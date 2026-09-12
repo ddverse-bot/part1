@@ -1,0 +1,272 @@
+[
+ {
+  "run": "crop_mixed_v2",
+  "scenario": "crop",
+  "features": "mixed",
+  "refine_features": "mixed",
+  "search_top1": 0.733,
+  "search_top2": 0.701,
+  "search_s": 14,
+  "final_ncc": 0.731,
+  "mirror": true,
+  "centre": [
+   -6.1,
+   25.7,
+   8.3
+  ],
+  "scales": [
+   0.984,
+   1.02,
+   1.029
+  ],
+  "dice_WM_otsu": 0.798,
+  "dice_GM_otsu": 0.829,
+  "dice_WM_parser": 0.465,
+  "dice_GM_parser": 0.727,
+  "vessel_median_um": 297,
+  "vessel_f300": 0.51,
+  "vessels_inside": 4023,
+  "restarts": "8/12",
+  "total_s": 193
+ },
+ {
+  "run": "whole_mixed_v2",
+  "scenario": "whole",
+  "features": "mixed",
+  "refine_features": "mixed",
+  "search_top1": 0.724,
+  "search_top2": 0.703,
+  "search_s": 76,
+  "final_ncc": 0.731,
+  "mirror": true,
+  "centre": [
+   -6.1,
+   25.7,
+   8.3
+  ],
+  "scales": [
+   0.984,
+   1.025,
+   1.016
+  ],
+  "dice_WM_otsu": 0.799,
+  "dice_GM_otsu": 0.83,
+  "dice_WM_parser": 0.466,
+  "dice_GM_parser": 0.728,
+  "vessel_median_um": 297,
+  "vessel_f300": 0.51,
+  "vessels_inside": 3980,
+  "restarts": "8/12",
+  "total_s": 268
+ },
+ {
+  "run": "crop_mixed_nomirror",
+  "scenario": "crop",
+  "features": "mixed",
+  "refine_features": "mixed",
+  "search_top1": 0.685,
+  "search_top2": 0.68,
+  "search_s": 6,
+  "final_ncc": 0.685,
+  "mirror": false,
+  "centre": [
+   -5.6,
+   25.5,
+   8.5
+  ],
+  "scales": [
+   0.955,
+   1.0,
+   1.0
+  ],
+  "dice_WM_otsu": 0.767,
+  "dice_GM_otsu": 0.806,
+  "dice_WM_parser": 0.486,
+  "dice_GM_parser": 0.757,
+  "vessel_median_um": 284,
+  "vessel_f300": 0.53,
+  "vessels_inside": 3495,
+  "restarts": "7/8",
+  "total_s": 149
+ },
+ {
+  "run": "crop_parser_v2",
+  "scenario": "crop",
+  "features": "parser",
+  "refine_features": "parser",
+  "search_top1": 0.65,
+  "search_top2": 0.637,
+  "search_s": 12,
+  "final_ncc": 0.71,
+  "mirror": true,
+  "centre": [
+   -15.8,
+   40.3,
+   19.6
+  ],
+  "scales": [
+   0.968,
+   0.991,
+   0.964
+  ],
+  "dice_WM_otsu": 0.442,
+  "dice_GM_otsu": 0.696,
+  "dice_WM_parser": 0.68,
+  "dice_GM_parser": 0.901,
+  "vessel_median_um": 230,
+  "vessel_f300": 0.68,
+  "vessels_inside": 242,
+  "restarts": "5/8",
+  "total_s": 158
+ },
+ {
+  "run": "crop_otsu_v2",
+  "scenario": "crop",
+  "features": "otsu",
+  "refine_features": "otsu",
+  "search_top1": 0.727,
+  "search_top2": 0.697,
+  "search_s": 12,
+  "final_ncc": 0.753,
+  "mirror": true,
+  "centre": [
+   -6.2,
+   25.9,
+   8.1
+  ],
+  "scales": [
+   0.978,
+   1.016,
+   1.011
+  ],
+  "dice_WM_otsu": 0.801,
+  "dice_GM_otsu": 0.83,
+  "dice_WM_parser": 0.463,
+  "dice_GM_parser": 0.731,
+  "vessel_median_um": 281,
+  "vessel_f300": 0.53,
+  "vessels_inside": 3926,
+  "restarts": "7/8",
+  "total_s": 158
+ },
+ {
+  "run": "crop_mind_v2",
+  "scenario": "crop",
+  "features": "mind",
+  "refine_features": "mind",
+  "search_top1": 0.219,
+  "search_top2": 0.216,
+  "search_s": 31,
+  "final_ncc": 0.185,
+  "mirror": true,
+  "centre": [
+   -17.5,
+   10.6,
+   31.6
+  ],
+  "scales": [
+   0.972,
+   0.982,
+   0.974
+  ],
+  "dice_WM_otsu": 0.323,
+  "dice_GM_otsu": 0.672,
+  "dice_WM_parser": 0.114,
+  "dice_GM_parser": 0.793,
+  "vessel_median_um": "n/a",
+  "vessel_f300": "n/a",
+  "vessels_inside": 0,
+  "restarts": "3/8",
+  "total_s": 182
+ },
+ {
+  "run": "crop_intensity_v2",
+  "scenario": "crop",
+  "features": "intensity",
+  "refine_features": "intensity",
+  "search_top1": 0.594,
+  "search_top2": 0.592,
+  "search_s": 11,
+  "final_ncc": 0.693,
+  "mirror": true,
+  "centre": [
+   -6.2,
+   25.8,
+   8.1
+  ],
+  "scales": [
+   0.985,
+   1.021,
+   1.014
+  ],
+  "dice_WM_otsu": 0.8,
+  "dice_GM_otsu": 0.832,
+  "dice_WM_parser": 0.465,
+  "dice_GM_parser": 0.732,
+  "vessel_median_um": 275,
+  "vessel_f300": 0.54,
+  "vessels_inside": 3945,
+  "restarts": "4/8",
+  "total_s": 158
+ },
+ {
+  "run": "crop_parser_v1",
+  "scenario": "crop",
+  "features": "parser",
+  "refine_features": "parser",
+  "search_top1": 0.621,
+  "search_top2": 0.619,
+  "search_s": 113,
+  "final_ncc": 0.769,
+  "mirror": null,
+  "centre": [
+   -13.8,
+   34.6,
+   4.0
+  ],
+  "scales": [
+   0.759,
+   0.729,
+   0.772
+  ],
+  "dice_WM_otsu": 0.453,
+  "dice_GM_otsu": 0.703,
+  "dice_WM_parser": 0.687,
+  "dice_GM_parser": 0.912,
+  "vessel_median_um": 298,
+  "vessel_f300": 0.51,
+  "vessels_inside": 396,
+  "restarts": "5/12",
+  "total_s": 320
+ },
+ {
+  "run": "crop_parser_vessel_v1",
+  "scenario": "crop",
+  "features": "parser",
+  "refine_features": "parser_vessel",
+  "search_top1": 0.621,
+  "search_top2": 0.619,
+  "search_s": 5,
+  "final_ncc": 0.483,
+  "mirror": null,
+  "centre": [
+   -13.5,
+   37.2,
+   36.0
+  ],
+  "scales": [
+   0.954,
+   0.956,
+   1.003
+  ],
+  "dice_WM_otsu": 0.453,
+  "dice_GM_otsu": 0.674,
+  "dice_WM_parser": 0.62,
+  "dice_GM_parser": 0.877,
+  "vessel_median_um": "n/a",
+  "vessel_f300": "n/a",
+  "vessels_inside": 0,
+  "restarts": "5/12",
+  "total_s": 182
+ }
+]
