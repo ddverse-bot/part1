@@ -23,7 +23,7 @@ from octreg.search import FFTSearcher
 from octreg.refine import Refiner, params_from_matrix, compose
 from octreg.evaluate import vessel_distance_stats, gm_wm_overlap, transform_diff, qc_figure
 from octreg.vascular import mri_dark_channel, density_on_grid, vascular_refine
-from octreg.fine import FineContext, FineConfig, fine_stage, mri_box, block_corners, pose_move
+from octreg.fine import FineContext, FineConfig, fine_stage, mri_box, block_corners, pose_move, restart_tol_mm, weight_fixed
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--work", type=Path, required=True); ap.add_argument("--out", type=Path, required=True)
@@ -50,6 +50,14 @@ ap.add_argument("--fine-iters", type=int, default=200); ap.add_argument("--fine-
 ap.add_argument("--fine-max-move", type=float, default=3.0, help="mm, mean displacement of the 8 OCT block corners vs the start pose; also caps U_mm"); ap.add_argument("--fine-max-rot", type=float, default=5.0, help="deg, rotation of the fine delta vs the start pose")
 ap.add_argument("--fine-subsample", type=int, default=1)
 ap.add_argument("--fine-verify", choices=["basic", "full"], default="basic", help="basic = restarts + multi-similarity + split-half + landscapes; full adds inverse consistency")
+# v1.1 fine-stage options after the P7/P8 probes; defaults = v1.1 behaviour (see octreg/fine.py header)
+ap.add_argument("--fine-fixed-mask", choices=["on", "off"], default="off", help="on = P7's configuration: m_spec chosen once per level at the start pose and kept for every chain, AND (unless --fine-fixed-weight off) the ncc loss's MRI-tissue weight frozen there too (v1.1's 'mask follows pose' rewards drifting)")
+ap.add_argument("--fine-fixed-weight", choices=["auto", "on", "off"], default="auto", help="the ncc loss's detached MRI-tissue weight: auto = frozen iff --fine-fixed-mask on (P7's pair); on = frozen at the mask pose even without a fixed mask; off = re-sampled through the current pose at every evaluation (v1.1; with --fine-fixed-mask on = the fixed-mask-only I58 runs (ii)/(iii), where points that drift off the MRI tissue silently drop out)")
+ap.add_argument("--fine-restart-mm", type=float, default=3.0, help="restart translation size (U(-2/3,2/3) x this per axis; v1.1 = 3.0)")
+ap.add_argument("--fine-restart-tol-mm", type=float, default=0.3, help="a restart counts as converged within this block-corner distance (mm) of T_fine (v1.1 gate 0.3; NOT scaled with --fine-restart-mm: pass e.g. 0.3 x that explicitly for larger restarts)")
+ap.add_argument("--fine-restart-deg", type=float, default=5.0, help="restart rotation size (angle U(0.4,1.2) x this; v1.1 = 5.0)"); ap.add_argument("--fine-restart-logscale", type=float, default=0.03, help="restart log-scale U(-1,1) x this per axis")
+ap.add_argument("--fine-dof", choices=["rigid", "similarity", "affine"], default="affine", help="degrees of freedom of the fine polish after the first level's rigid step (v1.1 = affine; R10: the affine polish over-stretched the I46 depth axis 1.219 -> 1.31, so a conservative polish is rigid)")
+ap.add_argument("--fine-exclude-fov-mm", type=float, default=0.0, help="mm; > 0 drops MRI tissue this close to a field-of-view face from the fine stage's tissue.  FOV faces = the faces of the MRI region the stage sees: the mri.npy array faces, or the --crop-centre box faces when that is set (which flagged faces are array faces is recorded in result.json fine.fov_faces; P8: the I58 MRI is a whole-brain crop whose tissue touches 3 array faces)")
 a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True); t_start = time.time()
 log = {"args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}}
 def say(*x): print(*x, flush=True)
@@ -282,9 +290,14 @@ if fine_on:
     ctx = FineContext(mri=mri, mri_tissue=mri_tissue_all, A_mri=A_mri, lo=lo, hi=hi, oct150=oct150, oct_mask=oct_mask, A_oct=A_oct, c_o=c_o,
                       BLOCK_R=BLOCK_R, VOX_M=VOX_M, VOX_O=VOX_O, ref015=ref015, device=DEVICE)
     cfg = FineConfig(sim=a.fine_sim, levels=tuple(float(x) for x in a.fine_levels.split(",")), flatten_mm=a.fine_flatten_mm, erode_mm=a.fine_erode_mm, lcc_mm=a.fine_lcc_mm,
-                     clamp=a.fine_clamp, reg=a.fine_reg, iters=a.fine_iters, n_restarts=a.fine_restarts, max_move=a.fine_max_move, max_rot=a.fine_max_rot, subsample=a.fine_subsample, verify=a.fine_verify)
+                     clamp=a.fine_clamp, reg=a.fine_reg, iters=a.fine_iters, n_restarts=a.fine_restarts, max_move=a.fine_max_move, max_rot=a.fine_max_rot, subsample=a.fine_subsample, verify=a.fine_verify,
+                     fixed_mask=a.fine_fixed_mask == "on", fixed_weight=a.fine_fixed_weight, restart_mm=a.fine_restart_mm, restart_deg=a.fine_restart_deg, restart_tol_mm=a.fine_restart_tol_mm, restart_logscale=a.fine_restart_logscale, exclude_fov_mm=a.fine_exclude_fov_mm, dof=a.fine_dof)
+    say(f"fine options: dof={cfg.dof}, fixed_mask={cfg.fixed_mask}, fixed_weight={cfg.fixed_weight}, restarts {cfg.restart_mm} mm / {cfg.restart_deg} deg / logscale {cfg.restart_logscale} (converged < {restart_tol_mm(cfg):g} mm), exclude_fov {cfg.exclude_fov_mm} mm; "
+        f"ncc weight {'frozen at the mask pose' if weight_fixed(cfg) else 'follows the pose (v1.1)'}")
     T_final, T_fine_cand, finfo = fine_stage(T_prefine, ctx, cfg, rng)
     np.save(a.out / "T_oct2mri_fine_candidate.npy", T_fine_cand); log["fine"] = finfo; _vs = finfo.get("vs_start") or {}
+    log["fine"]["options"] = {"dof": cfg.dof, "fixed_mask": cfg.fixed_mask, "fixed_weight": weight_fixed(cfg), "fixed_weight_option": cfg.fixed_weight, "restart_mm": cfg.restart_mm, "restart_deg": cfg.restart_deg, "restart_tol_mm": cfg.restart_tol_mm,
+                              "restart_logscale": cfg.restart_logscale, "exclude_fov_mm": cfg.exclude_fov_mm}
     say(f"fine stage: sign/level {finfo.get('sign_per_level')} sim/level {finfo.get('sim_per_level')}; guard {[(g['level'], g.get('frac_neg'), g.get('mean')) for g in finfo.get('guard', [])]}; "
         f"loss {finfo.get('loss_start_finest')} -> {finfo.get('loss_fine_finest')}; structural NCC {finfo.get('struct_ncc_before')} -> {finfo.get('struct_ncc_after')}; MI {finfo.get('mi_before')} -> {finfo.get('mi_after')}; "
         f"moved {_vs.get('corner_mean_mm')} mm (7 mm cube) / {_vs.get('block_corner_mean_mm')} mm (block corners), rotated {_vs.get('delta_rotation_deg')} deg (OCT-axis shift {_vs.get('centre_shift_oct_axes_mm')}); "

@@ -11,6 +11,36 @@ block's OWN 8 corners (pose_move) and the rotation of the delta is capped (cfg.m
 under-reads the rotation of a 29 mm block ~3x and its rotation_deg is meaningless for mirrored poses.  Restarts are REQUIRED
 (gate (d) fails with n_restarts = 0), U_mm must not exceed max_move (g), and a dense LCC loss whose box is wider than the mask
 (degenerate) skips the level / drops the witness instead of producing a NaN loss.
+
+Options after the P7/P8 probes (all default to the v1.1 behaviour above; the call sequence is byte-identical when unset):
+  fixed_mask      P7's configuration: m_spec is chosen ONCE per level at T_start and every chain (main run, restarts, LCC witness,
+                  backward ICE mask) optimises on that fixed OCT point set, AND (fixed_weight 'auto') the ncc loss's detached MRI-tissue
+                  point weight is frozen at T_start as well, so the effective point set (points with non-zero weight) cannot follow the
+                  pose either.  v1.1 re-derived m_spec from the CURRENT pose at every level start ('mask follows pose'), which rewards
+                  drifting into basins 6-8 mm away (P7).
+  fixed_weight    'auto' (default) = frozen iff fixed_mask; 'on' = (ncc loss only) the weight is frozen at the pose the mask was derived
+                  from even without fixed_mask (the current pose at the level start); 'off' = re-sampled through the current pose at every
+                  evaluation (v1.1; with fixed_mask this is the fixed-mask-only variant of the first I58 runs (ii)/(iii), in which points
+                  that drift off the MRI tissue silently drop out of the correlation).  Frozen: points that leave the MRI tissue see the
+                  flattened MRI's 0 background and decorrelate instead (P7's 'fixed detached tissue weight').  The dense LCC / LCC2
+                  witnesses and the backward ICE problem keep their validity(T) mask in every case.  weight_fixed(cfg) resolves the switch.
+  restart_mm / restart_deg / restart_logscale   size of the V1 restart perturbations: angle U(0.4, 1.2) x restart_deg about a random
+                  axis, translation U(-2/3, 2/3) x restart_mm per axis (RMS norm 2/3 restart_mm, max 1.15 restart_mm), log-scale
+                  U(-1, 1) x restart_logscale per axis; the defaults 5 deg / 3 mm / 0.03 are v1.1's U(2,6) deg / U(-2,2) mm / U(-0.03,0.03).
+                  The rigid basin of the I58 loss captures ~1.5 mm / 3 deg (P7): 1 mm / 2 deg restarts test convergence, 3 mm / 5 deg
+                  ones test the (absent) global basin.
+  restart_tol_mm  a restart counts as converged when its block corners lie within this distance of T_fine (default 0.3 mm = the v1.1
+                  gate; recorded as info.restart_tol_mm / restarts.tol_mm).  An explicit option, not a slope on restart_mm: the asked-for
+                  max(0.3, 0.3 x restart_mm) would move the default gate to 0.9 mm and change validated accept/reject outcomes; pass it
+                  explicitly (e.g. 0.3 x restart_mm) when that scaling is wanted for restarts larger than 1 mm.
+  exclude_fov_mm  MRI tissue within this distance of a field-of-view face is removed from t_m before everything that derives from it
+                  (flattening mask, tissue weight, eroded m_spec seed, guard / MI tissue).  FOV faces = the faces of the MRI region
+                  [lo,hi) the stage sees: the mri.npy array faces, or the --crop-centre box faces when that is set (the stage's MRI box
+                  is clipped to the region, so tissue is truncated there exactly as at an array face; info.fov_faces records which
+                  flagged faces are array faces).  Box faces inside the region do not count.  The I58 MRI is a whole-brain crop whose
+                  specimen touches 3 array faces (P8), so the truncated partial-volume rind must not attract the pose.  erode_ball already
+                  treats the box faces as background, so the eroded seed loses exclude_fov_mm + erode_mm at a FOV face (I58 at 0.32 mm,
+                  1.0 mm: m_spec 230.7k -> 227.7k voxels); the tissue WEIGHT loses exactly the exclude_fov_mm rind.
 """
 from __future__ import annotations
 
@@ -46,6 +76,26 @@ class FineConfig:
     clamp: float = 0.15; reg: float = 0.5; iters: int = 200; n_restarts: int = 8; max_move: float = 3.0; subsample: int = 1
     verify: str = "basic"; rigid_iters: int = 150; n_points: int = 50000
     max_rot: float = 5.0                                    # deg, rotation of the delta vs the start pose (the loss is flat in rotation: P2 caveat 4)
+    fixed_mask: bool = False                                # P7: m_spec per level chosen once at T_start for every chain, ncc weight frozen there too (fixed_weight auto); False = v1.1 'mask follows pose'
+    fixed_weight: object = "auto"                           # ncc weight: "auto" = frozen iff fixed_mask; "on"/True = frozen at the mask pose; "off"/False = re-sampled through T (v1.1); weight_fixed(cfg) resolves it
+    restart_mm: float = 3.0; restart_deg: float = 5.0; restart_logscale: float = 0.03    # V1 restart size (defaults = v1.1's hard-coded U(-2,2) mm / U(2,6) deg / 0.03)
+    restart_tol_mm: float = 0.3                             # mm at the block corners for a converged restart (v1.1 gate; NOT scaled with restart_mm, see the header)
+    exclude_fov_mm: float = 0.0                             # mm; > 0 drops MRI tissue this close to a field-of-view face from t_m / m_spec (0 = v1.1)
+    dof: str = "affine"                                     # degrees of freedom of every polish step after the first level's rigid step: rigid | similarity | affine (v1.1 = affine; R10: the affine polish over-stretches the I46 depth axis)
+
+
+def restart_tol_mm(cfg: FineConfig) -> float:
+    """Block-corner tolerance (mm) for a converged restart = cfg.restart_tol_mm (an explicit option; default = the v1.1 gate 0.3 mm)."""
+    return float(cfg.restart_tol_mm)
+
+
+def weight_fixed(cfg: FineConfig) -> bool:
+    """Resolved ncc tissue-weight switch: fixed_weight 'auto' / None follows fixed_mask (so fixed_mask alone is P7's fixed point set
+    WITH a fixed detached weight), 'on' / True freezes the weight at the mask pose regardless, 'off' / False re-samples it through the
+    current pose at every evaluation (v1.1; with fixed_mask = the fixed-mask-only variant)."""
+    w = cfg.fixed_weight
+    if w is None or (isinstance(w, str) and w.strip().lower() == "auto"): return bool(cfg.fixed_mask)
+    return bool(w) if isinstance(w, (bool, int)) else str(w).strip().lower() in ("on", "true", "yes", "1")
 
 
 # ----------------------------------------------------------------------------- small helpers
@@ -90,6 +140,20 @@ def erode_ball(mask_np: np.ndarray, r_mm: float, vox_mm: float) -> np.ndarray:
     """Erosion by a physical radius: EDT(mask) * vox >= r_mm (array faces count as background, as binary_erosion does)."""
     m = np.pad(np.asarray(mask_np, bool), 1)
     return (ndimage.distance_transform_edt(m) * vox_mm >= r_mm)[1:-1, 1:-1, 1:-1]
+
+
+def fov_face_distance(shape_p, f: int, n_orig, vox_mm, face_lo, face_hi) -> np.ndarray:
+    """Distance (mm) of every voxel centre of a grid pooled by f from the nearest field-of-view face of the unpooled box it came from
+    (n_orig voxels of size vox_mm per axis; face_lo / face_hi flag the box faces that are FOV faces).  The faces are axis-aligned
+    planes, so the EDT from them is the minimum over axes of the per-axis distances (exact, no padding / pooling artefacts):
+    pooled voxel i covers unpooled voxels [i f, (i+1) f), its centre is (i + 0.5) f voxels from the lo face plane."""
+    d = np.full(tuple(int(s) for s in shape_p), np.inf, np.float32)
+    for k in range(3):
+        c = (np.arange(shape_p[k], dtype=np.float64) + 0.5) * f; dk = np.full(shape_p[k], np.inf)
+        if face_lo[k]: dk = np.minimum(dk, c * vox_mm[k])
+        if face_hi[k]: dk = np.minimum(dk, (n_orig[k] - c) * vox_mm[k])
+        shp = [1, 1, 1]; shp[k] = -1; d = np.minimum(d, dk.reshape(shp).astype(np.float32))
+    return d
 
 
 def _zs(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
@@ -171,10 +235,12 @@ def pose_move(T_new: np.ndarray, T_ref: np.ndarray, c_o: np.ndarray, corners: np
 
 # ----------------------------------------------------------------------------- one pyramid level (pose independent)
 class Level:
-    """Pooled OCT / MRI-box arrays of one level, flattened once; the specimen mask is built per pose by spec_mask()."""
+    """Pooled OCT / MRI-box arrays of one level, flattened once; the specimen mask is built per pose by spec_mask().
+    fov (optional, cfg.exclude_fov_mm > 0): (n_orig, vox_mm, face_lo, face_hi) of the unpooled MRI box -> tissue within
+    exclude_fov_mm of a field-of-view face is dropped from t_m before anything is derived from it (n_fov_excluded voxels)."""
 
-    def __init__(self, O: torch.Tensor, MK: torch.Tensor, A_oct, box, L: float, cfg: FineConfig, VOX_O: float, VOX_M: float, dev):
-        mri_b, tis_b, A_box = box; self.mm = float(L); self.dev = dev
+    def __init__(self, O: torch.Tensor, MK: torch.Tensor, A_oct, box, L: float, cfg: FineConfig, VOX_O: float, VOX_M: float, dev, fov=None):
+        mri_b, tis_b, A_box = box; self.mm = float(L); self.dev = dev; self.n_fov_excluded = 0
         self.f_o = max(1, int(round(L / VOX_O))); self.f_m = max(1, int(round(L / VOX_M)))
         pos = (O > 0).float()
         if self.f_o > 1:
@@ -189,6 +255,9 @@ class Level:
             I_m, A_m = avg_pool_iso(mri_b, A_box, self.f_m); t_m = avg_pool_iso(tis_b, A_box, self.f_m)[0][0] > 0.5
         else:
             I_m, A_m = mri_b, np.asarray(A_box).copy(); t_m = tis_b[0] > 0.5
+        if fov is not None and cfg.exclude_fov_mm > 0:                              # FOV rind: EDT from the field-of-view faces < exclude_fov_mm
+            far = to_t(fov_face_distance(t_m.shape, self.f_m, *fov), device=dev) >= cfg.exclude_fov_mm
+            self.n_fov_excluded = int((t_m & ~far).sum()); t_m = t_m & far
         self.I_m = I_m[0]; self.A_m = A_m; self.A_m_t = to_t(A_m, device=dev); self.shape_m = tuple(self.I_m.shape); self.t_m = t_m
         self.t_m_f = t_m.float()[None]
         self.vox_o = float(np.linalg.norm(A_o[:3, :3], axis=0).mean()); self.vox_m = float(np.linalg.norm(A_m[:3, :3], axis=0).mean())
@@ -275,14 +344,19 @@ class _DeltaRefiner(Refiner):
 
 class FineRefiner(_DeltaRefiner):
     """sim = ncc: point-based masked NCC of the flattened intensities, sign-corrected (FM = sign * F_m); the MRI tissue sampled
-    through T is a detached point weight (the moving-tissue intersection carries no gradient)."""
+    through T is a detached point weight (the moving-tissue intersection carries no gradient).  T_weight (weight_fixed(cfg)): the
+    weight is sampled ONCE through this pose and frozen (None = v1.1: re-sampled through the current pose at every evaluation)."""
 
-    def __init__(self, F_m, A_m, F_o, A_o, mask, tis_m, T_start, sign, device=DEVICE):
+    def __init__(self, F_m, A_m, F_o, A_o, mask, tis_m, T_start, sign, device=DEVICE, T_weight=None):
         super().__init__(sign * F_m, A_m, F_o, A_o, mask, device)
-        self.FMT = torch.cat([self.FM, tis_m.to(device).float()], 0); self.set_start(T_start)
+        self.FMT = torch.cat([self.FM, tis_m.to(device).float()], 0); self.set_start(T_start); self.w_fix = None
+        if T_weight is not None:
+            with torch.no_grad(): self.w_fix = (sample_at_world(self.FMT[1:], self.A_M, apply_affine(to_t(T_weight, device=self.dev), self.pts_o))[0] > 0.5).float()
 
     def loss_of(self, D, subsample: int = 1):
         pts = self.pts_o[::subsample]; w = self.w[::subsample]; fo = self.fo[:, ::subsample]
+        if self.w_fix is not None:
+            s = sample_at_world(self.FMT[:1], self.A_M, apply_affine(self.T0 @ D, pts)); return 1.0 - masked_ncc(s, fo, w * self.w_fix[::subsample])
         s = sample_at_world(self.FMT, self.A_M, apply_affine(self.T0 @ D, pts))
         tis = (s[1] > 0.5).float().detach()
         return 1.0 - masked_ncc(s[:1], fo, w * tis)
@@ -325,16 +399,19 @@ class FineDense(_DeltaRefiner):
         return 1.0 - (cov ** 2 / (va * vb + 1e-2))[valid].mean()
 
 
-def make_refiner(L: Level, m_spec, T, sign, sim, cfg: FineConfig, dev):
-    if sim == "ncc": return FineRefiner(L.F_m, L.A_m, L.F_o, L.A_o, m_spec.float()[None], L.t_m_f, T, sign, dev)
+def make_refiner(L: Level, m_spec, T, sign, sim, cfg: FineConfig, dev, T_mask=None):
+    """T_mask: pose m_spec was derived from (None = T); with weight_fixed(cfg) (fixed_mask, or fixed_weight 'on') the ncc tissue
+    weight is frozen at that pose (fixed_mask: T_start for every chain)."""
+    if sim == "ncc": return FineRefiner(L.F_m, L.A_m, L.F_o, L.A_o, m_spec.float()[None], L.t_m_f, T, sign, dev, (T if T_mask is None else T_mask) if weight_fixed(cfg) else None)
     return FineDense(L.F_o[0], L.A_o, m_spec, L.F_m, L.A_m, L.t_m_f, T, sign, sim, int(round(cfg.lcc_mm / L.vox_o)) | 1, dev)
 
 
 def _schedule(kind: str, i: int, L: float, cfg: FineConfig):
-    """Per-level steps [(dof, iters, lrs)]: first level rigid -> affine, later levels affine; lrs halved below 0.25 mm."""
-    s = 1.0 if L >= 0.25 else 0.5
-    if kind == "main": steps = ([("rigid", cfg.rigid_iters)] if i == 0 else []) + [("affine", cfg.iters)]
-    else: steps = ([("rigid", 100)] if i == 0 else []) + [("affine", 100)]
+    """Per-level steps [(dof, iters, lrs)]: first level rigid -> cfg.dof, later levels cfg.dof (v1.1: affine); lrs halved below 0.25 mm.
+    With cfg.dof == "rigid" the first level runs two consecutive rigid steps (rigid_iters, then iters), which is the same as one longer one."""
+    s = 1.0 if L >= 0.25 else 0.5; dof = cfg.dof if cfg.dof in ("rigid", "similarity", "affine") else "affine"
+    if kind == "main": steps = ([("rigid", cfg.rigid_iters)] if i == 0 else []) + [(dof, cfg.iters)]
+    else: steps = ([("rigid", 100)] if i == 0 else []) + [(dof, 100)]
     return [(dof, n, dict(lr_rot=0.01 * s, lr_t=0.15 * s, lr_ls=0.005 * s, lr_sh=0.005 * s)) for dof, n in steps if n > 0]
 
 
@@ -344,15 +421,17 @@ def run_steps(ref: _DeltaRefiner, steps, cfg: FineConfig):
     return T, (ref.evaluate_T(T) if loss is None else loss)
 
 
-def run_chain(levels, T_init, signs, sims, cfg: FineConfig, kind: str, dev, notes: list | None = None):
+def run_chain(levels, T_init, signs, sims, cfg: FineConfig, kind: str, dev, notes: list | None = None, masks=None, T_mask=None):
     """Full level schedule from T_init with the main run's per-level sign / sim (None = level skipped); kind 'main' | 'lcc'.
     notes (optional list) collects 'degenerate@L' / 'failed@L' for levels whose refiner could not move (FineDense window too large
-    for the mask, or no finite loss); the pose is then carried through unchanged at that level."""
+    for the mask, or no finite loss); the pose is then carried through unchanged at that level.
+    masks: per-level m_spec to optimise on (cfg.fixed_mask: the T_start masks of the main run); None = m_spec at the chain's current pose;
+    T_mask: the pose those masks were derived from (weight_fixed(cfg) freezes the ncc weight there)."""
     T = np.asarray(T_init, float).copy()
     for i, L in enumerate(levels):
         if sims[i] is None: continue
         sim = sims[i] if kind == "main" else ("lcc" if signs[i] != 0 else "lcc2")
-        ref = make_refiner(L, L.spec_mask(T), T, signs[i], sim, cfg, dev)
+        ref = make_refiner(L, masks[i] if masks is not None else L.spec_mask(T), T, signs[i], sim, cfg, dev, T_mask if masks is not None else None)
         if ref.degenerate:
             if notes is not None: notes.append(f"degenerate@{L.mm}")
             del ref; continue
@@ -418,32 +497,39 @@ def landscape(eval_fn, T, c_o, axes_u, trans=(0.25, 0.5, 1.0, 2.0), rots=(1.0, 2
     return {"per_axis": out}
 
 
-def restarts(levels, T_start, T_fine, signs, sims, cfg: FineConfig, rng, c_o, corners, pts, dev) -> dict:
-    """V1: perturbed restarts (rotation U(2,6) deg, translation U(-2,2) mm/axis, log-scale U(-0.03,0.03)/axis) through the full
-    schedule; converged iff the mean displacement of the BLOCK corners (Tr vs T_fine) < 0.3 mm (the spec's 7 mm cube tolerates
-    ~2.5 deg on I58, recorded as converged_7mm); specimen-point displacement stats of each Tr vs T_fine."""
+def restarts(levels, T_start, T_fine, signs, sims, cfg: FineConfig, rng, c_o, corners, pts, dev, masks=None, T_mask=None) -> dict:
+    """V1: perturbed restarts (rotation U(0.4,1.2) x restart_deg, translation U(-2/3,2/3) x restart_mm per axis, log-scale
+    U(-1,1) x restart_logscale per axis; defaults = v1.1's U(2,6) deg, U(-2,2) mm, U(-0.03,0.03)) through the full schedule;
+    converged iff the mean displacement of the BLOCK corners (Tr vs T_fine) < restart_tol_mm(cfg) = cfg.restart_tol_mm (0.3 mm default;
+    the spec's 7 mm cube tolerates ~2.5 deg on I58, recorded as converged_7mm); specimen-point displacement stats of each Tr vs
+    T_fine; n_within: restarts within 0.3 / 0.5 / 1 mm at the block corners (cluster size).  masks: see run_chain."""
     r0, t0, ls0, sh0, mir = params_from_matrix(T_start, c_o); det = []; pooled = []
+    tol = restart_tol_mm(cfg); a_lo, a_hi = cfg.restart_deg * 2.0 / 5.0, cfg.restart_deg * 6.0 / 5.0; t_h = cfg.restart_mm * 2.0 / 3.0
     for i in range(cfg.n_restarts):
-        ang = np.deg2rad(rng.uniform(2, 6)); ax = rng.normal(size=3); ax /= np.linalg.norm(ax); tp = rng.uniform(-2, 2, 3); lp = rng.uniform(-0.03, 0.03, 3)
+        ang = np.deg2rad(rng.uniform(a_lo, a_hi)); ax = rng.normal(size=3); ax /= np.linalg.norm(ax); tp = rng.uniform(-t_h, t_h, 3); lp = rng.uniform(-cfg.restart_logscale, cfg.restart_logscale, 3)
+        if cfg.dof == "rigid": lp[:] = 0.0                  # a rigid polish cannot undo a scale perturbation (3 % = 0.9 mm at the I58 block corners), so the restarts must not apply one
+        elif cfg.dof == "similarity": lp[:] = lp[0]         # similarity: isotropic only
         Tp = compose(to_t(r0 + ax * ang, device=dev), to_t(t0 + tp, device=dev), to_t(ls0 + lp, device=dev), to_t(sh0, device=dev), to_t(c_o, device=dev), mir).cpu().numpy()
-        t1 = time.time(); notes = []; Tr = run_chain(levels, Tp, signs, sims, cfg, "main", dev, notes); d = _point_disp(Tr, T_fine, pts)
+        t1 = time.time(); notes = []; Tr = run_chain(levels, Tp, signs, sims, cfg, "main", dev, notes, masks, T_mask); d = _point_disp(Tr, T_fine, pts)
         e = {"perturb_deg": float(np.rad2deg(ang)), "perturb_mm": float(np.linalg.norm(tp)), "perturb_logscale": lp.tolist(), **pose_move(Tr, T_fine, c_o, corners),
-             "disp_mean_mm": float(d.mean()), "disp_p95_mm": float(np.percentile(d, 95)), "notes": notes, "seconds": time.time() - t1}
-        e["converged"] = bool(e["block_corner_mean_mm"] < 0.3); e["converged_7mm"] = bool(e["corner_mean_mm"] < 0.3); det.append(e)
+             "disp_mean_mm": float(d.mean()), "disp_p95_mm": float(np.percentile(d, 95)), "notes": notes, "seconds": time.time() - t1, "T": Tr.tolist()}
+        e["converged"] = bool(e["block_corner_mean_mm"] < tol); e["converged_7mm"] = bool(e["corner_mean_mm"] < tol); det.append(e)
         if e["converged"]: pooled.append(d)
     p95 = float(np.percentile(np.concatenate(pooled), 95)) if pooled else None
-    return {"n": len(det), "n_converged": sum(e["converged"] for e in det), "n_converged_7mm": sum(e["converged_7mm"] for e in det), "detail": det, "p95_disp_converged_mm": p95}
+    within = {f"{r:g}": sum(e["block_corner_mean_mm"] < r for e in det) for r in (0.3, 0.5, 1.0)}
+    return {"n": len(det), "n_converged": sum(e["converged"] for e in det), "n_converged_7mm": sum(e["converged_7mm"] for e in det), "detail": det, "p95_disp_converged_mm": p95,
+            "tol_mm": tol, "n_within_mm": within, "size": {"deg_range": [a_lo, a_hi], "mm_per_axis": t_h, "logscale": cfg.restart_logscale}}
 
 
-def split_half(L: Level, m_spec, T_fine, sign, sim, cfg: FineConfig, pts, dev) -> dict:
+def split_half(L: Level, m_spec, T_fine, sign, sim, cfg: FineConfig, pts, dev, T_mask=None) -> dict:
     """V3: per OCT array axis split m_spec at the median coordinate; affine 100 iters from T_fine on each half; disagreement of the
-    two half solutions over the specimen points (mean mm); loho_max_mm = max over axes."""
+    two half solutions over the specimen points (mean mm); loho_max_mm = max over axes.  T_mask: see make_refiner."""
     idx = torch.nonzero(m_spec); s = 1.0 if L.mm >= 0.25 else 0.5; per, detail = [], []
     for k in range(3):
         med = float(idx[:, k].float().median()); shp = [1, 1, 1]; shp[k] = -1
         coord = torch.arange(m_spec.shape[k], device=m_spec.device).view(shp); Ts = []; deg = []
         for h in (m_spec & (coord <= med), m_spec & (coord > med)):
-            ref = make_refiner(L, h, T_fine, sign, sim, cfg, dev); deg.append(bool(ref.degenerate))
+            ref = make_refiner(L, h, T_fine, sign, sim, cfg, dev, T_mask); deg.append(bool(ref.degenerate))
             Th, _ = ref.refine_delta("affine", 100, lr_rot=0.01 * s, lr_t=0.15 * s, lr_ls=0.005 * s, lr_sh=0.005 * s, clamp=cfg.clamp, reg=cfg.reg, subsample=cfg.subsample)
             Ts.append(Th); del ref
         d = point_disp_stats(Ts[0], Ts[1], pts); ok = not any(deg)                  # a degenerate half (LCC box wider than the half) cannot move: no test
@@ -454,11 +540,12 @@ def split_half(L: Level, m_spec, T_fine, sign, sim, cfg: FineConfig, pts, dev) -
 
 def inverse_consistency(levels, T_start, T_fine, signs, sims, sim_f, cfg: FineConfig, pts, dev) -> dict:
     """V5: backward problem MRI -> OCT with FineDense roles swapped (fixed = MRI level grid, mask = eroded MRI tissue & OCT mask
-    through inv(T_start); moving = flattened OCT with its validity), started at inv(T_start), same sign; ICE = |T_fine p - inv(T_bwd) p|."""
+    through inv(T_start); moving = flattened OCT with its validity), started at inv(T_start), same sign; ICE = |T_fine p - inv(T_bwd) p|.
+    cfg.fixed_mask: the backward mask is taken at inv(T_start) on every level (v1.1: at the current backward pose)."""
     T_b = np.linalg.inv(T_start); notes = []; ran = 0
     for i, L in enumerate(levels):
         if sims[i] is None: continue
-        om = resample_to_grid(L.mo_f, L.A_o_t, L.A_m_t, L.shape_m, T_grid_to_vol=to_t(T_b, device=dev))[0] > 0.5
+        om = resample_to_grid(L.mo_f, L.A_o_t, L.A_m_t, L.shape_m, T_grid_to_vol=to_t(np.linalg.inv(T_start) if cfg.fixed_mask else T_b, device=dev))[0] > 0.5
         sim_b = sim_f if signs[i] != 0 else "lcc2"
         ref = FineDense(L.F_m[0], L.A_m, L.t_m_er_b & om, L.F_o, L.A_o, L.mo_f, T_b, signs[i], sim_b, int(round(cfg.lcc_mm / L.vox_m)) | 1, dev)
         if ref.degenerate: notes.append(f"degenerate@{L.mm}"); del ref; continue
@@ -478,28 +565,42 @@ def fine_stage(T_start, ctx: FineContext, cfg: FineConfig, rng, probe_only: bool
     per level, no optimisation (test_fine.py --init-only)."""
     t0 = time.time(); dev = ctx.device; T_start = np.asarray(T_start, float).copy(); c_o = np.asarray(ctx.c_o, float)
     axes_u = [ctx.A_oct[:3, k] / np.linalg.norm(ctx.A_oct[:3, k]) for k in range(3)]; corners = block_corners(ctx.A_oct, ctx.oct150.shape)
-    info = {"mode": "on", "sim": cfg.sim, "levels_mm": [float(x) for x in cfg.levels], "verify": cfg.verify, "max_move_mm": cfg.max_move, "max_rot_deg": cfg.max_rot}
+    info = {"mode": "on", "sim": cfg.sim, "levels_mm": [float(x) for x in cfg.levels], "verify": cfg.verify, "max_move_mm": cfg.max_move, "max_rot_deg": cfg.max_rot,
+            "fixed_mask": bool(cfg.fixed_mask), "fixed_weight": weight_fixed(cfg), "fixed_weight_option": cfg.fixed_weight if isinstance(cfg.fixed_weight, str) else str(cfg.fixed_weight),
+            "restart_mm": cfg.restart_mm, "restart_deg": cfg.restart_deg, "restart_logscale": cfg.restart_logscale,
+            "restart_tol_mm": restart_tol_mm(cfg), "exclude_fov_mm": cfg.exclude_fov_mm, "dof": cfg.dof}
     bc = (T_start @ np.r_[c_o, 1.0])[:3]
     vlo, vhi, A_box, mri_b, tis_b = mri_box(ctx.mri, ctx.mri_tissue, ctx.A_mri, ctx.lo, ctx.hi, bc, ctx.BLOCK_R + 8.0)
     box = (to_t(mri_b, device=dev)[None], to_t(tis_b.astype(np.float32), device=dev)[None], A_box); del mri_b, tis_b
     info["mri_box_ijk"] = [vlo.tolist(), vhi.tolist()]
+    fov = None
+    if cfg.exclude_fov_mm > 0:                               # box faces that ARE field-of-view faces = faces of the region [lo,hi) (mri.npy array faces, or the --crop-centre box faces)
+        f_lo = [bool(vlo[k] <= ctx.lo[k]) for k in range(3)]; f_hi = [bool(vhi[k] >= ctx.hi[k]) for k in range(3)]
+        a_lo = [bool(f and vlo[k] <= 0) for k, f in enumerate(f_lo)]; a_hi = [bool(f and vhi[k] >= ctx.mri.shape[k]) for k, f in enumerate(f_hi)]   # which flagged faces are true array faces
+        fov = (np.asarray(vhi - vlo, float), np.linalg.norm(np.asarray(A_box)[:3, :3], axis=0), f_lo, f_hi)
+        info["fov_faces"] = {"lo": f_lo, "hi": f_hi, "array_lo": a_lo, "array_hi": a_hi, "region_ijk": [np.asarray(ctx.lo).tolist(), np.asarray(ctx.hi).tolist()],
+                             "region": "array" if (np.all(np.asarray(ctx.lo) == 0) and np.all(np.asarray(ctx.hi) == np.asarray(ctx.mri.shape))) else "crop"}
     O = to_t(ctx.oct150, device=dev)[None]; MK = to_t(ctx.oct_mask.astype(np.float32), device=dev)[None]
-    levels = [Level(O, MK, ctx.A_oct, box, L, cfg, ctx.VOX_O, ctx.VOX_M, dev) for L in cfg.levels]; del O, MK, box
-    info["level_grids"] = [{"level": L.mm, "oct_shape": list(L.shape_o), "oct_vox_mm": L.vox_o, "mri_shape": list(L.shape_m), "mri_vox_mm": L.vox_m} for L in levels]
+    levels = [Level(O, MK, ctx.A_oct, box, L, cfg, ctx.VOX_O, ctx.VOX_M, dev, fov) for L in cfg.levels]; del O, MK, box
+    info["level_grids"] = [{"level": L.mm, "oct_shape": list(L.shape_o), "oct_vox_mm": L.vox_o, "mri_shape": list(L.shape_m), "mri_vox_mm": L.vox_m,
+                            **({"fov_excluded_vox": L.n_fov_excluded, "fov_excluded_cm3": L.n_fov_excluded * L.vox_m ** 3 / 1000} if fov is not None else {})} for L in levels]
     info["seconds_prep"] = time.time() - t0
 
-    # ---- main run: guard -> similarity -> delta refinement, level by level (m_spec fixed within a level)
-    T_cur = T_start.copy(); signs, sims, guard, lv = [], [], [], []; last = None
+    # ---- main run: guard -> similarity -> delta refinement, level by level (m_spec fixed within a level; cfg.fixed_mask: at T_start on every level,
+    #      and the ncc weight frozen there too unless fixed_weight 'off')
+    T_cur = T_start.copy(); signs, sims, guard, lv, spec_masks = [], [], [], [], []; last = None
     for i, L in enumerate(levels):
-        tl = time.time(); m_spec = L.spec_mask(T_cur)
+        tl = time.time(); m_spec = L.spec_mask(T_start if cfg.fixed_mask else T_cur); spec_masks.append(m_spec)
         sign, g = polarity_guard(L.I_o, L.A_o, L.I_m, L.A_m, m_spec, T_cur, min_vox=int(2000 * (0.3 / L.mm) ** 3), level=L); g["level"] = L.mm; guard.append(g)
         sim = cfg.sim if cfg.sim != "auto" else ("ncc" if sign != 0 else "lcc2")
-        e = {"level": L.mm, "sim": sim, "sign": sign, "n_spec": int(m_spec.sum()), "spec_cm3": float(m_spec.sum()) * L.vox_o ** 3 / 1000, "skipped": None}
+        e = {"level": L.mm, "sim": sim, "sign": sign, "n_spec": int(m_spec.sum()), "spec_cm3": float(m_spec.sum()) * L.vox_o ** 3 / 1000, "skipped": None,
+             "mask_pose": "start" if cfg.fixed_mask else "current",
+             "ncc_weight": (("frozen@start" if cfg.fixed_mask else "frozen@current") if weight_fixed(cfg) else "follows_pose") if sim == "ncc" else None}
         if e["n_spec"] < 1000: e["skipped"] = "specimen_mask_too_small"
         elif sim in ("ncc", "lcc") and sign == 0: e["skipped"] = "mixed_polarity"
         if e["skipped"]:
             signs.append(0); sims.append(None); lv.append(e); continue
-        ref = make_refiner(L, m_spec, T_cur, sign, sim, cfg, dev)
+        ref = make_refiner(L, m_spec, T_cur, sign, sim, cfg, dev, T_start if cfg.fixed_mask else None)
         if ref.degenerate:                                   # LCC box wider than the specimen: the dense loss is undefined everywhere -> skip, do not crash
             e.update(skipped="lcc_window_too_large", lcc_box_vox=ref.w_box, lcc_box_mm=ref.w_box * L.vox_o); signs.append(0); sims.append(None); lv.append(e); del ref; continue
         e["loss_before"] = ref.evaluate_T(T_cur); e["ncc_before"] = 1.0 - e["loss_before"]
@@ -509,7 +610,7 @@ def fine_stage(T_start, ctx: FineContext, cfg: FineConfig, rng, probe_only: bool
         e.update(loss_after=float(loss1), ncc_after=1.0 - float(loss1), moved_mm=mv["corner_mean_mm"], moved_block_mm=mv["block_corner_mean_mm"],
                  rotated_deg=mv["delta_rotation_deg"], failed_steps=ref.failed_steps, seconds=time.time() - tl)
         signs.append(sign); sims.append(sim); lv.append(e); last = (L, m_spec, ref, sign, sim); T_cur = T_new
-    T_fine = T_cur
+    T_fine = T_cur; masks = spec_masks if cfg.fixed_mask else None; T_mask = T_start if cfg.fixed_mask else None   # chains re-derive m_spec at their own pose unless fixed_mask
     info.update(sim_per_level=[l["sim"] if not l["skipped"] else None for l in lv], sign_per_level=signs, guard=guard, levels=lv)
     if probe_only or last is None:
         info.update(accepted=False, reasons=["probe_only"] if probe_only else ["no_level"], U_mm=None, seconds=time.time() - t0)
@@ -531,15 +632,15 @@ def fine_stage(T_start, ctx: FineContext, cfg: FineConfig, rng, probe_only: bool
                 stretch_ijk_before=stretch_ijk(T_start, ctx.A_oct), stretch_ijk_after=stretch_ijk(T_fine, ctx.A_oct), cum_log_scale=(ls_f - ls_s).tolist(),
                 fine_large_move=bool(vs["block_corner_mean_mm"] > 1.5))
     # V1 restarts
-    t1 = time.time(); rs = restarts(levels, T_start, T_fine, signs, sims, cfg, rng, c_o, corners, pts, dev) if cfg.n_restarts > 0 else {"n": 0, "n_converged": 0, "n_converged_7mm": 0, "detail": [], "p95_disp_converged_mm": None}
+    t1 = time.time(); rs = restarts(levels, T_start, T_fine, signs, sims, cfg, rng, c_o, corners, pts, dev, masks, T_mask) if cfg.n_restarts > 0 else {"n": 0, "n_converged": 0, "n_converged_7mm": 0, "detail": [], "p95_disp_converged_mm": None, "tol_mm": restart_tol_mm(cfg)}
     rs["seconds"] = time.time() - t1; info["restarts"] = rs
     # V2 multi-similarity: dense LCC chain from T_start, MI polish from T_fine (a degenerate LCC chain = no independent witness, not a disagreement)
-    t1 = time.time(); lcc_notes = []; T_lcc = run_chain(levels, T_start, signs, sims, cfg, "lcc", dev, lcc_notes); T_mi, mi_info = mi_polish(mi, T_fine, c_o)
+    t1 = time.time(); lcc_notes = []; T_lcc = run_chain(levels, T_start, signs, sims, cfg, "lcc", dev, lcc_notes, masks, T_mask); T_mi, mi_info = mi_polish(mi, T_fine, c_o)
     lcc_ok = not any(n.startswith("degenerate") for n in lcc_notes)
     info["multi_sim"] = {"fine_lcc": point_disp_stats(T_fine, T_lcc, pts) if lcc_ok else None, "fine_mi": point_disp_stats(T_fine, T_mi, pts), "lcc_mi": point_disp_stats(T_lcc, T_mi, pts) if lcc_ok else None,
                          "lcc_vs_start": pose_move(T_lcc, T_start, c_o, corners), "lcc_notes": lcc_notes, "mi_polish": mi_info, "T_lcc": T_lcc.tolist(), "T_mi": T_mi.tolist(), "seconds": time.time() - t1}
     # V3 split-half
-    t1 = time.time(); info["split_half"] = split_half(Lf, m_spec_f, T_fine, sign_f, sim_f, cfg, pts, dev); info["split_half"]["seconds"] = time.time() - t1
+    t1 = time.time(); info["split_half"] = split_half(Lf, m_spec_f, T_fine, sign_f, sim_f, cfg, pts, dev, T_mask); info["split_half"]["seconds"] = time.time() - t1
     # V4 landscapes at T_fine (fine loss sign-corrected, higher = better; MI32 on the same 9 axes)
     t1 = time.time()
     info["landscape"] = {"fine": landscape(lambda T: 1.0 - ref_f.evaluate_T(T), T_fine, c_o, axes_u), "mi": landscape(mi, T_fine, c_o, axes_u), "seconds": time.time() - t1}
@@ -559,7 +660,7 @@ def fine_stage(T_start, ctx: FineContext, cfg: FineConfig, rng, probe_only: bool
     if vs["delta_rotation_deg"] > cfg.max_rot: reasons.append(f"(c) rotated {vs['delta_rotation_deg']:.2f} deg > {cfg.max_rot}")
     need = int(math.ceil(0.625 * rs["n"]))                                            # 5 of 8
     if rs["n"] == 0: reasons.append("(d) no restarts run (n_restarts = 0): convergence unverified")
-    elif rs["n_converged"] < need: reasons.append(f"(d) restarts converged {rs['n_converged']}/{rs['n']} < {need} (block corners < 0.3 mm; 7 mm cube: {rs['n_converged_7mm']})")
+    elif rs["n_converged"] < need: reasons.append(f"(d) restarts converged {rs['n_converged']}/{rs['n']} < {need} (block corners < {rs['tol_mm']:g} mm; 7 mm cube: {rs['n_converged_7mm']})")
     if mi_after < mi_before - 0.001: reasons.append(f"(e) MI32 {mi_before:.4f} -> {mi_after:.4f} (drop > 0.001)")
     if lv[-1]["skipped"]: reasons.append(f"(f) finest level skipped ({lv[-1]['skipped']})")
     ms = info["multi_sim"]; ms_have = [ms[k]["mean_mm"] for k in ("fine_lcc", "fine_mi", "lcc_mi") if ms[k] is not None]

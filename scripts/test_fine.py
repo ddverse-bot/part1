@@ -15,7 +15,7 @@ from octreg.common import DEVICE, to_t, world_bbox_to_voxel, write_json
 from octreg.features import otsu_two_class, otsu_two_class_lowmem
 from octreg.refine import Refiner
 from octreg.evaluate import transform_diff
-from octreg.fine import FineContext, FineConfig, fine_stage
+from octreg.fine import FineContext, FineConfig, fine_stage, restart_tol_mm, weight_fixed
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--work", type=Path, required=True); ap.add_argument("--T", type=Path, required=True, help="4x4 .npy start pose (OCT world -> MRI world)"); ap.add_argument("--out", type=Path, required=True)
@@ -26,6 +26,12 @@ ap.add_argument("--oct-wm-bright", choices=["auto", "yes", "no", "run"], default
 ap.add_argument("--mri-wm-bright", action="store_true"); ap.add_argument("--no-ref015", action="store_true", help="skip the structural gate refiner (faster)")
 ap.add_argument("--flatten-mm", type=float, default=3.0); ap.add_argument("--erode-mm", type=float, default=1.3); ap.add_argument("--lcc-mm", type=float, default=4.5)
 ap.add_argument("--clamp", type=float, default=0.15); ap.add_argument("--reg", type=float, default=0.5); ap.add_argument("--max-move", type=float, default=3.0, help="mm at the block corners"); ap.add_argument("--max-rot", type=float, default=5.0, help="deg")
+# same names as register.py (defaults = v1.1): fixed OCT point set, restart size, field-of-view rind exclusion
+ap.add_argument("--fine-fixed-mask", choices=["on", "off"], default="off", help="on = P7's configuration (fixed point set at the start pose + frozen ncc weight unless --fine-fixed-weight off)")
+ap.add_argument("--fine-fixed-weight", choices=["auto", "on", "off"], default="auto", help="auto = frozen iff --fine-fixed-mask on; off = v1.1 re-sampling (fixed-mask-only when the mask is fixed)")
+ap.add_argument("--fine-restart-mm", type=float, default=3.0); ap.add_argument("--fine-restart-deg", type=float, default=5.0); ap.add_argument("--fine-restart-tol-mm", type=float, default=0.3, help="converged-restart block-corner tolerance (v1.1 gate 0.3; not scaled with --fine-restart-mm)")
+ap.add_argument("--fine-restart-logscale", type=float, default=0.03); ap.add_argument("--fine-exclude-fov-mm", type=float, default=0.0)
+ap.add_argument("--fine-dof", choices=["rigid", "similarity", "affine"], default="affine")
 a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True); t_all = time.time()
 def say(*x): print(*x, flush=True)
 say(f"device {DEVICE}, torch threads {torch.get_num_threads()}")
@@ -64,7 +70,10 @@ if not a.no_ref015:
 
 ctx = FineContext(mri=mri, mri_tissue=mri_tissue_all, A_mri=A_mri, lo=lo, hi=hi, oct150=oct150, oct_mask=oct_mask, A_oct=A_oct, c_o=c_o, BLOCK_R=BLOCK_R, VOX_M=VOX_M, VOX_O=VOX_O, ref015=ref015, device=DEVICE)
 cfg = FineConfig(sim=a.sim, levels=tuple(float(x) for x in a.levels.split(",")), flatten_mm=a.flatten_mm, erode_mm=a.erode_mm, lcc_mm=a.lcc_mm, clamp=a.clamp, reg=a.reg, iters=a.iters,
-                 n_restarts=a.restarts, max_move=a.max_move, max_rot=a.max_rot, subsample=a.subsample, verify=a.verify, rigid_iters=a.rigid_iters)
+                 n_restarts=a.restarts, max_move=a.max_move, max_rot=a.max_rot, subsample=a.subsample, verify=a.verify, rigid_iters=a.rigid_iters,
+                 fixed_mask=a.fine_fixed_mask == "on", fixed_weight=a.fine_fixed_weight, restart_mm=a.fine_restart_mm, restart_deg=a.fine_restart_deg, restart_tol_mm=a.fine_restart_tol_mm, restart_logscale=a.fine_restart_logscale, exclude_fov_mm=a.fine_exclude_fov_mm, dof=a.fine_dof)
+say(f"fine options: dof={cfg.dof}, fixed_mask={cfg.fixed_mask}, fixed_weight={cfg.fixed_weight}, restarts {cfg.restart_mm} mm / {cfg.restart_deg} deg / logscale {cfg.restart_logscale} (converged < {restart_tol_mm(cfg):g} mm), exclude_fov {cfg.exclude_fov_mm} mm; "
+    f"ncc weight {'frozen at the mask pose' if weight_fixed(cfg) else 'follows the pose (v1.1)'}")
 rng = np.random.default_rng(a.seed + 1)
 t0 = time.time(); T_acc, T_cand, info = fine_stage(T0, ctx, cfg, rng, probe_only=a.init_only); info["test_args"] = {k: str(v) for k, v in vars(a).items()}
 write_json(info, a.out / "fine_info.json"); np.save(a.out / "T_fine_candidate.npy", T_cand); np.save(a.out / "T_fine_accepted.npy", T_acc); np.save(a.out / "T_start.npy", T0)
@@ -73,15 +82,21 @@ write_json(info, a.out / "fine_info.json"); np.save(a.out / "T_fine_candidate.np
 for g in info["guard"]:
     say(f"guard level {g['level']}: blocks {g['n_blocks']}, negative {g['n_neg']} (frac {g['frac_neg']}), vol-weighted mean {g['mean']}, sign {g.get('sign')}, n_vox {g['n_vox']}")
 for e in info["levels"]:
-    say(f"level {e['level']} sim {e['sim']} sign {e['sign']} m_spec {e['n_spec']} vox = {e.get('spec_cm3', 0):.2f} cm3: "
-        + (f"skipped {e['skipped']}" if e["skipped"] else f"NCC (sign-corrected) at level start {e.get('ncc_before'):.4f}" + (f" -> after {e.get('ncc_after'):.4f} (loss {e['loss_before']:.4f} -> {e['loss_after']:.4f}), moved {e['moved_mm']:.3f} mm, {e['seconds']:.0f}s" if "loss_after" in e else "")))
+    say(f"level {e['level']} sim {e['sim']} sign {e['sign']} m_spec {e['n_spec']} vox = {e.get('spec_cm3', 0):.2f} cm3 (mask at the {e.get('mask_pose', 'current')} pose, ncc weight {e.get('ncc_weight')}): "
+        + (f"skipped {e['skipped']}" if e["skipped"] else f"NCC (sign-corrected) at level start {e.get('ncc_before'):.4f}"
+           + (f" -> after {e.get('ncc_after'):.4f} (loss {e['loss_before']:.4f} -> {e['loss_after']:.4f}), moved {e['moved_mm']:.3f} mm (7 mm cube) / {e['moved_block_mm']:.3f} mm (block corners), rotated {e['rotated_deg']:.3f} deg, {e['seconds']:.0f}s" if "loss_after" in e else "")))
+for g in info.get("level_grids", []):
+    if "fov_excluded_vox" in g: say(f"level {g['level']}: MRI tissue within {info['exclude_fov_mm']} mm of a FOV face excluded: {g['fov_excluded_vox']} vox = {g['fov_excluded_cm3']:.3f} cm3 (faces {info.get('fov_faces')})")
 if not a.init_only and info.get("vs_start"):
     vs = info["vs_start"]
     say(f"move vs start: corner mean {vs['corner_mean_mm']:.3f} mm (7 mm cube) / {vs['block_corner_mean_mm']:.3f} mm (block corners, max {vs['block_corner_max_mm']:.3f}), centre {vs['centre_mm']:.3f} mm, "
         f"delta rotation {vs['delta_rotation_deg']:.3f} deg (transform_diff {vs['rotation_deg']:.3f}); centre shift along OCT axes (z,y,x) {np.round(vs['centre_shift_oct_axes_mm'], 3).tolist()} mm; "
         f"stretch {info['stretch_ijk_before']} -> {info['stretch_ijk_after']}, cum log-scale {np.round(info['cum_log_scale'], 4).tolist()}")
     say(f"finest {info['finest_level']} mm {info['finest_sim']}: loss at T_start {info['loss_start_finest']:.4f} -> at T_fine {info['loss_fine_finest']:.4f}; structural NCC {info['struct_ncc_before']} -> {info['struct_ncc_after']}; MI32 {info['mi_before']:.4f} -> {info['mi_after']:.4f}")
-    rs = info["restarts"]; say(f"restarts converged {rs['n_converged']}/{rs['n']} (block corners < 0.3 mm; 7 mm cube {rs.get('n_converged_7mm')}), p95 disp of the converged {rs['p95_disp_converged_mm']} mm ({rs.get('seconds', 0):.0f}s)")
+    rs = info["restarts"]; say(f"restarts converged {rs['n_converged']}/{rs['n']} (block corners < {rs.get('tol_mm', 0.3):g} mm; 7 mm cube {rs.get('n_converged_7mm')}), cluster n within 0.3/0.5/1 mm {rs.get('n_within_mm')}, "
+                               f"p95 disp of the converged {rs['p95_disp_converged_mm']} mm ({rs.get('seconds', 0):.0f}s)")
+    for i, r in enumerate(rs["detail"]):
+        say(f"  restart {i}: perturbed {r['perturb_mm']:.2f} mm / {r['perturb_deg']:.2f} deg -> vs T_fine {r['block_corner_mean_mm']:.3f} mm (block corners), {r['delta_rotation_deg']:.3f} deg, disp mean {r['disp_mean_mm']:.3f} mm {r['notes'] or ''} ({r['seconds']:.0f}s)")
     ms = info["multi_sim"]; _p = lambda d: "n/a (degenerate LCC)" if d is None else f"{d['mean_mm']:.3f}/{d['p95_mm']:.3f}"
     say(f"multi-sim disp mean/p95 mm: fine-lcc {_p(ms['fine_lcc'])}, fine-mi {_p(ms['fine_mi'])}, lcc-mi {_p(ms['lcc_mi'])} {ms['lcc_notes'] or ''} ({ms['seconds']:.0f}s)")
     say(f"split-half per axis {info['split_half']['per_axis_mm']} mm, loho_max {info['split_half']['loho_max_mm']} mm")

@@ -8,6 +8,12 @@ one exists; exterior pockets enclosed by the specimen are reassigned; closing / 
 W mask is resampled to the 0.15 mm grid and to the octv grid.  All sizes are given in mm and converted with the octv
 voxel size.  CPU only: multiprocessing.Pool(n_workers) over z-chunks of octv (forked workers read the parent's array).
 Reference: work/probe_xr/mask/scripts/{p1_aniso04,p1_rim04,p1_final,p1_common}.py (I58: 18.05 cm3, 1 CC, ~4 min).
+
+Options of oct_specimen_mask (every default = the v1.1 behaviour above; probe P8 found ~30 % of the I58 mask is agarose
+shell + lamellar pockets that the pocket / hole rules turn into mask): fill_pockets (step 5), fill_holes (steps 6-7),
+rim_required (rim_gate: drop watershed basins bounded by weak rims), boundary_erode_mm (extra final EDT erosion of the
+returned masks; the un-eroded 0.15 mm volume stays available as info['V_cm3_150_uneroded'] for the mask-band rule).  The
+chosen options and the volume after every stage are returned in info['options'] / ['volumes_cm3'].
 """
 from __future__ import annotations
 import os, time
@@ -55,18 +61,24 @@ def largest_cc(m: np.ndarray) -> tuple[np.ndarray, int]:
     sizes = np.bincount(lab.ravel()); sizes[0] = 0
     return lab == int(np.argmax(sizes)), int(n)
 
-def cleanup(m: np.ndarray, close_r: int = 0) -> tuple[np.ndarray, int]:
+def cleanup(m: np.ndarray, close_r: int = 0, fill_holes: bool = True, stats: dict | None = None) -> tuple[np.ndarray, int]:
     """Optional closing on an edge-padded array (plain binary_closing erodes a mask cut by the box faces), largest
-    component, 3-D hole filling -> (mask, n_components_before_largest)."""
+    component, 3-D hole filling (returned unfilled when fill_holes is False; stats, if given, receives 'holes_voxels' =
+    what the filling adds or would have added) -> (mask, n_components_before_largest)."""
     if close_r > 0:
         mp = np.pad(m, close_r, mode="edge"); mp = ndimage.binary_closing(mp, structure=ball(close_r))
         m = mp[close_r:-close_r, close_r:-close_r, close_r:-close_r]
-    m, n = largest_cc(m); return binary_fill_holes(m), n
+    m, n = largest_cc(m); filled = binary_fill_holes(m)
+    if stats is not None: stats["holes_voxels"] = int(filled.sum()) - int(m.sum())
+    return (filled if fill_holes else m), n
 
 def erode_mm(mask: np.ndarray, r_mm: float, vox_mm: float) -> np.ndarray:
     """Erosion by a ball of radius r_mm through the Euclidean distance transform (cheap for large radii); the box
-    faces count as boundary (1-voxel False padding), so the result is defined even for an all-True mask."""
-    d = ndimage.distance_transform_edt(np.pad(np.asarray(mask, bool), 1))[1:-1, 1:-1, 1:-1]
+    faces count as boundary (1-voxel False padding), so the result is defined even for an all-True mask.  r_mm <= 0
+    returns the mask itself (the EDT test 'd >= 0' would otherwise be True everywhere, background included)."""
+    mask = np.asarray(mask, bool)
+    if r_mm <= 0: return mask.copy()
+    d = ndimage.distance_transform_edt(np.pad(mask, 1))[1:-1, 1:-1, 1:-1]
     return d * vox_mm >= r_mm
 
 def gmm2_1d(v, iters: int = 100, n_sub: int = 500_000):
@@ -145,11 +157,47 @@ def _resample_chunk(args):
 
 
 # ----------------------------------------------------------------------------- the mask
-def oct_specimen_mask(octv: np.ndarray, A_v, o150: np.ndarray, A150, work, n_workers: int = 4):
+def rim_gate(lab: np.ndarray, E: np.ndarray, valid: np.ndarray, vox_W: float, min_frac: float = 0.5) -> tuple[np.ndarray, dict]:
+    """rim_required rule on the W grid.  lab is a watershed of E with the exterior marker = 1 and one marker label (>= 2)
+    per connected component of the inner texture marker, so every basin >= 2 is one texture region grown to its rim.
+    The exterior-facing boundary of a basin = its cells within 1 cell of a valid exterior (label 1) cell; cells next to
+    zero data (tiles / outside the block) or on the box faces are a crop, not a rim, and are not counted.  The largest
+    basin is taken as tissue and the p25 of the rim strength E along its boundary is the reference E25 ('tissue-boundary
+    p25'); every other basin is kept only if at least min_frac of its boundary cells have E >= E25 (a basin without an
+    exterior boundary is kept).  Dropped basins are relabelled 1 (exterior) and kept ones 2, so the caller's steps 5-6
+    run unchanged -> (lab', info with E25, the per-basin table and the dropped volume)."""
+    K = int(lab.max()); spec = (lab >= 2) & valid; cm3 = vox_W ** 3 / 1000.0
+    info = {"rule": f"basin kept iff >= {min_frac:.0%} of its exterior-facing 1-cell boundary has rim strength E >= p25 of the largest basin's boundary E",
+            "min_frac": min_frac, "n_basins": max(0, K - 1), "E25": None, "n_dropped": 0, "V_dropped_cm3_W": 0.0, "basins": []}
+    if K < 2 or not spec.any(): return lab, info
+    bnd = spec & ndimage.binary_dilation((lab == 1) & valid, structure=ball(1))
+    vol = np.bincount(lab[spec], minlength=K + 1); nb = np.bincount(lab[bnd], minlength=K + 1)
+    ref = int(np.argmax(vol[2:])) + 2; Eb = E[bnd & (lab == ref)]; E25 = float(np.percentile(Eb, 25)) if Eb.size else 0.0
+    ns = np.bincount(lab[bnd & (E >= E25)], minlength=K + 1)
+    keep = (nb == 0) | (ns >= min_frac * nb); keep[:2] = False
+    lab2 = np.where(lab >= 2, 2, lab).astype(lab.dtype); lab2[spec & ~keep[lab]] = 1
+    order = np.argsort(-vol[2:])[:12] + 2
+    info.update({"E25": E25, "ref_basin_label": ref, "ref_basin_cm3": float(vol[ref]) * cm3, "n_dropped": int((~keep[2:]).sum()),
+                 "V_dropped_cm3_W": float(vol[2:][~keep[2:]].sum()) * cm3, "V_kept_cm3_W": float(vol[2:][keep[2:]].sum()) * cm3,
+                 "basins": [{"label": int(k), "cm3": float(vol[k]) * cm3, "n_boundary": int(nb[k]), "frac_strong": (float(ns[k]) / float(nb[k]) if nb[k] else None), "kept": bool(keep[k])} for k in order]})
+    return lab2, info
+
+
+def oct_specimen_mask(octv: np.ndarray, A_v, o150: np.ndarray, A150, work, n_workers: int = 4, fill_pockets: bool = True, fill_holes: bool = True,
+                      rim_required: bool = False, boundary_erode_mm: float = 0.0, cache: dict | None = None):
     """Texture-marker + rim-watershed specimen mask of a slab-normalised OCT block (zeros = missing data).
 
     octv: (Z,Y,X) float16/float32 array or memmap at the vessel level (~0.04 mm) with voxel->world affine A_v;
     o150/A150: the 0.15 mm level (only o150 > 0 and its grid are used); work: directory for octv_mask_texture.npy.
+    Options (defaults = v1.1): fill_pockets = step 5 (exterior pockets enclosed by the specimen join the mask);
+    fill_holes = the 3-D binary_fill_holes of steps 6 (W) and 7 (0.15 mm); rim_required = rim_gate() on the watershed
+    basins (see there); boundary_erode_mm > 0 = extra EDT erosion (box faces count as boundary) of the cleaned W mask
+    right before it is resampled to the returned 0.15 mm and octv masks (V_cm3_W stays the un-eroded volume, and
+    info['V_cm3_150_uneroded'] is the 0.15 mm volume the un-eroded W mask would have given, for the mask-band rule of
+    prep_subject.py: the erosion is a boundary trim, not a change of the segmentation; == V_cm3_150 when off).  cache:
+    a dict that stores / reuses the texture field, threshold and rim strength of steps 1-3 (same octv), so several
+    option settings cost one field pass.  info['volumes_cm3'] holds the W volume after every stage (specimen basin,
+    + pockets, after cleanup, after erosion) with what the pocket and hole rules add (or would add when switched off).
     Returns (mask150_tex bool, path of the octv-grid bool memmap, info dict)."""
     t0 = time.time(); work = Path(work); work.mkdir(parents=True, exist_ok=True); A_v = np.asarray(A_v, float); A150 = np.asarray(A150, float)
     vox = float(np.linalg.norm(A_v[:3, :3], axis=0).mean()); vox150 = float(np.linalg.norm(A150[:3, :3], axis=0).mean())
@@ -160,55 +208,80 @@ def oct_specimen_mask(octv: np.ndarray, A_v, o150: np.ndarray, A150, work, n_wor
     CH = max(kW, (128 // kW) * kW); pad_f = max(16, int(np.ceil(4 * sig_bp)) + win + 2); pad_r = max(8, win_rim // 2 + 6)
     params = {"vox_v_mm": vox, "kW": kW, "vox_W_mm": vox_W, "shape_W": [ZW, YW, XW], "bp_sigma_vox": sig_bp, "std_window_vox": win, "rim_window_vox": win_rim,
               "smooth_sigma_cells": sig_s, "open_r_cells": r_open, "close_r_cells": r_close, "chunk": CH, "n_workers": n_workers}
+    options = {"fill_pockets": bool(fill_pockets), "fill_holes": bool(fill_holes), "rim_required": bool(rim_required), "boundary_erode_mm": float(boundary_erode_mm)}
+    cm3_W = vox_W ** 3 / 1000.0; vols = {}
     jobs = [(z0, min(Z, z0 + CH)) for z0 in range(0, ZW * kW, CH)]
-    # ---- step 1: texture field F on W
-    fields = np.zeros((5, ZW, YW, XW), np.float32)
-    for z0, arr in _run(_field_chunk, [(a, b, pad_f, sig_bp, win, kW) for a, b in jobs], octv, n_workers):
-        fields[:, z0 // kW:z0 // kW + arr.shape[1]] = arr
-    den = np.maximum(fields[4], 1e-3); valid = fields[4] > 0.5; mv = valid.astype(np.float32)
-    def msmooth(f): return gaussian_filter(f * mv, sig_s) / np.maximum(gaussian_filter(mv, sig_s), 1e-3)
-    Ss = [msmooth(fields[i] / den) for i in range(3)]; MU = msmooth(fields[3] / den)
-    F = np.minimum(np.minimum(Ss[0], Ss[1]), Ss[2]) / np.maximum(MU, 1.0); F[~valid] = 0; del fields, Ss, MU, den
-    t1 = time.time()
-    # ---- step 2: threshold from a log-GMM (never Otsu: it splits at the rim class)
-    sel = valid & (F > 0)
-    if sel.sum() >= 1000:
-        lthr, ginfo = gmm2_1d(np.log(F[sel])); thr = float(np.exp(lthr))
+    if cache is not None and "F" in cache:      # steps 1-3 reused (same octv, same constants)
+        F, thr, ginfo, E, valid = cache["F"], cache["thr"], cache["gmm"], cache["E"], cache["valid"]
+        sec_field, sec_rim = cache["seconds_field"], cache["seconds_rim"]; t2 = time.time()
     else:
-        thr, ginfo = float("nan"), {"log_means": None, "sds": None, "weights": None}
-    # ---- step 3: rim strength E on W
-    E = np.zeros((ZW, YW, XW), np.float32)
-    for z0, arr in _run(_rim_chunk, [(a, b, pad_r, win_rim, kW) for a, b in jobs], octv, n_workers):
-        E[z0 // kW:z0 // kW + arr.shape[0]] = arr
-    E[~valid] = 0; t2 = time.time()
-    # ---- steps 4-6: markers, watershed, enclosed exterior pockets, cleanup
+        # ---- step 1: texture field F on W
+        fields = np.zeros((5, ZW, YW, XW), np.float32)
+        for z0, arr in _run(_field_chunk, [(a, b, pad_f, sig_bp, win, kW) for a, b in jobs], octv, n_workers):
+            fields[:, z0 // kW:z0 // kW + arr.shape[1]] = arr
+        den = np.maximum(fields[4], 1e-3); valid = fields[4] > 0.5; mv = valid.astype(np.float32)
+        def msmooth(f): return gaussian_filter(f * mv, sig_s) / np.maximum(gaussian_filter(mv, sig_s), 1e-3)
+        Ss = [msmooth(fields[i] / den) for i in range(3)]; MU = msmooth(fields[3] / den)
+        F = np.minimum(np.minimum(Ss[0], Ss[1]), Ss[2]) / np.maximum(MU, 1.0); F[~valid] = 0; del fields, Ss, MU, den
+        t1 = time.time()
+        # ---- step 2: threshold from a log-GMM (never Otsu: it splits at the rim class)
+        sel = valid & (F > 0)
+        if sel.sum() >= 1000:
+            lthr, ginfo = gmm2_1d(np.log(F[sel])); thr = float(np.exp(lthr))
+        else:
+            thr, ginfo = float("nan"), {"log_means": None, "sds": None, "weights": None}
+        # ---- step 3: rim strength E on W
+        E = np.zeros((ZW, YW, XW), np.float32)
+        for z0, arr in _run(_rim_chunk, [(a, b, pad_r, win_rim, kW) for a, b in jobs], octv, n_workers):
+            E[z0 // kW:z0 // kW + arr.shape[0]] = arr
+        E[~valid] = 0; t2 = time.time(); sec_field, sec_rim = t1 - t0, t2 - t1
+        if cache is not None: cache.update(F=F, thr=thr, gmm=ginfo, E=E, valid=valid, seconds_field=sec_field, seconds_rim=sec_rim)
+    # ---- steps 4-6: markers, watershed (+ optional rim gate), enclosed exterior pockets, cleanup
     from skimage.segmentation import watershed
     if np.isfinite(thr):
         inner = ndimage.binary_opening((F > thr) & valid, structure=ball(r_open)); outer = ndimage.binary_opening((F < thr) & valid, structure=ball(r_open)) | ~valid
     else:
         inner = np.zeros_like(valid); outer = np.ones_like(valid)
-    mk = np.zeros(F.shape, np.int32); mk[outer] = 1; mk[inner] = 2
-    lab = watershed(E, mk)
+    mk = np.zeros(F.shape, np.int32); mk[outer] = 1; rim_info = None
+    if rim_required and inner.any():       # one marker label per inner-marker component -> rim_gate decides which basins stay
+        li, _ = label(inner); mk[inner] = li[inner] + 1; del li
+        lab, rim_info = rim_gate(watershed(E, mk), E, valid, vox_W)
+        vols["W_basins_before_rim_gate"] = rim_info["V_dropped_cm3_W"] + rim_info.get("V_kept_cm3_W", 0.0)
+    else:
+        mk[inner] = 2; lab = watershed(E, mk)
+    vols["W_specimen_basin"] = float(((lab == 2) & valid).sum()) * cm3_W
     ext = (lab == 1) & valid; le, ne = label(ext); touch = np.zeros(ne + 1, bool)
     for f in (le[0], le[-1], le[:, 0], le[:, -1], le[:, :, 0], le[:, :, -1]): touch[np.unique(f)] = True
     touch[np.unique(le[ndimage.binary_dilation(~valid, structure=ball(1))])] = True; touch[0] = False
-    mask_W = valid & ~np.isin(le, np.where(touch)[0])                 # specimen label + exterior pockets that reach neither a face nor a zero cell
-    mask_W, n_cc_W = cleanup(mask_W, close_r=r_close); del lab, ext, le, mk, inner, outer, E
+    nt = np.isin(le, np.where(touch)[0])                              # exterior cells whose component reaches a face or a zero cell
+    vols["W_pockets"] = float((ext & ~nt).sum()) * cm3_W              # what step 5 adds (or would add): exterior pockets enclosed by the specimen
+    mask_W = (valid & ~nt) if fill_pockets else ((lab == 2) & valid)  # specimen label + exterior pockets that reach neither a face nor a zero cell
+    vols["W_after_pockets"] = float(mask_W.sum()) * cm3_W; st_W = {}
+    mask_W, n_cc_W = cleanup(mask_W, close_r=r_close, fill_holes=fill_holes, stats=st_W); del lab, ext, le, mk, inner, outer, E, nt
+    vols["W_holes"] = st_W["holes_voxels"] * cm3_W; vols["W_after_cleanup"] = float(mask_W.sum()) * cm3_W
+    mask_W_out = erode_mm(mask_W, boundary_erode_mm, vox_W) if boundary_erode_mm > 0 else mask_W
+    vols["W_after_erode"] = float(mask_W_out.sum()) * cm3_W
     t3 = time.time()
     # ---- step 7: resample W -> 0.15 mm grid and -> octv grid (bool memmap)
-    mf = mask_W.astype(np.float32)
-    f150 = map_coordinates(mf, grid_coords(np.linalg.inv(A_W) @ A150, o150.shape), order=1, mode="nearest").reshape(o150.shape)
-    mask150 = (f150 > 0.5) & (np.asarray(o150) > 0); mask150, n_cc_150 = cleanup(mask150); del f150
+    mf = mask_W_out.astype(np.float32); M150 = np.linalg.inv(A_W) @ A150
+    f150 = map_coordinates(mf, grid_coords(M150, o150.shape), order=1, mode="nearest").reshape(o150.shape)
+    mask150 = (f150 > 0.5) & (np.asarray(o150) > 0); vols["150_before_cleanup"] = float(mask150.sum()) * vox150 ** 3 / 1000.0; st_150 = {}
+    mask150, n_cc_150 = cleanup(mask150, fill_holes=fill_holes, stats=st_150); del f150
+    vols["150_holes"] = st_150["holes_voxels"] * vox150 ** 3 / 1000.0; vols["150_final"] = float(mask150.sum()) * vox150 ** 3 / 1000.0
+    if boundary_erode_mm > 0:      # same resample + cleanup of the UN-eroded W mask: the volume the band rule should judge (a boundary trim is not a segmentation change)
+        m0 = (map_coordinates(mask_W.astype(np.float32), grid_coords(M150, o150.shape), order=1, mode="nearest").reshape(o150.shape) > 0.5) & (np.asarray(o150) > 0)
+        vols["150_final_uneroded"] = float(cleanup(m0, fill_holes=fill_holes)[0].sum()) * vox150 ** 3 / 1000.0; del m0
+    else: vols["150_final_uneroded"] = vols["150_final"]
     maskv_path = work / "octv_mask_texture.npy"
     np.lib.format.open_memmap(str(maskv_path), mode="w+", dtype=bool, shape=(Z, Y, X)).flush()
     Mv = np.linalg.inv(A_W) @ A_v; n_v = 0
     for _, n in _run(_resample_chunk, [(z0, min(Z, z0 + 32), Mv, str(maskv_path)) for z0 in range(0, Z, 32)], octv, n_workers, aux=mf):
         n_v += n
-    t4 = time.time()
+    t4 = time.time(); vols["v_final"] = n_v * vox ** 3 / 1000.0
     info = {"V_cm3_150": float(mask150.sum()) * vox150 ** 3 / 1000.0, "V_cm3_W": float(mask_W.sum()) * vox_W ** 3 / 1000.0, "V_cm3_v": n_v * vox ** 3 / 1000.0,
-            "voxels150": int(mask150.sum()), "voxels_v": int(n_v), "frac150": float(mask150.mean()), "thr": thr, "gmm": ginfo,
-            "n_cc_before_largest": n_cc_W, "n_cc_150_before_largest": n_cc_150, "seconds_field": t1 - t0, "seconds_rim": t2 - t1, "seconds_ws": t3 - t2,
-            "seconds_resample": t4 - t3, "seconds_total": t4 - t0, "params": params}
+            "V_cm3_W_eroded": vols["W_after_erode"], "V_cm3_150_uneroded": vols["150_final_uneroded"], "voxels150": int(mask150.sum()), "voxels_v": int(n_v), "frac150": float(mask150.mean()), "thr": thr, "gmm": ginfo,
+            "n_cc_before_largest": n_cc_W, "n_cc_150_before_largest": n_cc_150, "seconds_field": sec_field, "seconds_rim": sec_rim, "seconds_ws": t3 - t2,
+            "seconds_resample": t4 - t3, "seconds_total": t4 - t0, "params": params, "options": options, "volumes_cm3": vols, "rim_gate": rim_info}
     return mask150, maskv_path, info
 
 

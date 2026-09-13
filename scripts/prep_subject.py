@@ -7,6 +7,10 @@
   ba_labels.npy                    [optional, evaluation only] the block-region manual labels (same coding)
   mri_vessels.npy                  [optional, evaluation only] manual MRI vessel label (bool)
   oct150.npy/_affine/_mask         OCT block at --target-mm (default 0.15 mm), slab-normalised, isotropic grid in the OCT frame
+  oct150_mask_core.npy             the chosen 0.15 mm mask eroded to --mask-core-mm (default 2 mm; EDT, box faces count as boundary) from the
+                                   UN-eroded specimen boundary (P8: the outer 2 mm of the I58 texture mask is 60 % agarose).  Today nothing in
+                                   the pipeline reads it: register.py / the fine stage take oct150_mask.npy, so an eroded mask reaches them
+                                   through --mask-erode-mm; scripts/test_specimen_mask.py --eval-mask measures the core against the MRI.
   octv.npy/_affine/_mask           OCT 'vessel level' (native if >= 24 um, else pooled to ~24 um), float16
   octv_vessels.npy                 our own OCT vessel segmentation at the vessel level (dark tubes 24-106 um, top-1% inside tissue)
   oct_ves_dist48_own.npy/_affine   EDT (um) to the nearest own OCT vessel on a ~48 um grid (evaluation)
@@ -39,6 +43,13 @@ ap.add_argument("--skip-vessels", action="store_true", help="no Frangi / octv_ve
 ap.add_argument("--mri-tissue-cm3", type=float, default=None, help="MRI tissue volume (cm3) for the auto mask rule when the MRI was not prepped into this --work")
 ap.add_argument("--mask-band", type=str, default="0.5,1.75", help="accepted V_texture / V_MRI band 'lo,hi'")
 ap.add_argument("--save-stripe-field", action="store_true", help="write octv_stripeS.npy (float16, diagnostics only)")
+ap.add_argument("--mask-fill-pockets", choices=["on", "off"], default="on", help="texture mask step 5: exterior pockets enclosed by the specimen join the mask (P8: on I58 they are agarose between lamellar sheets)")
+ap.add_argument("--mask-fill-holes", choices=["on", "off"], default="on", help="texture mask steps 6-7: 3-D binary hole filling of the W and 0.15 mm masks")
+ap.add_argument("--mask-rim-required", choices=["on", "off"], default="off", help="texture mask: drop watershed basins whose exterior rim is mostly weaker than the p25 rim strength of the largest basin (specimen.rim_gate)")
+ap.add_argument("--mask-erode-mm", type=float, default=0.0, help="texture mask: extra final EDT erosion (mm) of the returned 0.15 mm / octv texture masks (0 = off). The eroded mask is what oct150_mask.npy, "
+                "octv_mask.npy and hence register.py's fine stage see; the auto mask-band rule judges the UN-eroded texture volume (texture.V_cm3_150_uneroded), and oct150_mask_core.npy / the stripe-axis "
+                "diagnostic mask are eroded only by what is missing to --mask-core-mm / 2 mm from the un-eroded boundary (never stacked)")
+ap.add_argument("--mask-core-mm", type=float, default=2.0, help="oct150_mask_core.npy = chosen mask eroded to this distance (mm) from the un-eroded specimen boundary (0 = no core file)")
 a = ap.parse_args(); a.work.mkdir(parents=True, exist_ok=True); t0 = time.time()
 info = json.load(open(a.work / "prep.json")) if (a.work / "prep.json").exists() else {}
 def say(*x): print(*x, f"[{time.time()-t0:.0f}s]", flush=True)
@@ -138,11 +149,22 @@ if not a.skip_oct:
     kv = np.maximum(1, np.ceil(a.vessel_level_um / sp - 1e-6)).astype(int)     # never finer than the vessel level (20 um data -> 40 um)
     if a.stripe_axis not in ("auto", "0", "1", "2"): raise SystemExit(f"--stripe-axis must be auto|0|1|2, got {a.stripe_axis}")
     band = tuple(float(x) for x in a.mask_band.split(","))
+    mask_opts = {"fill_pockets": a.mask_fill_pockets == "on", "fill_holes": a.mask_fill_holes == "on", "rim_required": a.mask_rim_required == "on", "boundary_erode_mm": float(a.mask_erode_mm)}
     V_mri = a.mri_tissue_cm3                                                   # MRI tissue volume (cm3) for the mask rule; from prep.json when the MRI was prepped into this --work
     if V_mri is None and all(k in info.get("mri", {}) for k in ("tissue_fraction", "shape", "voxel_mm")):
         V_mri = float(info["mri"]["tissue_fraction"] * np.prod(info["mri"]["shape"]) * np.prod(info["mri"]["voxel_mm"]) / 1000.0)
     vol150 = lambda m: float(m.sum()) * a.target_mm ** 3 / 1000.0             # cm3 at the 0.15 mm level
-    mask_tex = None; V_tex = None; tex_info = None; ds_info = {"applied": False, "reason": "off"}; ds_diag = None; axis = None; provenance = "v1"
+    mask_tex = None; V_tex = None; V_tex0 = None; tex_info = None; ds_info = {"applied": False, "reason": "off"}; ds_diag = None; axis = None; provenance = "v1"
+    DIAG_ERODE_MM = 2.0                                                        # stripe-axis detection / destripe estimation run on the chosen mask 2 mm inside the specimen boundary
+    def erode_from_boundary(m150, r_mm, mode):
+        """m150 eroded to r_mm from the UN-eroded specimen boundary: a chosen texture mask already lost --mask-erode-mm on the W grid,
+        so only the remainder is applied (the intensity mask is never eroded by that option) -> (mask, mm applied here)."""
+        extra = max(0.0, r_mm - (mask_opts["boundary_erode_mm"] if mode == "texture" else 0.0))
+        return erode_mm(m150, extra, a.target_mm), extra
+    def tex_report():
+        return (f"texture mask {V_tex:.2f} cm3 (W {tex_info['V_cm3_W']:.2f}, octv {tex_info['V_cm3_v']:.2f}" + (f"; un-eroded {V_tex0:.2f} for the band rule" if V_tex0 != V_tex else "")
+                + f"), thr {tex_info['thr']:.4g}, n_cc {tex_info['n_cc_before_largest']}, {tex_info['seconds_total']:.0f} s; options {mask_opts}; "
+                f"W stages {({k: round(v, 2) for k, v in tex_info['volumes_cm3'].items() if k.startswith('W_')})}")
     def vgrid(m150):
         """nearest resample of a 0.15 mm mask onto the vessel grid (same construction as maskv below)."""
         M_ = np.linalg.inv(A150) @ A_v
@@ -170,8 +192,8 @@ if not a.skip_oct:
         want_tex, want_reason = want_texture(a.oct_mask, V_int, V_mri)
         if want_tex:    # data-driven: never fires on the DANDI cortex blocks (V_int << 1.5 V_mri)
             say(f"texture specimen mask ({want_reason}; V_int {V_int:.2f} cm3, V_mri {V_mri})")
-            mask_tex, _, tex_info = oct_specimen_mask(octv, A_v, o150, A150, a.work, n_workers=4); V_tex = tex_info["V_cm3_150"]
-            say(f"texture mask {V_tex:.2f} cm3 (W {tex_info['V_cm3_W']:.2f}, octv {tex_info['V_cm3_v']:.2f}), thr {tex_info['thr']:.4g}, n_cc {tex_info['n_cc_before_largest']}, {tex_info['seconds_total']:.0f} s")
+            mask_tex, _, tex_info = oct_specimen_mask(octv, A_v, o150, A150, a.work, n_workers=4, **mask_opts); V_tex, V_tex0 = tex_info["V_cm3_150"], tex_info["V_cm3_150_uneroded"]
+            say(tex_report())
     else:
         # a. vessel level first (the destripe works on octv; octn is freed before anything else is allocated)
         octv = octn if kv.max() == 1 else pool_mean_np(octn, kv).astype(np.float16); A_v = pooled_affine(A_nat, kv); sp_v = sp * kv
@@ -193,11 +215,11 @@ if not a.skip_oct:
         want_tex, want_reason = want_texture(a.oct_mask, V_int_nd, V_mri)
         if want_tex:
             say(f"texture specimen mask ({want_reason}; V_int {V_int_nd:.2f} cm3, V_mri {V_mri})")
-            mask_tex, _, tex_info = oct_specimen_mask(octv, A_v, o150_nd, A150, a.work, n_workers=4); V_tex = tex_info["V_cm3_150"]
-            say(f"texture mask {V_tex:.2f} cm3 (W {tex_info['V_cm3_W']:.2f}, octv {tex_info['V_cm3_v']:.2f}), thr {tex_info['thr']:.4g}, n_cc {tex_info['n_cc_before_largest']}, {tex_info['seconds_total']:.0f} s")
-        # e. stripe axis on the chosen mask eroded 2 mm, nearest-resampled to the octv grid
-        m_diag = choose_oct_mask(mask_int_nd, V_int_nd, mask_tex, V_tex, V_mri, a.oct_mask, band)[0]
-        maskv_diag = vgrid(erode_mm(m_diag, 2.0, a.target_mm)); del m_diag
+            mask_tex, _, tex_info = oct_specimen_mask(octv, A_v, o150_nd, A150, a.work, n_workers=4, **mask_opts); V_tex, V_tex0 = tex_info["V_cm3_150"], tex_info["V_cm3_150_uneroded"]
+            say(tex_report())
+        # e. stripe axis on the chosen mask 2 mm inside the un-eroded specimen boundary, nearest-resampled to the octv grid
+        m_diag, m_diag_mode = choose_oct_mask(mask_int_nd, V_int_nd, mask_tex, V_tex0, V_mri, a.oct_mask, band)[:2]
+        maskv_diag = vgrid(erode_from_boundary(m_diag, DIAG_ERODE_MM, m_diag_mode)[0]); del m_diag
         from octreg import destripe as _ds
         axis, ds_diag = _ds.detect_stripe_axis(octv, mask=maskv_diag, n_planes=40, hp_sigma_vox=3.0)
         if a.stripe_axis != "auto": ds_diag = override_axis(ds_diag, axis, int(a.stripe_axis)); axis = int(a.stripe_axis)
@@ -220,14 +242,19 @@ if not a.skip_oct:
         V_int = vol150(mask_int)
         say("oct150", shape150, "tissue frac", round(float(mask_int.mean()), 3), f"({provenance})")
     # ---- mask choice (v1 path: no texture mask computed -> resolves to mask_int) and saves; oct150_mask.npy = the CHOSEN mask
-    mask150, mask_mode, mask_reason = choose_oct_mask(mask_int, V_int, mask_tex, V_tex, V_mri, a.oct_mask, band)
+    mask150, mask_mode, mask_reason = choose_oct_mask(mask_int, V_int, mask_tex, V_tex0, V_mri, a.oct_mask, band)   # band rule on the UN-eroded texture volume
     if a.oct_mask == "auto" and V_mri is None: say("WARNING: auto mask rule needs the MRI volume (prep the MRI into this --work or pass --mri-tissue-cm3); using intensity")
     np.save(a.work / "oct150_mask.npy", mask150); np.save(a.work / "oct150_mask_intensity.npy", mask_int)
     if mask_tex is not None: np.save(a.work / "oct150_mask_texture.npy", mask_tex)
+    V_core = core_extra = None                                                   # P8: the outer 2 mm of the I58 texture mask is 60 % non-tissue -> boundary-based consumers should use the core
+    if a.mask_core_mm > 0:
+        mask_core, core_extra = erode_from_boundary(mask150, a.mask_core_mm, mask_mode); V_core = vol150(mask_core); np.save(a.work / "oct150_mask_core.npy", mask_core)
+        say(f"oct150_mask_core.npy = chosen mask {a.mask_core_mm} mm inside the un-eroded boundary (eroded {core_extra} mm here): {V_core:.2f} cm3 ({float(mask_core.mean()):.3f} of the grid)"); del mask_core
+    else: say("no oct150_mask_core.npy (--mask-core-mm 0)")
     try:    # diagnostic figure only: a matplotlib / font-cache failure must never abort the prep
         mask_qc_png(o150, mask_int, mask150, a.work / "oct150_mask_qc.png", title=f"{a.work.name}: mask {mask_mode} ({mask_reason}); V_int {V_int:.2f} cm3, V_tex {V_tex if V_tex is None else round(V_tex, 2)}, V_mri {V_mri if V_mri is None else round(V_mri, 2)} cm3")
     except Exception as e: say(f"WARNING: oct150_mask_qc.png not written ({type(e).__name__}: {e})")
-    say(f"oct150 mask: {mask_mode} ({mask_reason}); V_int {V_int:.2f} cm3, V_tex {V_tex}, V_mri {V_mri}, chosen frac {float(mask150.mean()):.3f}")
+    say(f"oct150 mask: {mask_mode} ({mask_reason}); V_int {V_int:.2f} cm3, V_tex {V_tex}" + (f" (un-eroded {V_tex0} judged by the band)" if V_tex0 != V_tex else "") + f", V_mri {V_mri}, chosen frac {float(mask150.mean()):.3f}")
     # tissue mask at the vessel level: the (cleaned) 0.15 mm mask resampled nearest onto the vessel grid (no full-res morphology)
     M_ = np.linalg.inv(A150) @ A_v                                   # vessel-grid voxel -> 0.15 mm voxel (same axes, diagonal + offset)
     idx = [np.clip(np.rint(M_[r, r] * np.arange(octv.shape[r]) + M_[r, 3]).astype(int), 0, mask150.shape[r] - 1) for r in range(3)]
@@ -237,7 +264,7 @@ if not a.skip_oct:
     if a.destripe == "off" and mask_tex is not None and ds_diag is None:       # diagnostic stripe axis (no destripe) for the vessel section-phase check whenever the texture mask was computed (forced OR auto-selected; never on the v1 default path)
         try:
             from octreg import destripe as _ds
-            axis, ds_diag = _ds.detect_stripe_axis(octv, mask=vgrid(erode_mm(mask150, 2.0, a.target_mm)), n_planes=40, hp_sigma_vox=3.0)
+            axis, ds_diag = _ds.detect_stripe_axis(octv, mask=vgrid(erode_from_boundary(mask150, DIAG_ERODE_MM, mask_mode)[0]), n_planes=40, hp_sigma_vox=3.0)
             if a.stripe_axis != "auto": ds_diag = override_axis(ds_diag, axis, int(a.stripe_axis)); axis = int(a.stripe_axis)
             ds_info["detect"] = ds_diag; say("stripe axis (diagnostic only)", axis, ds_diag)
         except ImportError: say("octreg.destripe not available: no stripe-axis diagnostic")
@@ -280,7 +307,9 @@ if not a.skip_oct:
                    "per_slice_median_head": [round(x, 1) if x == x else None for x in slab["per_slice_median"][:5]],
                    "mask_mode": mask_mode, "mask_reason": mask_reason, "tissue_frac150_intensity": float(mask_int.mean()),
                    "tissue_frac150_texture": None if mask_tex is None else float(mask_tex.mean()), "V_oct_cm3_int": V_int, "V_oct_cm3_tex": V_tex, "V_mri_cm3": V_mri,
-                   "mask_band": list(band), "texture": tex_info, "destripe": ds_info, "oct150_provenance": provenance, "vessels_skipped": bool(a.skip_vessels)}
+                   "mask_band": list(band), "texture": tex_info, "mask_options": mask_opts, "V_oct_cm3_tex_uneroded": V_tex0,
+                   "V_oct_cm3_core": V_core, "mask_core_erode_mm": a.mask_core_mm, "mask_core_extra_erode_mm": core_extra, "mask_diag_erode_mm": DIAG_ERODE_MM,
+                   "destripe": ds_info, "oct150_provenance": provenance, "vessels_skipped": bool(a.skip_vessels)}
     if a.destripe == "on": info["oct"]["V_oct_cm3_int_nodestripe"] = V_int_nd
     if vmask is not None and ds_diag is not None and axis is not None and ds_diag.get("period_vox") is not None:   # vessel density vs section phase (I58: ratio 2.54)
         mod = _ds.section_phase_modulation(vmask, maskv, axis=axis, period_vox=ds_diag["period_vox"])
