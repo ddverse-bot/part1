@@ -1,7 +1,7 @@
 #!/bin/bash
 # One command for Xiangrui's I58 brainstem pair (AutoDL server), label-free, final settings of 2026-09-14:
 #   prep (texture specimen mask, axis-detected destripe)  ->  register (FFT search + rigid/similarity/affine, no fine stage)
-#   ->  QC (viz + qc_fine)  ->  export in the ORIGINAL NIfTI frames (4x4 + FreeSurfer LTA + overlays)  ->  summary.json
+#   ->  QC (viz + qc_fine)  ->  export in the ORIGINAL NIfTI frames (4x4 + FreeSurfer LTA + overlays), checked against the raw OCT file  ->  summary.json
 # The handedness of the OCT relative to the MRI is not decided by the data (REPORT_I58_v11 Appendix C.4): by default the script
 # therefore also registers the other handedness (mirrored OCT frame, --no-mirror) and exports both candidates side by side, so a
 # person can decide by eye in freeview.  Set HANDEDNESS=search to run only the pipeline's own choice.
@@ -31,6 +31,7 @@ step register python $S/register.py --work $W --out $R --oct-wm-bright auto || e
 step viz      python $S/viz_result.py --work $W --run $R
 step qc       python $S/qc_fine.py --work $W --run $R
 step export   python $S/export_registration.py --work $W --run $R --oct-nifti $OCT --mri-nifti $MRI --out $R/export
+step export_check python $S/check_export_header.py --export $R/export --oct-nifti $OCT --mri-nifti $MRI --box 7
 # 3. the other handedness: OCT frame flipped along array axis 2, search restricted to proper poses in that frame
 if [ "$HANDEDNESS" = both ]; then
   WM=${W}_mirror; RM=${R}_mirror; mkdir -p $WM
@@ -44,6 +45,7 @@ F = np.eye(4); F[2, 2] = -1; F[2, 3] = n[2] - 1; np.save('$WM/oct150_affine.npy'
 import numpy as np; A = np.load('$W/oct150_affine.npy'); F = np.load('$WM/flip_voxel.npy'); T = np.load('$RM/T_oct2mri.npy')
 np.save('$RM/T_oct2mri_in_prep_frame.npy', T @ A @ F @ np.linalg.inv(A))"
   step export_mirror   python $S/export_registration.py --work $W --run $RM --T $RM/T_oct2mri_in_prep_frame.npy --oct-nifti $OCT --mri-nifti $MRI --out $RM/export
+  step export_mirror_check python $S/check_export_header.py --export $RM/export --oct-nifti $OCT --mri-nifti $MRI --box 7
   step fig_handedness  python $S/fig_handedness.py $MRI $R/export/oct_in_mri.nii.gz $RM/export/oct_in_mri.nii.gz $R/handedness_side_by_side.png
 fi
 # 4. summary
@@ -62,7 +64,7 @@ def cand(run, T_key):
     return {"run": run, "search_top1_top2": [s.get("top1"), s.get("top2")], "structural_ncc": (r.get("refine") or {}).get("final_ncc"),
             "structural_restarts": (r.get("evaluation") or {}).get("restarts", {}).get("n_converged"), "stretch_ijk": (r.get("final_transform") or {}).get("stretch_ijk"),
             "det_in_prep_frame": float(np.linalg.det(np.load(f"{run}/{T_key}.npy")[:3, :3])), "det_in_nifti_frames": e.get("det"), "export": f"{run}/export", "T_octnii_to_mrinii": e.get("T_octnii_to_mrinii"),
-            "qc": qc(run), "export_check_vs_register": (e.get("checks") or {}).get("vs_register_oct_in_mri_region")}
+            "qc": qc(run), "export_check_vs_register": (e.get("checks") or {}).get("vs_register_oct_in_mri_region"), "export_check_vs_raw_oct": load(f"{run}/export/check_header.json")}
 out = {"prep": W, "prep_oct": (load(f"{W}/prep.json").get("oct") or {}).get("mask_mode"), "candidate_pipeline_choice": cand(R, "T_oct2mri")}
 if H == "both": out["candidate_other_handedness"] = cand(R + "_mirror", "T_oct2mri_in_prep_frame"); out["figure"] = f"{R}/handedness_side_by_side.png"
 out["reading"] = ("Body-level pose only (boundary agreement ~1.5-2 mm). The two handedness candidates trade outline agreement against internal class "
