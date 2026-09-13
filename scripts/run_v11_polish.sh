@@ -4,7 +4,7 @@
 # leave regress.py's fine tolerances intact against the v1.1 default run), then on I58 from the structural pose P_R5.
 # Strictly serial, one GPU job at a time; a failed step is logged and the chain continues (no `set -e`).
 # usage: bash octreg/scripts/run_v11_polish.sh [R12 R13 R14]
-#   R12  I46 polish variants (GPU ~25 min each): a = affine polish, b = rigid polish; each vs work/runs/v11/I46_v11 with --tol fine
+#   R12  labelled-cortex calibration (GPU ~25 min each): I46 and I55, a = affine polish, b = rigid polish; each vs work/runs/v11/<SUB>_v11 with --tol fine
 #   R13  I58 polish from P_R5 (GPU ~20 min each, --fine-verify full) with the same two variants + FOV rind exclusion, then qc_fine
 #   R14  summary table
 set -u
@@ -36,14 +36,17 @@ PY
 POLISH="--fine on --fine-fixed-mask on --fine-fixed-weight on --fine-restart-mm 1 --fine-restart-deg 2"
 STEPS=${*:-"R12 R13 R14"}
 for R in $STEPS; do case $R in
-R12)  # I46 calibration: a = affine DOF (v1.1 schedule), b = rigid DOF; both must pass regress.py --tol fine against I46_v11
-  step R12_I46_polish_a  python $S/register.py --work work/I46 --out $RUNS/I46_v11_polish_a --oct-wm-bright auto $POLISH --fine-dof affine
-  need_run R12_I46_a $RUNS/I46_v11_polish_a && fine_report $RUNS/I46_v11_polish_a
-  need_run R12_I46_a_regress $RUNS/I46_v11_polish_a && step R12_I46_polish_a_regress python $S/regress.py $RUNS/I46_v11 $RUNS/I46_v11_polish_a --tol fine
-  step R12_I46_polish_b  python $S/register.py --work work/I46 --out $RUNS/I46_v11_polish_b --oct-wm-bright auto $POLISH --fine-dof rigid
-  need_run R12_I46_b $RUNS/I46_v11_polish_b && fine_report $RUNS/I46_v11_polish_b
-  need_run R12_I46_b_regress $RUNS/I46_v11_polish_b && step R12_I46_polish_b_regress python $S/regress.py $RUNS/I46_v11 $RUNS/I46_v11_polish_b --tol fine
-  ;;
+R12)  # labelled-cortex calibration on I46 and I55: a = affine DOF (v1.1 schedule), b = rigid DOF; each vs <SUB>_v11 with regress.py --tol fine
+  # Reading rule (REPORT_I58_v11 section 6): a variant is harmless only if, on BOTH subjects, it is either rejected by its own gates or accepted with
+  # every accuracy row (F2-F5: pose move, Dice, vessel medians / f150, depth stretch) inside the fine tolerances; F6 (wall time) is not an accuracy row.
+  for SUB in I46 I55; do
+    for V in a:affine b:rigid; do D=${V%%:*}; DOF=${V##*:}
+      step R12_${SUB}_polish_$D  python $S/register.py --work work/$SUB --out $RUNS/${SUB}_v11_polish_$D --oct-wm-bright auto $POLISH --fine-dof $DOF
+      need_run R12_${SUB}_$D $RUNS/${SUB}_v11_polish_$D && fine_report $RUNS/${SUB}_v11_polish_$D
+      need_run R12_${SUB}_${D}_regress $RUNS/${SUB}_v11 && need_run R12_${SUB}_${D}_regress $RUNS/${SUB}_v11_polish_$D && \
+        step R12_${SUB}_polish_${D}_regress python $S/regress.py $RUNS/${SUB}_v11 $RUNS/${SUB}_v11_polish_$D --tol fine
+    done
+  done ;;
 R13)  # I58 from P_R5 (structural pose of xiangrui_I58bs), vascular off, FOV rind 1 mm excluded, full verification, then qc_fine
   T0=$RUNS/xiangrui_I58bs/T_oct2mri_structural.npy
   for V in a:affine b:rigid; do D=${V%%:*}; DOF=${V##*:}
