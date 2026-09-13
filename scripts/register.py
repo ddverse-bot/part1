@@ -23,18 +23,33 @@ from octreg.search import FFTSearcher
 from octreg.refine import Refiner, params_from_matrix, compose
 from octreg.evaluate import vessel_distance_stats, gm_wm_overlap, transform_diff, qc_figure
 from octreg.vascular import mri_dark_channel, density_on_grid, vascular_refine
+from octreg.fine import FineContext, FineConfig, fine_stage, mri_box, block_corners, pose_move
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--work", type=Path, required=True); ap.add_argument("--out", type=Path, required=True)
 ap.add_argument("--features", choices=["otsu", "parser"], default="otsu"); ap.add_argument("--parser-dir", type=Path, default=None, help="dir with mri_prob_{wm,gm,tissue}.npy (features=parser)")
-ap.add_argument("--crop-centre", type=str, default=None, help="x,y,z mm: register against a crop of the MRI around this point"); ap.add_argument("--crop-half-mm", type=float, default=30.0)
+ap.add_argument("--crop-centre", type=str, default=None, help="x,y,z mm: register against a crop of the MRI around this point (a negative x must be written --crop-centre=-x,y,z: argparse reads '-5,..' as an option)"); ap.add_argument("--crop-half-mm", type=float, default=30.0)
 ap.add_argument("--n-rot", type=int, default=8000); ap.add_argument("--topk", type=int, default=24); ap.add_argument("--min-overlap", type=float, default=0.85)
 ap.add_argument("--no-mirror", action="store_true"); ap.add_argument("--oct-wm-bright", choices=["auto", "yes", "no"], default="no", help="is the brighter OCT class WM? (imaging-protocol property; serial-sectioning OCT pooled to 0.15 mm: GM brighter -> 'no'); auto = run both, keep the better refined NCC")
 ap.add_argument("--mri-wm-bright", action="store_true", help="MRI has WM brighter than GM (default: GM bright, as ex-vivo FLASH ~20 deg)")
 ap.add_argument("--ls-clamp", type=float, default=0.15); ap.add_argument("--sh-clamp", type=float, default=0.15); ap.add_argument("--reg", type=float, default=2.0)
-ap.add_argument("--vascular", choices=["on", "off"], default="on"); ap.add_argument("--vascular-w", type=float, default=2.0); ap.add_argument("--vascular-reg", type=float, default=0.5); ap.add_argument("--vascular-clamp", type=float, default=0.3)
+ap.add_argument("--vascular-w", type=float, default=2.0); ap.add_argument("--vascular-reg", type=float, default=0.5); ap.add_argument("--vascular-clamp", type=float, default=0.3)
 ap.add_argument("--n-restarts", type=int, default=12); ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--ref-transform", type=Path, default=None, help="optional 4x4 (json/npy) OCT->MRI reference, reported only")
+# v1.1 (spec 2.1): position prior, vascular gate, fine stage.  Defaults reproduce v1 (the vascular gate only evaluates two NCCs).
+ap.add_argument("--init-transform", type=Path, default=None, help="4x4 .npy/.json OCT world (oct150 affine) -> MRI world: skips the FFT search and the structural refinement (polarity evaluated, not optimised)")
+ap.add_argument("--vascular", choices=["auto", "on", "off"], default="auto", help="auto = on unless prep.json oct.vessel_section_modulation.ratio > --vessel-modulation-max (missing key / no octv_vessels.npy -> as v1)")
+ap.add_argument("--vessel-modulation-max", type=float, default=1.6)
+ap.add_argument("--vascular-min-ncc", type=float, default=0.02, help="vessel-channel NCC required to accept the vascular pose (I58 v1 0.0055, I46 0.296, I55 0.083)")
+ap.add_argument("--vascular-struct-drop", type=float, default=0.05, help="max drop of the mean [WM,GM] NCC at T_vasc vs T_struct (v1's accepted DANDI solutions drop 0.027 on I46 and 0.004 on I55; the spec's 0.03 left I46 a 0.003 margin)")
+ap.add_argument("--vascular-max-move", type=float, default=3.0, help="mm, mean displacement of the 8 OCT block corners (vs_structural keeps the 7 mm transform_diff for comparability)")
+ap.add_argument("--fine", choices=["off", "on"], default="off"); ap.add_argument("--fine-sim", choices=["auto", "ncc", "lcc", "lcc2"], default="auto", help="auto = ncc when the polarity guard is decisive, lcc2 when mixed")
+ap.add_argument("--fine-levels", type=str, default="0.3,0.15", help="mm"); ap.add_argument("--fine-flatten-mm", type=float, default=3.0); ap.add_argument("--fine-erode-mm", type=float, default=1.3)
+ap.add_argument("--fine-lcc-mm", type=float, default=4.5); ap.add_argument("--fine-clamp", type=float, default=0.15, help="RELATIVE ls/sh clamp per step"); ap.add_argument("--fine-reg", type=float, default=0.5)
+ap.add_argument("--fine-iters", type=int, default=200); ap.add_argument("--fine-restarts", type=int, default=8, help="0 = diagnostic only: gate (d) then rejects the stage (unverified)")
+ap.add_argument("--fine-max-move", type=float, default=3.0, help="mm, mean displacement of the 8 OCT block corners vs the start pose; also caps U_mm"); ap.add_argument("--fine-max-rot", type=float, default=5.0, help="deg, rotation of the fine delta vs the start pose")
+ap.add_argument("--fine-subsample", type=int, default=1)
+ap.add_argument("--fine-verify", choices=["basic", "full"], default="basic", help="basic = restarts + multi-similarity + split-half + landscapes; full adds inverse consistency")
 a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True); t_start = time.time()
 log = {"args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}}
 def say(*x): print(*x, flush=True)
@@ -111,6 +126,11 @@ V_m = float(np.asarray(TIS_cpu).sum()) * VOX_M ** 3; V_o = float(oct_mask.sum())
 MIN_OV = float(min(a.min_overlap, max(0.15, 0.8 * V_m / max(V_o, 1e-6))))
 log["overlap_gate"] = {"requested": a.min_overlap, "effective": MIN_OV, "V_mri_tissue_cm3": V_m / 1000, "V_oct_mask_cm3": V_o / 1000}
 say(f"overlap gate: MRI tissue {V_m/1000:.1f} cm3, OCT mask {V_o/1000:.1f} cm3 -> effective min_overlap {MIN_OV:.2f} (requested {a.min_overlap})")
+_po = prep.get("oct", {}); _vsm = _po.get("vessel_section_modulation") or None                       # v1.1 prep keys; absent = legacy prep -> v1 behaviour (F5)
+if V_o > 1.5 * V_m and _po.get("mask_mode") in (None, "intensity"): say("WARNING: OCT mask over-inclusive: re-prep with --oct-mask auto/texture")
+log["prep_summary"] = {"mask_mode": _po.get("mask_mode"), "mask_reason": _po.get("mask_reason"), "destripe_applied": (_po.get("destripe") or {}).get("applied"),
+                       "V_oct_mask_cm3": _po.get("V_oct_cm3_tex") if _po.get("mask_mode") == "texture" else _po.get("V_oct_cm3_int"), "V_mri_tissue_cm3": _po.get("V_mri_cm3"),
+                       "vessel_section_modulation": _vsm, "vessels_skipped": _po.get("vessels_skipped")}
 PM06, A06 = MF.pooled(0.6); PT06, _ = MF.pooled(0.6, "tissue"); SEARCH_MM = float(np.linalg.norm(A06[:3, :3], axis=0).mean())
 _corn = np.array([[i, j, k] for i in (0, oct150.shape[0] - 1) for j in (0, oct150.shape[1] - 1) for k in (0, oct150.shape[2] - 1)], float)
 BLOCK_R = float(np.linalg.norm((A_oct @ np.c_[_corn, np.ones(8)].T).T[:, :3] - c_o, axis=1).max())   # bounding-sphere radius of the block (mm)
@@ -135,48 +155,76 @@ def refine_level(cand_list, level, dofs, iters, keep, PO):
         out.append({"T": T, "loss": loss, "ncc_channels": ref.ncc_channels(T)})
     out.sort(key=lambda d: d["loss"]); return out[:keep], ref
 polarities = {"auto": [False, True], "yes": [True], "no": [False]}[a.oct_wm_bright]
+fine_on = a.fine == "on"; keep_ref015 = fine_on or a.init_transform is not None          # the fine stage's structural gate needs ref015
 trials = {}
-for wm_bright in polarities:
-    t0 = time.time()
-    FO = FO_bright_first if wm_bright else FO_bright_first[[1, 0]]; PO = pyramid(FO, A_oct, VOX_O)
-    s = FFTSearcher(PM06, A06, PT06, PO[0.6][0], PO[0.6][1], PMask[0.6][0], spacing=SEARCH_MM, min_overlap=MIN_OV)
-    cands, sinfo = s.run(n_rot=a.n_rot, scales=(1.0,), topk=a.topk, seed=a.seed, log_every=4000, mirror=not a.no_mirror)
-    del s; torch.cuda.empty_cache()
-    lvl06, ref06 = refine_level(cands, 0.6, ("rigid", "similarity"), 120, keep=8, PO=PO)
-    lvl03, _ = refine_level(lvl06, 0.3, ("rigid", "affine"), 200, keep=3, PO=PO)
-    lvl015, _ = refine_level(lvl03, 0.15, ("affine",), 200, keep=3, PO=PO)
-    best = lvl015[0]
-    # refiners for the restarts: crops around the best pose, wide enough for +-30 deg / 5 mm perturbations
-    ref03 = refiner_at(best["T"], 0.3, PO, half_mm=BLOCK_R + 12.0); ref015 = refiner_at(best["T"], 0.15, PO, half_mm=BLOCK_R + 12.0)
-    say(f"polarity OCT wm_bright={wm_bright}: search top1/top2 {sinfo['top1']:.3f}/{sinfo['top2']:.3f}; refined NCC {1 - best['loss']:.3f} at centre {np.round((best['T'] @ np.r_[c_o, 1.0])[:3], 1).tolist()} mirror {bool(np.linalg.det(best['T'][:3,:3]) < 0)}  ({time.time()-t0:.0f}s)")
-    trials[wm_bright] = dict(FO=FO, PO=PO, cands=cands, sinfo=sinfo, lvl015=lvl015, ref03=ref03, ref015=ref015, best=best, seconds=time.time() - t0)
-    del ref06, lvl06, lvl03; torch.cuda.empty_cache()
-    log.setdefault("polarity_trials", {})[str(wm_bright)] = {"search_top1": sinfo["top1"], "search_top2": sinfo["top2"], "refined_ncc": 1 - best["loss"], "centre": (best["T"] @ np.r_[c_o, 1.0])[:3].tolist(), "mirror": bool(np.linalg.det(best["T"][:3, :3]) < 0), "seconds": time.time() - t0}
-OCT_WM_BRIGHT = min(trials, key=lambda k: trials[k]["best"]["loss"])
-tr = trials[OCT_WM_BRIGHT]; FO, PO, cands, sinfo, lvl015, ref03, ref015, best = tr["FO"], tr["PO"], tr["cands"], tr["sinfo"], tr["lvl015"], tr["ref03"], tr["ref015"], tr["best"]
-for k in list(trials):
-    if k != OCT_WM_BRIGHT: del trials[k]
-torch.cuda.empty_cache()
-log["oct_wm_bright"] = OCT_WM_BRIGHT
-log["search"] = sinfo | {"candidates": [{"score": c["score"], "overlap": c["overlap"], "mirror": c["mirror"], "centre": c["centre"].tolist()} for c in cands]}
-T_struct = best["T"].copy()
-runner = None
-for d in lvl015[1:]:
-    diff = transform_diff(T_struct, d["T"], c_o)
-    if diff["centre_mm"] > 2.0 or diff["rotation_deg"] > 5.0: runner = {"loss": d["loss"], **diff}; break
-log["refine"] = {"final_ncc": 1 - best["loss"], "final_ncc_channels": best["ncc_channels"], "distinct_runner_up": runner,
-                 "level015_candidates": [{"loss": d["loss"], "centre": (d["T"] @ np.r_[c_o, 1.0])[:3].tolist()} for d in lvl015]}
-say(f"structural stage: OCT wm_bright={OCT_WM_BRIGHT}; search top1/top2 {sinfo['top1']:.3f}/{sinfo['top2']:.3f}; NCC {1 - best['loss']:.3f} (channels {np.round(best['ncc_channels'], 3).tolist()}), centre {np.round((T_struct @ np.r_[c_o, 1.0])[:3], 1).tolist()}, mirror {bool(np.linalg.det(T_struct[:3,:3]) < 0)}")
-# perturbed restarts (5-30 deg, <=5 mm) at 0.3/0.15 mm
-rng = np.random.default_rng(a.seed + 1); restarts = []
-for i in range(a.n_restarts):
-    ang = np.deg2rad(rng.uniform(5, 30)); axis = rng.normal(size=3); axis /= np.linalg.norm(axis); Rp = rotvec_to_matrix(to_t(axis * ang)).cpu().numpy(); tp = rng.uniform(-5, 5, 3)
-    Tp = T_struct.copy(); Tp[:3, :3] = Rp @ T_struct[:3, :3]; Tp[:3, 3] = (T_struct @ np.r_[c_o, 1.0])[:3] + tp - Tp[:3, :3] @ c_o
-    Tr, _ = ref03.refine(Tp, dof="rigid", iters=150, **RK); Tr, _ = ref03.refine(Tr, dof="affine", iters=150, **RK); Tr, l2 = ref015.refine(Tr, dof="affine", iters=150, **RK)
-    restarts.append({"perturb_deg": float(np.rad2deg(ang)), "perturb_mm": float(np.linalg.norm(tp)), "final_loss": l2, **transform_diff(Tr, T_struct, c_o)})
-succ = [r for r in restarts if r["corner_mean_mm"] < 0.5]                    # block corners within 0.5 mm = same solution
-say(f"structural restarts converged to the solution: {len(succ)}/{len(restarts)}")
-del ref03, ref015, lvl015, PO, PMask, FO, trials, tr, PM06, PT06; torch.cuda.empty_cache()
+if a.init_transform is not None:
+    # ---- position prior (spec 2.2): the FFT search and the structural refinement are skipped; the prior is honoured as given.
+    # The class polarity is EVALUATED (not optimised) at T_init with the v1 ref015 construction for each candidate polarity.
+    T_init = np.load(a.init_transform) if a.init_transform.suffix == ".npy" else np.array(json.load(open(a.init_transform)), float)
+    for wm_bright in polarities:
+        t0 = time.time()
+        FO = FO_bright_first if wm_bright else FO_bright_first[[1, 0]]; PO = pyramid(FO, A_oct, VOX_O)
+        ref015 = refiner_at(T_init, 0.15, PO, half_mm=BLOCK_R + 12.0); l = ref015.evaluate(T_init)
+        best = {"T": T_init.copy(), "loss": l, "ncc_channels": ref015.ncc_channels(T_init)}
+        say(f"polarity OCT wm_bright={wm_bright}: NCC at the init transform {1 - l:.3f} (channels {np.round(best['ncc_channels'], 3).tolist()})  ({time.time()-t0:.0f}s)")
+        trials[wm_bright] = dict(FO=FO, PO=PO, ref015=ref015, best=best, seconds=time.time() - t0)
+        log.setdefault("polarity_trials", {})[str(wm_bright)] = {"search_top1": None, "search_top2": None, "refined_ncc": 1 - l, "evaluated_only": True, "centre": (T_init @ np.r_[c_o, 1.0])[:3].tolist(), "mirror": bool(np.linalg.det(T_init[:3, :3]) < 0), "seconds": time.time() - t0}
+    OCT_WM_BRIGHT = min(trials, key=lambda k: trials[k]["best"]["loss"])
+    tr = trials[OCT_WM_BRIGHT]; FO, PO, ref015, best = tr["FO"], tr["PO"], tr["ref015"], tr["best"]
+    for k in list(trials):
+        if k != OCT_WM_BRIGHT: del trials[k]
+    torch.cuda.empty_cache()
+    cands = []; sinfo = {"skipped": "init_transform", "top1": None, "top2": None}
+    log["oct_wm_bright"] = OCT_WM_BRIGHT; log["search"] = dict(sinfo)
+    T_struct = T_init.copy()
+    log["refine"] = {"final_ncc": 1 - best["loss"], "final_ncc_channels": best["ncc_channels"], "init_transform": str(a.init_transform)}
+    say(f"structural stage skipped (--init-transform {a.init_transform}): OCT wm_bright={OCT_WM_BRIGHT}; NCC {1 - best['loss']:.3f} (channels {np.round(best['ncc_channels'], 3).tolist()}), centre {np.round((T_struct @ np.r_[c_o, 1.0])[:3], 1).tolist()}, mirror {bool(np.linalg.det(T_struct[:3,:3]) < 0)}")
+    rng = np.random.default_rng(a.seed + 1); restarts = []; succ = []
+    del PO, PMask, FO, trials, tr, PM06, PT06; torch.cuda.empty_cache()
+else:
+    for wm_bright in polarities:
+        t0 = time.time()
+        FO = FO_bright_first if wm_bright else FO_bright_first[[1, 0]]; PO = pyramid(FO, A_oct, VOX_O)
+        s = FFTSearcher(PM06, A06, PT06, PO[0.6][0], PO[0.6][1], PMask[0.6][0], spacing=SEARCH_MM, min_overlap=MIN_OV)
+        cands, sinfo = s.run(n_rot=a.n_rot, scales=(1.0,), topk=a.topk, seed=a.seed, log_every=4000, mirror=not a.no_mirror)
+        del s; torch.cuda.empty_cache()
+        lvl06, ref06 = refine_level(cands, 0.6, ("rigid", "similarity"), 120, keep=8, PO=PO)
+        lvl03, _ = refine_level(lvl06, 0.3, ("rigid", "affine"), 200, keep=3, PO=PO)
+        lvl015, _ = refine_level(lvl03, 0.15, ("affine",), 200, keep=3, PO=PO)
+        best = lvl015[0]
+        # refiners for the restarts: crops around the best pose, wide enough for +-30 deg / 5 mm perturbations
+        ref03 = refiner_at(best["T"], 0.3, PO, half_mm=BLOCK_R + 12.0); ref015 = refiner_at(best["T"], 0.15, PO, half_mm=BLOCK_R + 12.0)
+        say(f"polarity OCT wm_bright={wm_bright}: search top1/top2 {sinfo['top1']:.3f}/{sinfo['top2']:.3f}; refined NCC {1 - best['loss']:.3f} at centre {np.round((best['T'] @ np.r_[c_o, 1.0])[:3], 1).tolist()} mirror {bool(np.linalg.det(best['T'][:3,:3]) < 0)}  ({time.time()-t0:.0f}s)")
+        trials[wm_bright] = dict(FO=FO, PO=PO, cands=cands, sinfo=sinfo, lvl015=lvl015, ref03=ref03, ref015=ref015, best=best, seconds=time.time() - t0)
+        del ref06, lvl06, lvl03; torch.cuda.empty_cache()
+        log.setdefault("polarity_trials", {})[str(wm_bright)] = {"search_top1": sinfo["top1"], "search_top2": sinfo["top2"], "refined_ncc": 1 - best["loss"], "centre": (best["T"] @ np.r_[c_o, 1.0])[:3].tolist(), "mirror": bool(np.linalg.det(best["T"][:3, :3]) < 0), "seconds": time.time() - t0}
+    OCT_WM_BRIGHT = min(trials, key=lambda k: trials[k]["best"]["loss"])
+    tr = trials[OCT_WM_BRIGHT]; FO, PO, cands, sinfo, lvl015, ref03, ref015, best = tr["FO"], tr["PO"], tr["cands"], tr["sinfo"], tr["lvl015"], tr["ref03"], tr["ref015"], tr["best"]
+    for k in list(trials):
+        if k != OCT_WM_BRIGHT: del trials[k]
+    torch.cuda.empty_cache()
+    log["oct_wm_bright"] = OCT_WM_BRIGHT
+    log["search"] = sinfo | {"candidates": [{"score": c["score"], "overlap": c["overlap"], "mirror": c["mirror"], "centre": c["centre"].tolist()} for c in cands]}
+    T_struct = best["T"].copy()
+    runner = None
+    for d in lvl015[1:]:
+        diff = transform_diff(T_struct, d["T"], c_o)
+        if diff["centre_mm"] > 2.0 or diff["rotation_deg"] > 5.0: runner = {"loss": d["loss"], **diff}; break
+    log["refine"] = {"final_ncc": 1 - best["loss"], "final_ncc_channels": best["ncc_channels"], "distinct_runner_up": runner,
+                     "level015_candidates": [{"loss": d["loss"], "centre": (d["T"] @ np.r_[c_o, 1.0])[:3].tolist()} for d in lvl015]}
+    say(f"structural stage: OCT wm_bright={OCT_WM_BRIGHT}; search top1/top2 {sinfo['top1']:.3f}/{sinfo['top2']:.3f}; NCC {1 - best['loss']:.3f} (channels {np.round(best['ncc_channels'], 3).tolist()}), centre {np.round((T_struct @ np.r_[c_o, 1.0])[:3], 1).tolist()}, mirror {bool(np.linalg.det(T_struct[:3,:3]) < 0)}")
+    # perturbed restarts (5-30 deg, <=5 mm) at 0.3/0.15 mm
+    rng = np.random.default_rng(a.seed + 1); restarts = []
+    for i in range(a.n_restarts):
+        ang = np.deg2rad(rng.uniform(5, 30)); axis = rng.normal(size=3); axis /= np.linalg.norm(axis); Rp = rotvec_to_matrix(to_t(axis * ang)).cpu().numpy(); tp = rng.uniform(-5, 5, 3)
+        Tp = T_struct.copy(); Tp[:3, :3] = Rp @ T_struct[:3, :3]; Tp[:3, 3] = (T_struct @ np.r_[c_o, 1.0])[:3] + tp - Tp[:3, :3] @ c_o
+        Tr, _ = ref03.refine(Tp, dof="rigid", iters=150, **RK); Tr, _ = ref03.refine(Tr, dof="affine", iters=150, **RK); Tr, l2 = ref015.refine(Tr, dof="affine", iters=150, **RK)
+        restarts.append({"perturb_deg": float(np.rad2deg(ang)), "perturb_mm": float(np.linalg.norm(tp)), "final_loss": l2, **transform_diff(Tr, T_struct, c_o)})
+    succ = [r for r in restarts if r["corner_mean_mm"] < 0.5]                    # block corners within 0.5 mm = same solution
+    say(f"structural restarts converged to the solution: {len(succ)}/{len(restarts)}")
+    del ref03, lvl015, PO, PMask, FO, trials, tr, PM06, PT06
+    if not keep_ref015: del ref015                                                # kept alive for the fine stage's structural gate (deleted after it)
+    torch.cuda.empty_cache()
 
 # ------------------------------------------------------------------ 3. label-free vascular refinement (own OCT vessels vs MRI darkness)
 R_axes = A_oct[:3, :3] / np.linalg.norm(A_oct[:3, :3], axis=0)
@@ -184,13 +232,13 @@ _corn = np.array([[i, j, k] for i in (0, oct150.shape[0] - 1) for j in (0, oct15
 BLOCK_R = float(np.linalg.norm((A_oct @ np.c_[_corn, np.ones(8)].T).T[:, :3] - c_o, axis=1).max())   # bounding-sphere radius of the block (mm)
 BOX = BLOCK_R + 8.0                                                                                   # half-size of the MRI box around the block for the vascular stage / outputs
 def stretch_ijk(T): return [round(float(np.linalg.norm(T[:3, :3] @ R_axes[:, q])), 3) for q in range(3)]
-T_final = T_struct.copy(); vasc = a.vascular == "on" and (a.work / "octv_vessels.npy").exists()
+T_final = T_struct.copy(); _ratio = (_vsm or {}).get("ratio"); vasc_file = (a.work / "octv_vessels.npy").exists()
+# v1.1 (spec 2.3): auto = as v1 unless the prep flags a section-phase vessel artefact; the vascular pose is then GATED, never accepted blindly
+vasc = vasc_file and (a.vascular == "on" or (a.vascular == "auto" and (_ratio is None or _ratio <= a.vessel_modulation_max)))
 if vasc:
     t2 = time.time(); bc = (T_struct @ np.r_[c_o, 1.0])[:3]
-    vlo, vhi = world_bbox_to_voxel(A_mri, mri.shape, bc - BOX, bc + BOX); A_v = A_mri.copy()
-    # box clipped to the MRI region used for the features (region coords = MRI coords - lo)
-    vlo = np.maximum(vlo, lo); vhi = np.minimum(vhi, hi); A_v[:3, 3] = (A_mri @ np.r_[vlo, 1.0])[:3]
-    mri_v_reg = np.asarray(mri[vlo[0]:vhi[0], vlo[1]:vhi[1], vlo[2]:vhi[2]]).astype(np.float32); tis_v = np.asarray(mri_tissue_all[vlo[0]:vhi[0], vlo[1]:vhi[1], vlo[2]:vhi[2]]).astype(bool)
+    # box clipped to the MRI region used for the features (region coords = MRI coords - lo); shared helper with the fine stage
+    vlo, vhi, A_v, mri_v_reg, tis_v = mri_box(mri, mri_tissue_all, A_mri, lo, hi, bc, BOX)
     rl, rh = vlo - lo, vhi - lo
     FM2v = torch.stack([to_t(np.asarray(x[rl[0]:rh[0], rl[1]:rh[1], rl[2]:rh[2]]).astype(np.float32)) for x in FM_cpu])   # same structural maps as the search/refinement
     FO2v = FO_bright_first if OCT_WM_BRIGHT else FO_bright_first[[1, 0]]
@@ -198,22 +246,52 @@ if vasc:
     vmask = to_t(np.load(a.work / "octv_vessels.npy"), dtype=torch.bool); A_vv = np.load(a.work / "octv_affine.npy")
     sp_v = np.linalg.norm(A_vv[:3, :3], axis=0) * 1000
     oct_v = density_on_grid(vmask, A_vv, A_oct, oct150.shape, oct_mask, pool=int(max(1, round(VOX_O * 1000 / sp_v.mean())))); del vmask; torch.cuda.empty_cache()
-    T_final, vinfo = vascular_refine(T_struct, FM2v, A_v, FO2v, A_oct, MO, mri_v, oct_v, w=a.vascular_w, reg=a.vascular_reg, clamp=a.vascular_clamp)
-    log["vascular"] = {"ncc_channels": vinfo["ncc_channels"], "vs_structural": transform_diff(T_final, T_struct, c_o), "stretch_ijk_structural": stretch_ijk(T_struct), "stretch_ijk_vascular": stretch_ijk(T_final), "seconds": time.time() - t2}
-    say(f"vascular refinement: ncc/channel {np.round(vinfo['ncc_channels'], 3).tolist()}; moved {log['vascular']['vs_structural']['corner_mean_mm']:.2f} mm (corner mean); stretch i,j,k {stretch_ijk(T_struct)} -> {stretch_ijk(T_final)}  ({time.time()-t2:.0f}s)")
-    # restarts of the vascular stage around the structural solution (3-8 deg, <=2.5 mm, +-10% depth scale)
+    T_vasc, vinfo = vascular_refine(T_struct, FM2v, A_v, FO2v, A_oct, MO, mri_v, oct_v, w=a.vascular_w, reg=a.vascular_reg, clamp=a.vascular_clamp)
+    # acceptance gate: vessel-channel NCC, no loss of structural [WM,GM] agreement (same refiner at both poses), bounded move
+    ref_v = Refiner(FM2v, A_v, FO2v, A_oct, MO); s_before = 1 - ref_v.evaluate(T_struct); s_after = 1 - ref_v.evaluate(T_vasc); del ref_v
+    vdiff = transform_diff(T_vasc, T_struct, c_o); vmove = pose_move(T_vasc, T_struct, c_o, block_corners(A_oct, oct150.shape)); vreasons = []; vdrop = s_before - s_after
+    if vinfo["ncc_channels"][2] < a.vascular_min_ncc: vreasons.append(f"vessel NCC {vinfo['ncc_channels'][2]:.4f} < {a.vascular_min_ncc}")
+    if vdrop > a.vascular_struct_drop: vreasons.append(f"structural NCC {s_before:.4f} -> {s_after:.4f} (drop {vdrop:.4f} > {a.vascular_struct_drop})")
+    if vmove["block_corner_mean_mm"] > a.vascular_max_move: vreasons.append(f"moved {vmove['block_corner_mean_mm']:.2f} mm at the block corners > {a.vascular_max_move}")
+    vasc_ok = not vreasons; T_final = T_vasc.copy() if vasc_ok else T_struct.copy()
+    log["vascular"] = {"ncc_channels": vinfo["ncc_channels"], "vs_structural": vdiff, "vs_structural_block": vmove, "stretch_ijk_structural": stretch_ijk(T_struct), "stretch_ijk_vascular": stretch_ijk(T_vasc),
+                       "accepted": vasc_ok, "reasons": vreasons, "struct_ncc_before": s_before, "struct_ncc_after": s_after, "struct_drop": vdrop, "struct_drop_margin": a.vascular_struct_drop - vdrop,
+                       "T_candidate": T_vasc.tolist(), "seconds": time.time() - t2}
+    say(f"vascular refinement: ncc/channel {np.round(vinfo['ncc_channels'], 3).tolist()}; moved {vdiff['corner_mean_mm']:.2f} mm (7 mm corner mean) / {vmove['block_corner_mean_mm']:.2f} mm (block corners), rotated {vmove['delta_rotation_deg']:.2f} deg; "
+        f"stretch i,j,k {stretch_ijk(T_struct)} -> {stretch_ijk(T_vasc)}; structural NCC {s_before:.4f} -> {s_after:.4f} (drop {vdrop:.4f}, margin {a.vascular_struct_drop - vdrop:+.4f} to {a.vascular_struct_drop}); accepted={vasc_ok} {vreasons}  ({time.time()-t2:.0f}s)")
+    # restarts of the vascular stage around the structural solution (3-8 deg, <=2.5 mm, +-10% depth scale); diagnostic, vs the vascular solution
     r0_, t0_, ls0_, sh0_, mir_ = params_from_matrix(T_struct, c_o); vres = []
     for i in range(8):
         ang = np.deg2rad(rng.uniform(3, 8)); axis = rng.normal(size=3); axis /= np.linalg.norm(axis)
         Tp = compose(to_t(r0_ + axis * ang), to_t(t0_ + rng.uniform(-2.5, 2.5, 3)), to_t(ls0_ + rng.uniform(-0.1, 0.1, 3)), to_t(sh0_), to_t(c_o), mir_).cpu().numpy()
         Tr, _ = vascular_refine(Tp, FM2v, A_v, FO2v, A_oct, MO, mri_v, oct_v, w=a.vascular_w, reg=a.vascular_reg, clamp=a.vascular_clamp, factors=(4, 2, 1))
-        vres.append({"perturb_deg": float(np.rad2deg(ang)), **transform_diff(Tr, T_final, c_o)})
+        vres.append({"perturb_deg": float(np.rad2deg(ang)), **transform_diff(Tr, T_vasc, c_o)})
     log["vascular"]["restarts"] = {"n": len(vres), "n_within_0.3mm": sum(r["corner_mean_mm"] < 0.3 for r in vres), "detail": vres}
     say(f"vascular restarts within 0.3 mm of the solution: {log['vascular']['restarts']['n_within_0.3mm']}/{len(vres)}")
+elif vasc_file and a.vascular == "auto":
+    log["vascular"] = {"mode": "skipped_section_artefact", "ratio": _ratio}; say(f"vascular stage skipped: vessel section-phase modulation ratio {_ratio} > {a.vessel_modulation_max}")
 else:
     log["vascular"] = {"mode": "off"}
 if vasc:
     del FM2v, FO2v, mri_v, oct_v
+torch.cuda.empty_cache()
+
+# ------------------------------------------------------------------ 3b. fine stage (v1.1, spec 2.4): single sharp loss, delta about the start pose, gated
+if fine_on:
+    t3 = time.time(); T_prefine = T_final.copy(); np.save(a.out / "T_oct2mri_prefine.npy", T_prefine)
+    ctx = FineContext(mri=mri, mri_tissue=mri_tissue_all, A_mri=A_mri, lo=lo, hi=hi, oct150=oct150, oct_mask=oct_mask, A_oct=A_oct, c_o=c_o,
+                      BLOCK_R=BLOCK_R, VOX_M=VOX_M, VOX_O=VOX_O, ref015=ref015, device=DEVICE)
+    cfg = FineConfig(sim=a.fine_sim, levels=tuple(float(x) for x in a.fine_levels.split(",")), flatten_mm=a.fine_flatten_mm, erode_mm=a.fine_erode_mm, lcc_mm=a.fine_lcc_mm,
+                     clamp=a.fine_clamp, reg=a.fine_reg, iters=a.fine_iters, n_restarts=a.fine_restarts, max_move=a.fine_max_move, max_rot=a.fine_max_rot, subsample=a.fine_subsample, verify=a.fine_verify)
+    T_final, T_fine_cand, finfo = fine_stage(T_prefine, ctx, cfg, rng)
+    np.save(a.out / "T_oct2mri_fine_candidate.npy", T_fine_cand); log["fine"] = finfo; _vs = finfo.get("vs_start") or {}
+    say(f"fine stage: sign/level {finfo.get('sign_per_level')} sim/level {finfo.get('sim_per_level')}; guard {[(g['level'], g.get('frac_neg'), g.get('mean')) for g in finfo.get('guard', [])]}; "
+        f"loss {finfo.get('loss_start_finest')} -> {finfo.get('loss_fine_finest')}; structural NCC {finfo.get('struct_ncc_before')} -> {finfo.get('struct_ncc_after')}; MI {finfo.get('mi_before')} -> {finfo.get('mi_after')}; "
+        f"moved {_vs.get('corner_mean_mm')} mm (7 mm cube) / {_vs.get('block_corner_mean_mm')} mm (block corners), rotated {_vs.get('delta_rotation_deg')} deg (OCT-axis shift {_vs.get('centre_shift_oct_axes_mm')}); "
+        f"restarts {finfo.get('restarts', {}).get('n_converged')}/{finfo.get('restarts', {}).get('n')}; U_mm {finfo.get('U_mm')}; accepted={finfo['accepted']} {finfo['reasons']}  ({time.time()-t3:.0f}s)")
+    del ctx
+if keep_ref015:
+    del ref015
 torch.cuda.empty_cache()
 
 # ------------------------------------------------------------------ 4. evaluation with whatever annotations exist (never used above)
@@ -228,16 +306,16 @@ def evaluate_T(T):
     if labels4 is not None: e["gmwm"] = gm_wm_overlap(T, oct_class, oct_mask, A_oct, np.asarray(labels4), A_mri)
     if ref_T is not None: e["vs_reference"] = transform_diff(T, ref_T, c_o)
     return e
-ev = {"final": evaluate_T(T_final), "structural": evaluate_T(T_struct) if vasc else None, "restarts": {"n": len(restarts), "n_converged": len(succ), "detail": restarts}}
+ev = {"final": evaluate_T(T_final), "structural": evaluate_T(T_struct) if (vasc or fine_on) else None, "restarts": {"n": len(restarts), "n_converged": len(succ), "detail": restarts}}
 log["evaluation"] = ev
 def _v(e, tag):
     r = e.get(f"vessels_{tag}", {}).get("registered", {}); c = e.get(f"vessels_{tag}", {}).get("random_shift_control", {})
     return f"{r.get('median_um', float('nan')):.0f} um / f150 {r.get('frac_within_150um', float('nan')):.2f} (ctrl median {c.get('median_um_mean') or float('nan'):.0f})" if r else "n/a"
 for tag in ("own", "vesseg"):
     if f"vessels_{tag}" in ev["final"]:
-        say(f"manual MRI vessels -> nearest OCT vessel [{tag}]: structural {_v(ev['structural'], tag) if vasc else '-'} -> final {_v(ev['final'], tag)}")
+        say(f"manual MRI vessels -> nearest OCT vessel [{tag}]: structural {_v(ev['structural'], tag) if (vasc or fine_on) else '-'} -> final {_v(ev['final'], tag)}")
 if "gmwm" in ev["final"]:
-    g0 = ev["structural"]["gmwm"] if vasc else ev["final"]["gmwm"]; g1 = ev["final"]["gmwm"]
+    g0 = ev["structural"]["gmwm"] if (vasc or fine_on) else ev["final"]["gmwm"]; g1 = ev["final"]["gmwm"]
     say(f"Dice OCT classes vs manual labels: structural WM {g0['dice_WM']:.3f} GM {g0['dice_GM']:.3f} -> final WM {g1['dice_WM']:.3f} GM {g1['dice_GM']:.3f} (on-label frac {g1['frac_on_mri_labels']:.2f})")
 
 # ------------------------------------------------------------------ 5. outputs
@@ -266,6 +344,10 @@ save_nifti(oct_in_mri, A_out, a.out / "oct_in_mri_region.nii.gz", dtype=np.float
 if labels4 is not None: save_nifti(np.asarray(labels4[olo[0]:ohi[0], olo[1]:ohi[1], olo[2]:ohi[2]]), A_out, a.out / "mri_labels_region.nii.gz", dtype=np.uint8)
 log["total_seconds"] = time.time() - t_start
 write_json(log, a.out / "result.json")          # (second write: identical content, after the heavy outputs succeeded)
-say(json.dumps({"subject": a.work.name, "features": a.features, "search_top1_top2": [round(sinfo["top1"], 3), round(sinfo["top2"], 3)], "oct_wm_bright": OCT_WM_BRIGHT, "mirror": log["final_transform"]["mirror"],
+def _r3(x): return None if x is None else round(x, 3)
+_fi = log.get("fine", {})
+say(json.dumps({"subject": a.work.name, "features": a.features, "search_top1_top2": [_r3(sinfo["top1"]), _r3(sinfo["top2"])], "oct_wm_bright": OCT_WM_BRIGHT, "mirror": log["final_transform"]["mirror"],
                 "centre": np.round(bc, 1).tolist(), "stretch_ijk": stretch_ijk(T_final), "final_ncc": round(1 - best["loss"], 3), "restarts": f"{len(succ)}/{len(restarts)}",
-                "vascular_restarts": log["vascular"].get("restarts", {}).get("n_within_0.3mm"), "total_s": round(time.time() - t_start)}))
+                "vascular_restarts": log["vascular"].get("restarts", {}).get("n_within_0.3mm"), "vascular_accepted": log["vascular"].get("accepted"),
+                "fine_accepted": _fi.get("accepted"), "fine_moved_mm": _r3((_fi.get("vs_start") or {}).get("corner_mean_mm")), "fine_moved_block_mm": _r3((_fi.get("vs_start") or {}).get("block_corner_mean_mm")),
+                "fine_rot_deg": _r3((_fi.get("vs_start") or {}).get("delta_rotation_deg")), "U_mm": _r3(_fi.get("U_mm")), "total_s": round(time.time() - t_start)}))
