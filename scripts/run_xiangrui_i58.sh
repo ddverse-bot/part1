@@ -61,7 +61,7 @@ def cand(run, T_key):
     r = load(f"{run}/result.json"); e = load(f"{run}/export/export.json"); s = r.get("search") or {}
     return {"run": run, "search_top1_top2": [s.get("top1"), s.get("top2")], "structural_ncc": (r.get("refine") or {}).get("final_ncc"),
             "structural_restarts": (r.get("evaluation") or {}).get("restarts", {}).get("n_converged"), "stretch_ijk": (r.get("final_transform") or {}).get("stretch_ijk"),
-            "det_in_prep_frame": (r.get("final_transform") or {}).get("det"), "det_in_nifti_frames": e.get("det"), "export": f"{run}/export", "T_octnii_to_mrinii": e.get("T_octnii_to_mrinii"),
+            "det_in_prep_frame": float(np.linalg.det(np.load(f"{run}/{T_key}.npy")[:3, :3])), "det_in_nifti_frames": e.get("det"), "export": f"{run}/export", "T_octnii_to_mrinii": e.get("T_octnii_to_mrinii"),
             "qc": qc(run), "export_check_vs_register": (e.get("checks") or {}).get("vs_register_oct_in_mri_region")}
 out = {"prep": W, "prep_oct": (load(f"{W}/prep.json").get("oct") or {}).get("mask_mode"), "candidate_pipeline_choice": cand(R, "T_oct2mri")}
 if H == "both": out["candidate_other_handedness"] = cand(R + "_mirror", "T_oct2mri_in_prep_frame"); out["figure"] = f"{R}/handedness_side_by_side.png"
