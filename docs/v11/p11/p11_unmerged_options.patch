@@ -1,0 +1,2043 @@
+diff --git a/scripts/prep_subject.py b/scripts/prep_subject.py
+index d12d038..ae0856a 100644
+--- a/scripts/prep_subject.py
++++ b/scripts/prep_subject.py
+@@ -16,6 +16,20 @@
+   oct_ves_dist48_own.npy/_affine   EDT (um) to the nearest own OCT vessel on a ~48 um grid (evaluation)
+   oct_ves_dist48_vesseg.npy        [optional] same from a provided OCT vessel segmentation (e.g. the dataset's ves_seg)
+   oct_native_affine.npy, prep.json
++  oct_slab_correction.npy          [only with --slab-audit on or a non-default normalisation option] [3, n] float64 record of the native-level
++                                   slab normalisation: per-plane tissue median (nan = too few tissue voxels), running-mean reference, applied scale
++                                   (v1 writes only a 5-value head, rounded to 0.1, into prep.json); prep.json oct.slab / oct.tile_flatfield likewise
++  octv_slab_factor.npy / oct_tile_field.npy   [only with --slab-axis auto / --tile-flatfield on] vessel-level per-plane factors / the 2-D log tile field
++
++Intensity-normalisation options (P11 probe:norm; defaults = v1, registration-neutral on I58, see octreg/octnorm.py):
++  --slab-axis 0|1|2      v1 per-slice normalisation at the native resolution along that array axis (0 = v1)
++  --slab-axis none       global float16 gain only (no per-slice scale)
++  --slab-axis auto       gain only at the native level; after the stripe-axis detection (which runs on octv and is insensitive to a per-slice
++                         gain), per-plane median normalisation of octv along the detected sectioning axis, after the destripe (needs --destripe on)
++  --tile-flatfield on    2-D folded tile flat field on the two en-face axes of octv after the destripe, before the 0.15 mm level (needs --destripe on);
++                         estimated periods that fail the plausibility rules (< 5 cycles, field log std > 0.05) are rejected (not applied, reason in
++                         prep.json); --tile-group-mm reports the tile residual per section group, --tile-group-mode per_group fits one field per group
++With every option at its default the outputs are byte-identical to v1.1 (no extra file, no extra prep.json key).
+ 
+ OCT spacing comes from --oct-spacing-um (z,y,x) or the BIDS sidecar next to the OCT (PixelSize = [x,y,z])."""
+ import argparse, json, sys, time
+@@ -24,6 +38,7 @@ import numpy as np, torch
+ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from octreg.common import (layout_affine, oct_slab_normalize, oct_tissue_mask, pool_mean_np, pooled_affine, resample_to_grid, to_t, write_json)
+ from octreg.specimen import oct_specimen_mask, choose_oct_mask, want_texture, mask_qc_png, erode_mm
++from octreg import octnorm
+ 
+ ap = argparse.ArgumentParser()
+ ap.add_argument("--work", type=Path, required=True)
+@@ -50,7 +65,28 @@ ap.add_argument("--mask-erode-mm", type=float, default=0.0, help="texture mask:
+                 "octv_mask.npy and hence register.py's fine stage see; the auto mask-band rule judges the UN-eroded texture volume (texture.V_cm3_150_uneroded), and oct150_mask_core.npy / the stripe-axis "
+                 "diagnostic mask are eroded only by what is missing to --mask-core-mm / 2 mm from the un-eroded boundary (never stacked)")
+ ap.add_argument("--mask-core-mm", type=float, default=2.0, help="oct150_mask_core.npy = chosen mask eroded to this distance (mm) from the un-eroded specimen boundary (0 = no core file)")
++# v1.2 intensity-normalisation options (P11 probe:norm); defaults = v1
++ap.add_argument("--slab-axis", choices=["0", "1", "2", "none", "auto"], default="0", help="slab normalisation: 0|1|2 = v1 per-slice tissue-median normalisation at the native resolution along that array axis (0 = v1); "
++                "none = global float16 gain only; auto = gain only at the native level + per-plane median normalisation of octv along the detected sectioning (stripe) axis after the destripe (needs --destripe on)")
++ap.add_argument("--slab-window-mm", type=float, default=None, help="running-mean window of the slab reference in mm (default: v1's max(10, round(1200 um / spacing)) planes at the native level; 1.2 mm at the vessel level for --slab-axis auto)")
++ap.add_argument("--slab-floor", choices=["abs", "rel"], default="abs", help="floor on the per-slice median below which the scale is 1: abs = 1e-3 (v1; the I58 mu_s medians are only 1.9 x above it), rel = 1e-3 x median of the medians")
++ap.add_argument("--tile-flatfield", choices=["off", "on"], default="off", help="on = 2-D folded multiplicative tile (mosaic) flat field of octv on the en-face axes after the destripe, before the 0.15 mm level (needs --destripe on; octreg.octnorm.tile_flatfield_inplace)")
++ap.add_argument("--tile-axes", type=str, default="auto", help="en-face axes 'a,b' of the tile field; auto = the two axes other than the detected (or --stripe-axis) sectioning axis")
++ap.add_argument("--tile-period-mm", type=str, default="auto", help="auto (FFT candidates + fold-R2 scan, octnorm.estimate_tile_period) | 'Pa,Pb' in mm along the en-face axes in increasing axis order (I58: 2.818,2.789)")
++ap.add_argument("--tile-band-mm", type=str, default="0.6,4.0", help="period search band (mm) for --tile-period-mm auto")
++ap.add_argument("--tile-bin-vox", type=float, default=2.0, help="tile field phase bin width (octv voxels)"); ap.add_argument("--tile-smooth-bins", type=float, default=1.0, help="circular Gaussian smoothing of the folded field (bins)")
++ap.add_argument("--tile-group-mm", type=float, default=2.0, help="section groups of this thickness (mm, along the sectioning axis) for the per-group tile diagnostics (fold correlation with the global field, residual before/after); 0 = off")
++ap.add_argument("--tile-group-mode", choices=["global", "per_group"], default="global", help="global = one tile field for the whole block; per_group = one field per section group (for tile patterns shifted between sections; needs --tile-group-mm > 0)")
++ap.add_argument("--slab-audit", choices=["off", "on"], default="off", help="on = write oct_slab_correction.npy and prep.json oct.slab / oct.tile_flatfield also with default options (they are always written when a normalisation option is not at its default)")
+ a = ap.parse_args(); a.work.mkdir(parents=True, exist_ok=True); t0 = time.time()
++if (a.slab_axis == "auto" or a.tile_flatfield == "on") and a.destripe != "on":
++    raise SystemExit("--slab-axis auto and --tile-flatfield on work on the vessel level after the stripe-axis detection: they need --destripe on")
++if a.tile_axes != "auto" and (len(a.tile_axes.split(",")) != 2 or not set(a.tile_axes.split(",")) <= {"0", "1", "2"} or len(set(a.tile_axes.split(","))) != 2):
++    raise SystemExit(f"--tile-axes must be auto or two distinct axes 'a,b' out of 0,1,2, got {a.tile_axes}")
++if a.tile_period_mm != "auto" and len(a.tile_period_mm.split(",")) != 2:
++    raise SystemExit(f"--tile-period-mm must be auto or 'Pa,Pb' (mm), got {a.tile_period_mm}")
++if a.tile_group_mode == "per_group" and a.tile_group_mm <= 0: raise SystemExit("--tile-group-mode per_group needs --tile-group-mm > 0")
++NORM_AUDIT = (a.slab_audit == "on" or a.slab_axis != "0" or a.slab_floor != "abs" or a.slab_window_mm is not None or a.tile_flatfield == "on")   # False = v1.1 outputs exactly
+ info = json.load(open(a.work / "prep.json")) if (a.work / "prep.json").exists() else {}
+ def say(*x): print(*x, f"[{time.time()-t0:.0f}s]", flush=True)
+ 
+@@ -141,9 +177,25 @@ if not a.skip_oct:
+     if thr_raw is None:
+         from skimage.filters import threshold_otsu
+         s4 = raw[::4, ::8, ::8].astype(np.float32); s4 = s4[np.isfinite(s4) & (s4 > 0)]; thr_raw = 0.5 * float(threshold_otsu(s4))   # well below the tissue mode, above the background
+-    window = max(10, int(round(1200.0 / sp[0])))                 # ~1.2 mm of depth = one section period at 12 um
+-    octn, slab = oct_slab_normalize(raw, tissue_thresh=thr_raw, window=window, out_dtype=np.float16); del raw
+-    say("slab-normalised (window", window, "slices, raw tissue thr", round(thr_raw, 1), ")")
++    slab_ax = int(a.slab_axis) if a.slab_axis in ("0", "1", "2") else 0      # none / auto: medians (and the float16 gain) along axis 0 as v1, scale 1
++    if a.slab_window_mm is None: window = max(10, int(round(1200.0 / sp[slab_ax])))   # ~1.2 mm of depth = one section period at 12 um
++    else: window = max(1, int(round(a.slab_window_mm * 1000.0 / sp[slab_ax])))
++    if a.slab_axis == "0" and a.slab_floor == "abs":
++        octn, slab = oct_slab_normalize(raw, tissue_thresh=thr_raw, window=window, out_dtype=np.float16); del raw          # v1 (octreg.common, frozen)
++    else:
++        octn, slab = octnorm.slab_normalize(raw, axis=slab_ax, tissue_thresh=thr_raw, window=window, out_dtype=np.float16, floor=a.slab_floor, gain_only=a.slab_axis in ("none", "auto")); del raw
++    say("slab-normalised (window", window, "slices, raw tissue thr", round(thr_raw, 1), ")" + ("" if a.slab_axis == "0" and a.slab_floor == "abs" else f" [--slab-axis {a.slab_axis} (native axis {slab_ax}, gain only {a.slab_axis in ('none', 'auto')}), --slab-floor {a.slab_floor}]"))
++    _med = np.asarray(slab["per_slice_median"], float); _ref = np.asarray(slab["reference"], float); _sc = np.asarray(slab["scale"], float)
++    if NORM_AUDIT: np.save(a.work / "oct_slab_correction.npy", np.stack([_med, _ref, _sc]))     # audit record (rows: median, reference, applied scale)
++    _good = np.isfinite(_med); _medf = np.interp(np.arange(len(_med)), np.where(_good)[0], _med[_good]) if _good.any() else np.ones(len(_med))
++    _fl = octnorm.ABS_FLOOR if a.slab_floor == "abs" else octnorm.ABS_FLOOR * float(np.nanmedian(_medf))
++    slab_rec = {"option": a.slab_axis, "level": "native", "axis": slab_ax, "gain_only": a.slab_axis in ("none", "auto"), "window_planes": int(window), "window_mm": float(window * sp[slab_ax] / 1000.0),
++                "window_source": "v1 formula max(10, round(1200 um / spacing))" if a.slab_window_mm is None else "--slab-window-mm", "floor": a.slab_floor, "floor_value": float(_fl),
++                "n_valid_planes_at_or_below_floor": int(((_medf <= _fl) & _good).sum()), "min_median_over_floor": float(np.nanmin(_med) / _fl) if _good.any() else None,
++                "tissue_thresh": float(thr_raw), "gain": float(slab["gain"]), "file": "oct_slab_correction.npy", "file_rows": ["per-plane tissue median (nan: <= 2000 tissue voxels)", "reference (running mean)", "applied scale"],
++                "applied": octnorm.scale_summary(_med, _sc), "v1_formula_correction": octnorm.scale_summary(_med, np.where(_medf > _fl, _ref / _medf, 1.0)), "vessel_level": None}
++    del _med, _ref, _sc, _good, _medf
++    tile_info = {"applied": False, "reason": "off"}
+     # 0.15 mm level: anisotropic integer pooling, then resample onto an isotropic grid in the same frame
+     k150 = np.maximum(1, np.round(a.target_mm * 1000 / sp)).astype(int)
+     kv = np.maximum(1, np.ceil(a.vessel_level_um / sp - 1e-6)).astype(int)     # never finer than the vessel level (20 um data -> 40 um)
+@@ -219,7 +271,10 @@ if not a.skip_oct:
+             say(tex_report())
+         # e. stripe axis on the chosen mask 2 mm inside the un-eroded specimen boundary, nearest-resampled to the octv grid
+         m_diag, m_diag_mode = choose_oct_mask(mask_int_nd, V_int_nd, mask_tex, V_tex0, V_mri, a.oct_mask, band)[:2]
+-        maskv_diag = vgrid(erode_from_boundary(m_diag, DIAG_ERODE_MM, m_diag_mode)[0]); del m_diag
++        maskv_diag = vgrid(erode_from_boundary(m_diag, DIAG_ERODE_MM, m_diag_mode)[0])
++        vessel_opts = a.slab_axis == "auto" or a.tile_flatfield == "on"
++        maskv_ops = vgrid(m_diag) if vessel_opts else None          # the chosen (un-eroded) mask on the octv grid, as octv_mask.npy (P11 variants)
++        del m_diag
+         from octreg import destripe as _ds
+         axis, ds_diag = _ds.detect_stripe_axis(octv, mask=maskv_diag, n_planes=40, hp_sigma_vox=3.0)
+         if a.stripe_axis != "auto": ds_diag = override_axis(ds_diag, axis, int(a.stripe_axis)); axis = int(a.stripe_axis)
+@@ -227,17 +282,47 @@ if not a.skip_oct:
+         if axis is None:
+             ds_info = {"applied": False, "reason": "axis_not_decisive", "detect": ds_diag}; provenance = "from_octv_nodestripe"
+             say("WARNING: stripe axis not decisive (min adjacent-plane NCC >= 0.8 x second) -> destripe SKIPPED; oct150 = pooled un-destriped octv")
+-            o150 = o150_nd; mask_int = mask_int_nd
+         else:
+             # f. flat-field in place (zeros stay zero, values clipped to [1, cap] before the float16 write-back)
+             ds_info = _ds.destripe_inplace(octv, axis=axis, vox_mm=float(sp_v.mean()) / 1000.0, sigma_smooth_mm=0.48, sigma_hp_mm=0.24, cap=60000.0, zchunk=64, pad=40, n_workers=4,
+                                            mask=maskv_diag, save_S=(a.work / "octv_stripeS.npy" if a.save_stripe_field else None))
+             ds_info["detect"] = ds_diag; provenance = "from_destriped_octv"
+             say("destriped octv:", {k: v for k, v in ds_info.items() if k not in ("detect",)})
+-            # g. oct150 from the destriped octv (same grid); intensity mask on it
++        # f2. v1.2 options on the vessel level, after the destripe and before the 0.15 mm level (octreg.octnorm; P11 probe:norm order)
++        renorm = False
++        if a.slab_axis == "auto":
++            if axis is None:
++                slab_rec["vessel_level"] = {"applied": False, "reason": "stripe_axis_not_decisive"}; say("WARNING: --slab-axis auto: no sectioning axis -> no per-plane normalisation (gain only)")
++            else:
++                win_v = max(1, int(round((1.2 if a.slab_window_mm is None else a.slab_window_mm) / (float(sp_v[axis]) / 1000.0))))
++                pn = octnorm.plane_normalize_inplace(octv, axis=axis, window=win_v, mask=maskv_ops)
++                if pn.get("factor") is not None: np.save(a.work / "octv_slab_factor.npy", np.asarray(pn.pop("factor"), np.float32)); pn["file"] = "octv_slab_factor.npy"
++                pn["window_mm"] = float(win_v * sp_v[axis] / 1000.0); pn["window_source"] = "default 1.2 mm" if a.slab_window_mm is None else "--slab-window-mm"; slab_rec["vessel_level"] = pn
++                renorm |= bool(pn["applied"]); say("vessel-level per-plane normalisation:", {k: v for k, v in pn.items()})
++        if a.tile_flatfield == "on":
++            sect = axis if a.tile_axes == "auto" else ({0, 1, 2} - {int(x) for x in a.tile_axes.split(",")}).pop()
++            if sect is None:
++                tile_info = {"applied": False, "reason": "no_sectioning_axis (stripe axis not decisive; pass --tile-axes)"}; say("WARNING: --tile-flatfield on: no sectioning axis -> skipped")
++            else:
++                en = octnorm.enface_axes(sect); vox_en = float(np.mean(sp_v[list(en)])) / 1000.0; bmm = [float(x) for x in a.tile_band_mm.split(",")]
++                per = None if a.tile_period_mm == "auto" else [float(p) / (float(sp_v[e]) / 1000.0) for p, e in zip(a.tile_period_mm.split(","), en)]
++                gpl = int(round(a.tile_group_mm / (float(sp_v[sect]) / 1000.0))) if a.tile_group_mm > 0 else 0
++                tile_info = octnorm.tile_flatfield_inplace(octv, maskv_ops, sect, periods_vox=per, bin_vox=a.tile_bin_vox, smooth_bins=a.tile_smooth_bins, band_vox=(bmm[0] / vox_en, bmm[1] / vox_en),
++                                                           group_planes=gpl, group_mode=a.tile_group_mode)
++                if tile_info.get("groups") is not None: tile_info["groups"]["group_mm"] = float(gpl * sp_v[sect] / 1000.0)
++                if tile_info.get("field_log") is not None: np.save(a.work / "oct_tile_field.npy", np.asarray(tile_info.pop("field_log"), np.float32)); tile_info["file"] = "oct_tile_field.npy"
++                if tile_info.get("periods_vox"): tile_info["periods_mm"] = [float(p * sp_v[e] / 1000.0) for p, e in zip(tile_info["periods_vox"], en)]
++                _fg = octnorm.pop_group_fields(tile_info)
++                if _fg is not None: np.save(a.work / "oct_tile_field_groups.npy", _fg); del _fg
++                renorm |= bool(tile_info["applied"]); say("tile flat field:", {k: v for k, v in tile_info.items() if k not in ("estimate", "groups")}); say("tile section groups:", (tile_info.get("groups") or {}).get("summary"))
++        if axis is None and not renorm:
++            o150 = o150_nd; mask_int = mask_int_nd
++        else:
++            # g. oct150 from the destriped (and/or re-normalised) octv (same grid); intensity mask on it
+             _, _, o150 = level150(octv)
+             mask_int, thr150 = oct_tissue_mask(o150, thresh=None, closing_iter=2)
+-        del maskv_diag, o150_nd, mask_int_nd
++            if renorm: provenance += "_renorm"
++        del maskv_diag, o150_nd, mask_int_nd, maskv_ops
+         np.save(a.work / "oct150.npy", o150.astype(np.float32)); np.save(a.work / "oct150_affine.npy", A150)
+         V_int = vol150(mask_int)
+         say("oct150", shape150, "tissue frac", round(float(mask_int.mean()), 3), f"({provenance})")
+@@ -310,6 +395,7 @@ if not a.skip_oct:
+                    "mask_band": list(band), "texture": tex_info, "mask_options": mask_opts, "V_oct_cm3_tex_uneroded": V_tex0,
+                    "V_oct_cm3_core": V_core, "mask_core_erode_mm": a.mask_core_mm, "mask_core_extra_erode_mm": core_extra, "mask_diag_erode_mm": DIAG_ERODE_MM,
+                    "destripe": ds_info, "oct150_provenance": provenance, "vessels_skipped": bool(a.skip_vessels)}
++    if NORM_AUDIT: info["oct"]["slab"] = slab_rec; info["oct"]["tile_flatfield"] = tile_info
+     if a.destripe == "on": info["oct"]["V_oct_cm3_int_nodestripe"] = V_int_nd
+     if vmask is not None and ds_diag is not None and axis is not None and ds_diag.get("period_vox") is not None:   # vessel density vs section phase (I58: ratio 2.54)
+         mod = _ds.section_phase_modulation(vmask, maskv, axis=axis, period_vox=ds_diag["period_vox"])
+diff --git a/scripts/qc_fine.py b/scripts/qc_fine.py
+index 84ce15b..8f57598 100644
+--- a/scripts/qc_fine.py
++++ b/scripts/qc_fine.py
+@@ -16,7 +16,17 @@ Q3 figures: qc_fine.png (5 depth planes x {OCT, MRI via T, checkerboard with 0.9
+    OCT}; MRI tissue boundary via the final T solid / via the pre-fine T dashed; OCT mask contour) and qc_fine_landscape.png.
+ Everything is computed for the final T and, when run/T_oct2mri_prefine.npy exists, for the pre-fine pose (boundary numbers
+ also for T_oct2mri_fine_candidate.npy).  Reads only prep outputs and run outputs; imports only octreg.common/evaluate.
+-Writes qc_fine.json (+ the two PNGs) into --out (default: the run dir)."""
++Writes qc_fine.json (+ the two PNGs) into --out (default: the run dir).
++
++Options added after the P11 probe:exclude (defaults: none of this runs and qc_fine.json is unchanged):
++--pose NAME=PATH (repeatable) adds poses to Q1 (same MRI box for every pose, so candidates from different runs are comparable in one call).
++--oct-exclude-mask / --mri-exclude-mask (bool .npy on the oct150 / MRI array grid; I58: scripts/make_exclusion_masks_i58.py) add a
++REPORT-ONLY body block (P11 qc_body.py port): 'boundary_body' = Q1 with the OCT boundary minus the OCT exclusion dilated by
++--oct-exclude-dilate-mm and the MRI tissue boundary minus the MRI exclusion; a point is dropped when it maps into the other side's
++exclusion under ANY pose of this call (union rule, so every pose is scored on the same points); 'mi_landscape_body' = Q2 on the
++body (final / prefine).  The masks must be bool or 0/1 on the grid of --work (a label map is refused; when a masks.json from
++make_exclusion_masks_i58.py sits next to a mask, its grid shape and affine must match --work).  P11: the body forward median depends on the pose set that defines the union (P_R5 3.24 vs 2.40 mm in two
++sets), so compare body numbers only within one call, never across calls, and never use them as a gate."""
+ from __future__ import annotations
+ import argparse, json, math, os, sys, time
+ from pathlib import Path
+@@ -31,6 +41,10 @@ ap.add_argument("--work", type=Path, required=True); ap.add_argument("--run", ty
+ ap.add_argument("--T", type=Path, default=None, help="4x4 .npy/.json OCT world -> MRI world (default run/T_oct2mri.npy)"); ap.add_argument("--out", type=Path, default=None)
+ ap.add_argument("--checker-mm", type=float, default=0.9); ap.add_argument("--erode-mm", type=float, default=1.3, help="MRI tissue erosion of the MI specimen mask")
+ ap.add_argument("--planes", type=str, default="0.2,0.35,0.5,0.65,0.8"); ap.add_argument("--skip-landscape", action="store_true"); ap.add_argument("--pad-mm", type=float, default=4.0)
++ap.add_argument("--pose", action="append", default=[], help="NAME=PATH: extra 4x4 OCT world -> MRI world pose (.npy/.json) scored by Q1 (and the body block) in the same MRI box; repeatable; final/prefine/candidate are reserved names")
++ap.add_argument("--oct-exclude-mask", type=Path, default=None, help="bool .npy on the oct150 grid (I58: OCT folia region): enables the report-only body block")
++ap.add_argument("--mri-exclude-mask", type=Path, default=None, help="bool .npy on the MRI array grid (I58: P7 cerebellum dilated 1 mm): enables the report-only body block")
++ap.add_argument("--oct-exclude-dilate-mm", type=float, default=1.0, help="EDT dilation of --oct-exclude-mask for the body boundary point sets and the reverse union rule (P11: 1.0); the body MI mask removes the undilated region")
+ a = ap.parse_args(); out = a.out or a.run; out.mkdir(parents=True, exist_ok=True); t_start = time.time()
+ torch.set_num_threads(max(1, min(4, int(os.environ.get("OMP_NUM_THREADS", "4")))))
+ def say(*x): print(*x, f"[{time.time()-t_start:.0f}s]", flush=True)
+@@ -50,6 +64,11 @@ for nm in ("prefine", "candidate"):
+         Tn = np.load(f)
+         if nm == "candidate" and np.allclose(Tn, Ts["final"]): continue                # accepted fine pose: candidate == final
+         Ts[nm] = Tn; T_files[nm] = f
++for p in a.pose:
++    if "=" not in p: raise SystemExit(f"--pose must be NAME=PATH, got {p!r}")
++    nm, f = p.split("=", 1); f = Path(f)
++    if nm in ("final", "prefine", "candidate") or nm in Ts: raise SystemExit(f"--pose name {nm!r} is reserved or repeated")
++    Ts[nm] = load_T(f); T_files[nm] = f
+ res = json.load(open(a.run / "result.json")) if (a.run / "result.json").exists() else {}
+ say(f"OCT {tuple(shape_o)} @ {vox_o:.3f} mm, mask {oct_mask.mean():.3f}; MRI {mri.shape} @ {np.round(vox_m, 3).tolist()} mm; poses {list(Ts)}")
+ 
+@@ -112,10 +131,10 @@ def agreement(d, cls):
+     rim = cls != DEEP_END; rim &= cls != ""
+     return {"overall": dstats(d[cls != ""]), "rim_faces": dstats(d[rim]), "deep_end": dstats(d[cls == DEEP_END]), "per_face": per, "deep_end_class": DEEP_END}
+ 
+-def sample_np(vol_t, A_t, pts_np, chunk=4_000_000):
++def sample_np(vol_t, A_t, pts_np, chunk=4_000_000, mode="bilinear"):
+     outv = np.empty(len(pts_np), np.float32)
+     if len(pts_np) == 0: return outv
+-    for s in range(0, len(pts_np), chunk): outv[s:s + chunk] = sample_at_world(vol_t, A_t, to_t(pts_np[s:s + chunk]))[0].cpu().numpy()
++    for s in range(0, len(pts_np), chunk): outv[s:s + chunk] = sample_at_world(vol_t, A_t, to_t(pts_np[s:s + chunk]), mode=mode)[0].cpu().numpy()
+     return outv
+ 
+ idx_B = np.argwhere(B); p_o_B = (A_oct @ np.c_[idx_B, np.ones(len(idx_B))].T).T[:, :3]; cls_B = face_class(-grad_at(sm_o, idx_B))
+@@ -144,6 +163,75 @@ if "prefine" in boundary and "final" in boundary:
+     boundary["prefine_to_final_rim_median_increase_mm"] = {"per_face_forward": inc, "max": max(inc.values()) if inc else None, "F7_limit": 0.1}
+     say("prefine -> final rim-face median change (fwd, mm):", {k: round(v, 3) for k, v in inc.items()})
+ 
++# ------------------------------------------------------------------ Q1b body-only boundary agreement (report only; P11 probe:exclude qc_body.py port)
++BODY = a.oct_exclude_mask is not None or a.mri_exclude_mask is not None
++boundary_body = None; excl_info = None; cer_box = None; fol = None
++if BODY:
++    t_b = time.time(); _h = lambda p: np.c_[p, np.ones(len(p))]
++    def check_mask(path, arr, grid, shape, A):
++        """an exclusion mask must be a boolean (or 0/1) array on this prep's grid: shape, values and, when a masks.json from
++        scripts/make_exclusion_masks_i58.py sits next to it, the grid affine it was built on (a label map such as piece_labels_*.npy has the
++        MRI shape but values 0/1/2 and would silently exclude the whole tissue)."""
++        if tuple(arr.shape) != tuple(shape): raise SystemExit(f"{path}: shape {arr.shape} != {grid} {tuple(shape)}")
++        if arr.dtype != np.bool_:
++            u = np.unique(np.asarray(arr))
++            if not np.all(np.isin(u, [0, 1])): raise SystemExit(f"{path}: dtype {arr.dtype} with values {u[:10].tolist()}{'...' if u.size > 10 else ''}: an exclusion mask must be bool or 0/1")
++        prov = {"dtype": str(arr.dtype), "grid_check": "no masks.json next to the mask"}
++        mj = Path(path).parent / "masks.json"
++        if mj.exists():
++            g = (json.load(open(mj)).get("grids") or {}).get(grid)
++            if g is None: prov["grid_check"] = f"masks.json has no grids.{grid}"
++            else:
++                ok = tuple(g["shape"]) == tuple(shape) and np.allclose(np.asarray(g["affine"], float), A, atol=1e-6)
++                if not ok: raise SystemExit(f"{path}: masks.json grids.{grid} (shape {g['shape']}, affine {g['affine']}) does not match --work {a.work} (shape {tuple(shape)}, affine {np.asarray(A).tolist()})")
++                prov["grid_check"] = "masks.json grid shape and affine match --work"
++        return prov
++    mask_prov = {}
++    if a.mri_exclude_mask is not None:
++        _mx = np.load(a.mri_exclude_mask, mmap_mode="r"); mask_prov["mri"] = check_mask(a.mri_exclude_mask, _mx, "mri", mri.shape, A_mri)
++        cer_box = np.asarray(_mx[blo[0]:bhi[0], blo[1]:bhi[1], blo[2]:bhi[2]]).astype(bool); del _mx
++    else: cer_box = np.zeros(tis_box.shape, bool)
++    if a.oct_exclude_mask is not None:
++        fol = np.load(a.oct_exclude_mask); mask_prov["oct"] = check_mask(a.oct_exclude_mask, fol, "oct150", oct_mask.shape, A_oct); fol = fol.astype(bool)
++    else: fol = np.zeros(oct_mask.shape, bool)
++    fol_d = (ndimage.distance_transform_edt(~fol, sampling=(vox_o,) * 3) <= a.oct_exclude_dilate_mm) if fol.any() else fol
++    B_body = B & ~fol_d; bnd_m_t = bnd_m & ~cer_box
++    gidx_b = np.argwhere(bnd_m_t) + blo; fov_b = ((gidx_b >= np.ceil(1.0 / vox_m)) & (gidx_b <= np.array(mri.shape) - 1 - np.ceil(1.0 / vox_m))).all(1)
++    bnd_mb_use = np.zeros_like(bnd_m); bnd_mb_use[tuple((gidx_b[fov_b] - blo).T)] = True; del gidx_b, fov_b
++    say(f"body block: OCT boundary usable {int(B.sum())} -> {int(B_body.sum())} after the OCT exclusion (dilated {a.oct_exclude_dilate_mm} mm); MRI boundary {int(bnd_m.sum())} -> minus the MRI exclusion {int(bnd_m_t.sum())} -> FOV-ok {int(bnd_mb_use.sum())}")
++    d_mb_t = to_t(ndimage.distance_transform_edt(~bnd_m_t, sampling=tuple(vox_m)).astype(np.float32))[None]
++    d_ob_t = to_t(ndimage.distance_transform_edt(~B_body, sampling=(vox_o,) * 3).astype(np.float32))[None] if B_body.sum() >= 1000 else None
++    cer_t = to_t(cer_box.astype(np.float32))[None]; fol_t = to_t(fol_d.astype(np.float32))[None]
++    idx_Bb = np.argwhere(B_body); p_o_Bb = (A_oct @ _h(idx_Bb).T).T[:, :3]; cls_Bb = face_class(-grad_at(sm_o, idx_Bb))
++    idx_Mb = np.argwhere(bnd_mb_use); p_m_Mb = (A_box @ _h(idx_Mb).T).T[:, :3]; n_w_Mb = -grad_at(sm_m, idx_Mb) @ np.linalg.inv(A_box[:3, :3])
++    ex_f = np.zeros(len(p_o_Bb), bool); ex_r = np.zeros(len(p_m_Mb), bool)            # union rule over every pose of this call
++    for T in Ts.values():
++        ex_f |= sample_np(cer_t, A_box_t, (T @ _h(p_o_Bb).T).T[:, :3], mode="nearest") > 0.5
++        ex_r |= sample_np(fol_t, A_oct_t, (np.linalg.inv(T) @ _h(p_m_Mb).T).T[:, :3], mode="nearest") > 0.5
++    say(f"body block union exclusion over {list(Ts)}: forward {int(ex_f.sum())}/{len(ex_f)} OCT boundary points map onto the MRI exclusion under some pose; reverse {int(ex_r.sum())}/{len(ex_r)} MRI boundary points map onto the dilated OCT exclusion")
++    boundary_body = {}
++    for nm, T in Ts.items():
++        p_m = (T @ _h(p_o_Bb).T).T[:, :3]; ijk = (Ainv_mri @ _h(p_m).T).T[:, :3]
++        fov = ((ijk >= margin) & (ijk <= np.array(mri.shape) - 1 - margin)).all(1) & ~ex_f
++        fwd = agreement(sample_np(d_mb_t, A_box_t, p_m[fov]), cls_Bb[fov]); fwd["n_excluded_fov_or_mri_exclusion"] = int((~fov).sum())
++        rev = None
++        if d_ob_t is not None:
++            p_o = (np.linalg.inv(T) @ _h(p_m_Mb).T).T[:, :3]; ijk_o = (np.linalg.inv(A_oct) @ _h(p_o).T).T[:, :3]
++            inside = ((ijk_o >= FACE) & (ijk_o <= shape_o - 1 - FACE)).all(1) & ~ex_r; r = np.rint(ijk_o[inside]).astype(int)
++            keep = inside.copy(); keep[inside] = valid2[r[:, 0], r[:, 1], r[:, 2]]
++            n_o = (n_w_Mb[keep] @ T[:3, :3]) @ A_oct[:3, :3]
++            rev = agreement(sample_np(d_ob_t, A_oct_t, p_o[keep]), face_class(n_o)); rev["n_mri_boundary_used"] = int(keep.sum()); rev["frac_mri_boundary_inside_oct"] = float(keep.sum() / max(1, int((~ex_r).sum())))
++        boundary_body[nm] = {"forward_oct_to_mri": fwd, "reverse_mri_to_oct": rev}
++        fm = lambda v: "n/a" if v is None else f"{v:.3f}"
++        say(f"body boundary [{nm}] rim median fwd {fm(fwd['rim_faces']['median_mm'])} (n {fwd['rim_faces']['n']}) / rev {fm(rev['rim_faces']['median_mm'] if rev else None)}; "
++            f"deep end fwd {fm(fwd['deep_end']['median_mm'])} / rev {fm(rev['deep_end']['median_mm'] if rev else None)}; per face fwd " + " ".join(f"{c}:{v['median_mm']:.2f}" for c, v in fwd["per_face"].items()))
++    excl_info = {"report_only": True, "oct_exclude_mask": None if a.oct_exclude_mask is None else str(a.oct_exclude_mask), "mri_exclude_mask": None if a.mri_exclude_mask is None else str(a.mri_exclude_mask),
++                 "oct_exclude_dilate_mm": a.oct_exclude_dilate_mm, "oct_exclude_cm3": float(fol.sum()) * vox_o ** 3 / 1000, "mri_exclude_cm3_in_box": float(cer_box.sum()) * float(np.prod(vox_m)) / 1000,
++                 "union_poses": list(Ts), "n_oct_boundary_usable": int(B.sum()), "n_oct_boundary_body": int(B_body.sum()), "n_mri_boundary_body_fov_ok": int(bnd_mb_use.sum()),
++                 "n_forward_union_excluded": int(ex_f.sum()), "n_reverse_union_excluded": int(ex_r.sum()), "seconds_boundary": time.time() - t_b,
++                 "mask_checks": mask_prov, "note": "compare body numbers only between poses of this call (the union exclusion depends on the pose set); never a gate (P11 probe:exclude)"}
++    del d_mb_t, d_ob_t, cer_t, fol_t, fol_d, B_body, bnd_m_t, bnd_mb_use
++
+ # ------------------------------------------------------------------ Q2 MI32 landscape
+ def mi32(ia, ib, m, bins=32):
+     h = torch.bincount((ia[m] * bins + ib[m]), minlength=bins * bins).double().view(bins, bins); p = h / h.sum(); pa = p.sum(1); pb = p.sum(0); nz = p > 0
+@@ -191,10 +279,35 @@ if not a.skip_landscape:
+         say(f"MI32 landscape [{nm}] mask {L['mask_cm3']:.2f} cm3, MI at T {v0:.4f}; argmax (parabolic|grid): " +
+             " ".join(f"{k}:{(v['argmax_parabolic'] if v['argmax_parabolic'] is not None else v['argmax_offset']):+.2f}{'' if v['unimodal'] else '*'}" for k, v in L.items() if isinstance(v, dict) and "unimodal" in v) + "  (* = not unimodal)")
+ 
++landscape_body = {}
++if BODY and not a.skip_landscape:       # Q2 on the body: eroded cleaned MRI tissue minus the MRI exclusion via T & OCT mask & ~OCT exclusion & valid; tissue sampled on the body
++    te_b = (ndimage.distance_transform_edt(np.pad(tis_box, 1), sampling=tuple(vox_m))[1:-1, 1:-1, 1:-1] >= a.erode_mm) & ~cer_box; te_b_t = to_t(te_b.astype(np.float32))[None]; del te_b
++    tisb_t = to_t((tis_box & ~cer_box).astype(np.float32))[None]
++    for nm in [k for k in ("final", "prefine") if k in Ts]:
++        T = Ts[nm]; t1 = time.time()
++        m_spec = (resample_to_grid(te_b_t, A_box_t, A_oct_t, tuple(shape_o), T_grid_to_vol=to_t(T))[0] > 0.5).cpu().numpy() & oct_mask & valid2 & ~fol
++        idx = np.argwhere(m_spec); pts_b = to_t((A_oct @ np.c_[idx, np.ones(len(idx))].T).T[:, :3]); I_ob = to_t(oct150[m_spec])
++        def sample_b(Tp):
++            pm = apply_affine(to_t(Tp), pts_b); return sample_at_world(mri_t, A_box_t, pm)[0], sample_at_world(tisb_t, A_box_t, pm)[0] > 0.5
++        im0, tis0 = sample_b(T)
++        ra = np.percentile(I_ob[tis0].cpu().numpy(), [0.5, 99.5]); rb = np.percentile(im0[tis0].cpu().numpy(), [0.5, 99.5]); ia_b = to_bins(I_ob, *ra)
++        def value_b(Tp):
++            im, tis = sample_b(Tp); return mi32(ia_b, to_bins(im, *rb), tis)
++        v0 = value_b(T); Lb = {"mask_voxels": int(m_spec.sum()), "mask_cm3": float(m_spec.sum()) * vox_o ** 3 / 1000, "value_at_T": v0, "bins": {"oct": ra.tolist(), "mri": rb.tolist()}}
++        for kind, offs in OFFS.items():
++            for ax in range(3):
++                pk_ = peak(offs, [v0 if o == 0 else value_b(perturb(T, kind, ax, o)) for o in offs]); pk_["at_range_end"] = pk_["argmax_offset"] in (float(offs[0]), float(offs[-1])); Lb[f"{kind}_{AXN[ax]}"] = pk_
++        Lb["n_axes_at_range_end"] = int(sum(v["at_range_end"] for v in Lb.values() if isinstance(v, dict) and "at_range_end" in v)); Lb["seconds"] = time.time() - t1; landscape_body[nm] = Lb
++        say(f"body MI32 landscape [{nm}] mask {Lb['mask_cm3']:.2f} cm3, MI at T {v0:.4f}; range ends {Lb['n_axes_at_range_end']}/9; argmax: " +
++            " ".join(f"{k}:{(v['argmax_parabolic'] if v['argmax_parabolic'] is not None else v['argmax_offset']):+.2f}{'E' if v['at_range_end'] else ''}" for k, v in Lb.items() if isinstance(v, dict) and "unimodal" in v))
++    del te_b_t, tisb_t
++
+ # ------------------------------------------------------------------ outputs: json first
+ Q = {"work": str(a.work), "run": str(a.run), "T_used": {k: {"file": str(v), "T": Ts[k].tolist()} for k, v in T_files.items()},
+      "boundary": boundary, "mi_landscape": landscape or None, "settings": {"erode_mm": a.erode_mm, "checker_mm": a.checker_mm, "face_margin_vox": FACE, "valid_erosion_vox": 2, "fov_margin_mm": 1.0, "deep_end_class": DEEP_END, "mri_box_ijk": [blo.tolist(), bhi.tolist()], "mri_mask_cleanup": "closing 2 vox + fill holes + components >= 1 mm3", "mi_mask": "erode_ball(cleaned MRI tissue, erode_mm; box faces = background as in fine.py) via T & oct150_mask & (oct150 > 0 eroded 2), intersected with MRI tissue via the perturbed pose"},
+      "pose_diffs": {f"{p}_vs_{q}": transform_diff(Ts[p], Ts[q], c_o) for p in Ts for q in Ts if p < q}, "fine": {k: res.get("fine", {}).get(k) for k in ("accepted", "reasons", "U_mm", "sign_per_level")} if res.get("fine") else None}
++if a.pose: Q["settings"]["extra_poses"] = list(a.pose)
++if BODY: Q["boundary_body"] = boundary_body; Q["mi_landscape_body"] = landscape_body or None; Q["exclusion"] = excl_info
+ write_json(Q, out / "qc_fine.json"); say("wrote", out / "qc_fine.json")
+ 
+ # ------------------------------------------------------------------ Q3 figures
+diff --git a/octreg/octnorm.py b/octreg/octnorm.py
+new file mode 100644
+index 0000000..1e7a63f
+--- /dev/null
++++ b/octreg/octnorm.py
+@@ -0,0 +1,406 @@
++"""OCT intensity-normalisation options for the prep (v1.2 candidates after the P11 probe:norm on I58).
++
++prep_subject.py keeps the frozen v1 ``common.oct_slab_normalize`` on its default path (per-slice tissue median along array
++axis 0 at the native resolution).  This module adds, behind prep flags:
++
++  slab_normalize             the same v1 algorithm along ANY array axis, or a global gain only (``gain_only``), with an absolute
++                             (v1: 1e-3) or relative (1e-3 x median of the per-slice medians) floor on the per-slice median
++  plane_normalize_inplace    per-plane median normalisation of the vessel-level volume along one axis (the detected sectioning
++                             axis; applied after the destripe, window 1.2 mm = 4 sections on I58)
++  tile_flatfield_inplace     2-D folded multiplicative flat field of the tile mosaic on the two en-face axes (the axes other than
++                             the sectioning axis), constant along the sectioning axis
++  level150_from_octv         prep's 0.15 mm level from a vessel-level volume (block means + resample), for scripts/renorm_prep.py
++
++P11 (I58, docs in the probe record): the prep's axis-0 correction is 1.5 % (std of log scale) and 85 % of its power sits at the
++2.82 mm tile harmonics; the tile mosaic has fundamentals 70.44 / 69.72 voxels at 40 um on axes 0 / 1 with a non-separable 2-D fold
++(log std 1.2-1.5 %, p2p 8-10 %) that flips about 1 % of the WM/GM class voxels.  None of the variants changed the structural
++objective at P_R5 by more than 0.0004 NCC, so on I58 these options are registration-neutral; they exist for a physically
++motivated prep and must go through the DANDI regression before any default changes.  What the probe ruled out as the source of the
++axis-0 stretch preference is only these small corrections (axis-0 per-slice correction, axis-2 section normalisation, tile field; log
++std <= 0.015); the kept axis-0 trend (std log 0.126) and the global gain were never varied.  The global tile field assumes one tile
++phase for the whole block: sections whose mosaic is shifted by a tile step get a larger tile amplitude from it (P11 I58: section groups
++0-2), which the section-group diagnostics of tile_flatfield_inplace report and group_mode 'per_group' avoids.
++
++Conventions: volumes are (Z,Y,X) arrays (ndarray or memmap); zeros are missing data (black tiles) and stay exactly zero; float16
++outputs are clipped to [1, CAP_F16] on valid voxels like octreg.destripe.  All functions are CPU/numpy except level150_from_octv."""
++from __future__ import annotations
++
++import math
++import time
++
++import numpy as np
++from scipy import ndimage
++
++CAP_F16 = 60000.0            # same cap as common.oct_slab_normalize / destripe.CAP_F16
++ABS_FLOOR = 1e-3             # v1's absolute floor on the per-slice median (common.oct_slab_normalize)
++
++
++def _plane(axis: int, i: int):
++    sl = [slice(None)] * 3; sl[axis] = i; return tuple(sl)
++
++
++# ----------------------------------------------------------------------------- native-level slab normalisation, any axis
++def slab_normalize(oct_vol: np.ndarray, axis: int = 0, tissue_thresh: float = 30.0, window: int = 100, out_dtype=np.float32,
++                   floor: str = "abs", gain_only: bool = False) -> tuple[np.ndarray, dict]:
++    """``common.oct_slab_normalize`` generalised.  For every plane along ``axis``: tissue median (voxels > tissue_thresh, planes with
++    > 2000 of them; others interpolated); reference = running mean of the medians over ``window`` planes (mode nearest);
++    scale = reference / median where median > floor, else 1.  ``floor``: 'abs' = 1e-3 (v1; I58's mu_s medians are only 1.9 x above
++    it), 'rel' = 1e-3 x median of the interpolated medians.  ``gain_only``: scale = 1 everywhere (the medians, reference and the
++    float16 gain are computed exactly as in v1, so the global level equals v1's).  float16 output: gain = 16384 / median(reference),
++    values clipped to [0, 60000].  With axis=0, floor='abs', gain_only=False the output is byte-identical to
++    common.oct_slab_normalize (scripts/test_octnorm.py).  -> (volume, info with per_slice_median / reference / scale lists)."""
++    axis = int(axis); assert axis in (0, 1, 2), axis; assert floor in ("abs", "rel"), floor
++    n = oct_vol.shape[axis]
++    med = np.full(n, np.nan)
++    for i in range(n):
++        s = oct_vol[_plane(axis, i)]
++        t = s[s > tissue_thresh]
++        if t.size > 2000:
++            med[i] = np.median(t)
++    good = np.isfinite(med)
++    idx = np.arange(n)
++    med_f = np.interp(idx, idx[good], med[good]) if good.any() else np.ones(n)
++    ref = ndimage.uniform_filter1d(med_f, size=window, mode="nearest")
++    floor_value = ABS_FLOOR if floor == "abs" else ABS_FLOOR * float(np.nanmedian(med_f))
++    scale = np.where(med_f > floor_value, ref / med_f, 1.0).astype(np.float32)
++    n_floor = int(((med_f <= floor_value) & good).sum())
++    if gain_only:
++        scale = np.ones(n, np.float32)
++    gain = 1.0
++    if np.dtype(out_dtype) == np.float16:
++        gmin = ABS_FLOOR if floor == "abs" else 1e-30
++        gain = 16384.0 / max(float(np.nanmedian(ref)), gmin); cap = CAP_F16
++    out = np.empty(oct_vol.shape, dtype=out_dtype)
++    for i in range(n):
++        v = np.asarray(oct_vol[_plane(axis, i)], dtype=np.float32) * (scale[i] * gain)
++        if gain != 1.0: np.clip(v, 0, cap, out=v)
++        out[_plane(axis, i)] = v.astype(out_dtype, copy=False)
++    return out, {"per_slice_median": med.tolist(), "reference": ref.tolist(), "scale": scale.tolist(), "window": window, "tissue_thresh": tissue_thresh,
++                 "gain": float(gain), "axis": axis, "floor": floor, "floor_value": float(floor_value), "n_planes_at_floor": n_floor, "gain_only": bool(gain_only)}
++
++
++def scale_summary(med, scale) -> dict:
++    """Compact statistics of a per-plane correction (valid planes = finite median)."""
++    med = np.asarray(med, float); scale = np.asarray(scale, float); ok = np.isfinite(med)
++    if not ok.any(): return {"n_planes": int(len(med)), "n_valid": 0}
++    s = scale[ok]; ls = np.log(np.maximum(s, 1e-12))
++    return {"n_planes": int(len(med)), "n_valid": int(ok.sum()), "scale_min_max": [float(s.min()), float(s.max())], "scale_p1_p99": np.percentile(s, [1, 99]).tolist(),
++            "std_log_scale": float(ls.std()), "max_abs_log_scale": float(np.abs(ls).max()), "median_min_max": [float(np.nanmin(med)), float(np.nanmax(med))],
++            "std_log_median": float(np.log(np.maximum(med[ok], 1e-30)).std())}
++
++
++# ----------------------------------------------------------------------------- vessel-level per-plane normalisation
++def plane_medians(vol: np.ndarray, axis: int, mask: np.ndarray | None = None, min_count: int = 2000):
++    """Exact median of the valid voxels (vol > 0, & mask) of every plane along ``axis`` (planes with <= min_count voxels -> nan)."""
++    n = vol.shape[axis]; med = np.full(n, np.nan); cnt = np.zeros(n, np.int64)
++    for i in range(n):
++        sl = _plane(axis, i); v = np.asarray(vol[sl], dtype=np.float32); m = v > 0
++        if mask is not None: m &= np.asarray(mask[sl], dtype=bool)
++        c = int(m.sum()); cnt[i] = c
++        if c > min_count: med[i] = float(np.median(v[m]))
++    return med, cnt
++
++
++def plane_normalize_inplace(vol: np.ndarray, axis: int, window: int, mask: np.ndarray | None = None, min_count: int = 2000, cap: float = CAP_F16) -> dict:
++    """Per-plane median normalisation IN PLACE along ``axis`` of a vessel-level volume (P11 N2 recipe): median of vol > 0 (& mask) per
++    plane, gaps interpolated, reference = running mean over ``window`` planes (mode nearest), factor = reference / median (relative
++    floor 1e-3 x median of the medians), valid voxels multiplied and clipped to [1, cap] (float16 safe), zeros stay 0."""
++    t0 = time.time(); axis = int(axis); assert axis in (0, 1, 2), axis; window = int(window)
++    med, cnt = plane_medians(vol, axis, mask, min_count)
++    good = np.isfinite(med)
++    if not good.any():
++        return {"applied": False, "reason": "no_valid_planes", "axis": axis, "window": window}
++    idx = np.arange(len(med)); med_f = np.interp(idx, idx[good], med[good])
++    ref = ndimage.uniform_filter1d(med_f, size=window, mode="nearest")
++    fac = np.where(med_f > ABS_FLOOR * float(np.median(med_f)), ref / med_f, 1.0).astype(np.float32)
++    for i in range(len(fac)):
++        if fac[i] == 1.0: continue
++        sl = _plane(axis, i); v = np.asarray(vol[sl], dtype=np.float32); valid = v > 0
++        vol[sl] = np.where(valid, np.clip(v * fac[i], 1.0, cap), 0.0).astype(vol.dtype, copy=False)
++    lf = np.log(fac[good].astype(np.float64))
++    per = _fft_top_period(lf - lf.mean(), 2.0, max(4.0, len(lf) / 2.0)) if good.sum() >= 16 else None
++    return {"applied": True, "axis": axis, "window": window, "min_count": min_count, "n_planes": int(len(med)), "n_valid": int(good.sum()),
++            "fac_min_max": [float(fac[good].min()), float(fac[good].max())], "std_log_fac": float(lf.std()), "dominant_period_planes": per,
++            "median_min_max": [float(np.nanmin(med)), float(np.nanmax(med))], "factor": fac.tolist(), "seconds": time.time() - t0}
++
++
++# ----------------------------------------------------------------------------- tile (mosaic) flat field on the en-face axes
++def enface_axes(sect_axis: int) -> tuple[int, int]:
++    return tuple(a for a in range(3) if a != int(sect_axis))
++
++
++def enface_log_maps(vol: np.ndarray, mask: np.ndarray | None, sect_axis: int, chunk: int = 64):
++    """Sum of log(vol) and voxel count over the sectioning axis on the valid voxels (vol > 0, & mask) -> (L, N) on the en-face plane
++    (en-face axes in increasing order).  Chunked along array axis 0 (float32 per chunk, as the P11 probe)."""
++    sect_axis = int(sect_axis); e0, e1 = enface_axes(sect_axis)
++    L = np.zeros((vol.shape[e0], vol.shape[e1])); N = np.zeros((vol.shape[e0], vol.shape[e1]))
++    for z0 in range(0, vol.shape[0], chunk):
++        z1 = min(vol.shape[0], z0 + chunk); x = np.asarray(vol[z0:z1]).astype(np.float32)
++        m = (x > 0) if mask is None else (np.asarray(mask[z0:z1]).astype(bool) & (x > 0))
++        lx = np.where(m, np.log(np.maximum(x, 1e-6)), 0)
++        if sect_axis == 0: L += lx.sum(0); N += m.sum(0)
++        elif sect_axis == 1: L[z0:z1] += lx.sum(1); N[z0:z1] += m.sum(1)
++        else: L[z0:z1] += lx.sum(2); N[z0:z1] += m.sum(2)
++        del x, m, lx
++    return L, N
++
++
++def group_bounds(n: int, group_planes: int) -> list[tuple[int, int]]:
++    """Contiguous groups of ``group_planes`` planes along a length-n axis; a last group shorter than half a group joins the previous one."""
++    g = max(1, int(group_planes)); b = [(s, min(n, s + g)) for s in range(0, n, g)]
++    if len(b) > 1 and b[-1][1] - b[-1][0] < g / 2.0: b[-2] = (b[-2][0], b[-1][1]); b.pop()
++    return b
++
++
++def enface_log_maps_grouped(vol: np.ndarray, mask: np.ndarray | None, sect_axis: int, bounds, chunk: int = 64):
++    """enface_log_maps per group of sectioning-axis planes -> (L [G, n_e0, n_e1], N [G, n_e0, n_e1]); summed over groups = enface_log_maps
++    up to float rounding."""
++    sect_axis = int(sect_axis); e0, e1 = enface_axes(sect_axis); G = len(bounds)
++    L = np.zeros((G, vol.shape[e0], vol.shape[e1])); N = np.zeros((G, vol.shape[e0], vol.shape[e1]))
++    for z0 in range(0, vol.shape[0], chunk):
++        z1 = min(vol.shape[0], z0 + chunk); x = np.asarray(vol[z0:z1]).astype(np.float32)
++        m = (x > 0) if mask is None else (np.asarray(mask[z0:z1]).astype(bool) & (x > 0))
++        lx = np.where(m, np.log(np.maximum(x, 1e-6)), 0)
++        for g, (g0, g1) in enumerate(bounds):
++            if sect_axis == 0:
++                s0, s1 = max(g0, z0), min(g1, z1)
++                if s0 < s1: L[g] += lx[s0 - z0:s1 - z0].sum(0); N[g] += m[s0 - z0:s1 - z0].sum(0)
++            elif sect_axis == 1: L[g, z0:z1] += lx[:, g0:g1].sum(1); N[g, z0:z1] += m[:, g0:g1].sum(1)
++            else: L[g, z0:z1] += lx[:, :, g0:g1].sum(2); N[g, z0:z1] += m[:, :, g0:g1].sum(2)
++        del x, m, lx
++    return L, N
++
++
++def _valid_extent(N: np.ndarray, ax: int) -> int:
++    """Number of en-face lines along map axis ``ax`` between the first and the last line with >= 2 % of the maximum count (as estimate_tile_period)."""
++    w = N.sum(1 - int(ax))
++    if w.max() <= 0: return 0
++    ii = np.where(w > 0.02 * w.max())[0]; return int(ii.max() - ii.min() + 1)
++
++
++def _box_detrend(prof, w, win):
++    num = ndimage.uniform_filter1d(np.where(w > 0, prof * w, 0.0), int(win), mode="constant"); den = ndimage.uniform_filter1d(w.astype(float), int(win), mode="constant")
++    return prof - num / np.maximum(den, 1e-12), den / max(float(w.max()), 1e-12)
++
++
++def _fold_r2(prof, w, P, nb=24):
++    """Weighted fold of a profile at period P (nb phase bins) -> (R2 = folded variance / total variance, zero-mean fold, bin weights)."""
++    ph = np.floor(((np.arange(len(prof)) / P) % 1.0) * nb).astype(int) % nb; ok = np.isfinite(prof) & (w > 0)
++    if ok.sum() < 2 * nb: return 0.0, np.zeros(nb), np.zeros(nb)
++    sw = np.bincount(ph[ok], w[ok], nb); fm = np.bincount(ph[ok], w[ok] * prof[ok], nb) / np.maximum(sw, 1e-12); mu = (w[ok] * prof[ok]).sum() / w[ok].sum()
++    vt = (w[ok] * (prof[ok] - mu) ** 2).sum() / w[ok].sum(); vf = (sw * (fm - mu) ** 2).sum() / sw.sum()
++    return float(vf / max(vt, 1e-30)), fm - (sw * fm).sum() / sw.sum(), sw
++
++
++def _fft_peaks(p, pmin, pmax, pad=1 << 15, top=3):
++    p = np.asarray(p, float); p = p - p.mean(); P = np.abs(np.fft.rfft(p * np.hanning(len(p)), pad)) ** 2; f = np.fft.rfftfreq(pad)
++    per = 1.0 / np.maximum(f, 1e-12); band = (per >= pmin) & (per <= pmax)
++    idx = np.where(band[1:-1] & (P[1:-1] > P[:-2]) & (P[1:-1] >= P[2:]))[0] + 1
++    if idx.size == 0: return []
++    idx = idx[np.argsort(-P[idx])][:top]; med = float(np.median(P[band])) if band.any() else 0.0
++    return [{"period_vox": float(per[i]), "over_band_median": float(P[i] / med) if med > 0 else None} for i in idx]
++
++
++def _fft_top_period(p, pmin, pmax):
++    pk = _fft_peaks(p, pmin, pmax, top=1); return pk[0]["period_vox"] if pk else None
++
++
++def estimate_tile_period(L: np.ndarray, N: np.ndarray, ax: int, band_vox=(15.0, 100.0), rel: float = 0.1, step: float = 0.02, nb: int = 24,
++                         harmonic_ratio: float = 1.2, n_fft: int = 3) -> tuple[float | None, dict]:
++    """Tile fundamental along en-face map axis ``ax`` (0/1 of the (L, N) maps).  Profile = mean log per line (lines with >= 2 % of the
++    maximum count), detrended by a count-normalised boxcar of the band's longest period; candidates = the ``n_fft`` strongest FFT
++    peaks in ``band_vox`` and their doubles inside the band; each candidate refined by the fold-R2 maximum over +-rel at ``step`` and
++    scored by its contrast = R2(P) - mean R2 at the off-period controls 0.87 P and 1.13 P (a smooth anatomy profile folds well at any
++    long period, a tile only at its own); the best contrast wins, except that a winner ~k x a shorter candidate (within 5 %) is replaced by the shorter one
++    when k >= 3, and for k = 2 unless its contrast is >= harmonic_ratio x the shorter one's (an alternating mosaic has its
++    fundamental at twice the tile step: I58 axis 0 R2 0.32 at 70.4 vs 0.22 at 35.4, controls 0.02-0.07).  -> (period in map voxels or None, info)."""
++    oth = 1 - int(ax); w = N.sum(oth); S = L.sum(oth)
++    if w.max() <= 0: return None, {"reason": "empty"}
++    okp = w > 0.02 * w.max(); ii = np.where(okp)[0]; a, b = int(ii.min()), int(ii.max()) + 1
++    lm = np.where(w > 0, S / np.maximum(w, 1), 0.0); wv = np.where(okp, w, 0.0)
++    win = int(round(band_vox[1])); d, cover = _box_detrend(lm, wv, win); wd = np.where(okp & (cover > 0.5), w, 0.0)
++    pk = _fft_peaks(d[a:b], band_vox[0], band_vox[1], top=n_fft)
++    cands = sorted({round(q["period_vox"], 2) for q in pk} | {round(2 * q["period_vox"], 2) for q in pk if 2 * q["period_vox"] <= band_vox[1]})
++    scans = []
++    for c in cands:
++        Ps = np.arange(c * (1 - rel), c * (1 + rel), step); r2 = np.array([_fold_r2(d, wd, P, nb)[0] for P in Ps]); j = int(np.argmax(r2))
++        c087 = _fold_r2(d, wd, Ps[j] * 0.87, nb)[0]; c113 = _fold_r2(d, wd, Ps[j] * 1.13, nb)[0]
++        scans.append({"candidate": float(c), "P": float(Ps[j]), "R2": float(r2[j]), "R2_control_0.87P": c087, "R2_control_1.13P": c113, "contrast": float(r2[j] - 0.5 * (c087 + c113))})
++    if not scans: return None, {"reason": "no_fft_peak", "fft_peaks": pk, "detrend_vox": win}
++    win_s = max(scans, key=lambda s: s["contrast"])
++    for s in sorted(scans, key=lambda s: s["P"]):
++        k = win_s["P"] / s["P"]
++        if s is win_s or s["contrast"] <= 0 or k < 1.9 or abs(k - round(k)) > 0.05 * round(k): continue
++        if round(k) >= 3 or win_s["contrast"] < harmonic_ratio * s["contrast"]:     # a mosaic alternates at most with period 2 x step
++            win_s = s; break
++    if win_s["contrast"] <= 0: return None, {"reason": "no_period_with_positive_contrast", "fft_peaks": pk, "detrend_vox": win, "scans": scans}
++    return float(win_s["P"]), {"fft_peaks": pk, "detrend_vox": win, "scans": scans, "chosen": win_s, "valid_range": [a, b], "harmonic_ratio": harmonic_ratio}
++
++
++def tile_field_2d(L: np.ndarray, N: np.ndarray, P0: float, P1: float, bin_vox: float = 2.0, smooth_bins: float = 1.0):
++    """2-D folded tile field (P11 norm_tiles.field2d): mean-log map detrended by a count-normalised boxcar of one period per axis (lines
++    with box cover <= 0.5 get no weight), folded at (P0, P1) with round(P / bin_vox) bins per axis (count-weighted), circular Gaussian
++    smoothing of ``smooth_bins``, weighted mean removed.  -> (F2 [nb0, nb1] log field, q0 [n0] bin index per line, q1 [n1], info)."""
++    nb0 = max(2, int(round(P0 / bin_vox))); nb1 = max(2, int(round(P1 / bin_vox))); k0, k1 = int(round(P0)), int(round(P1))
++    lm = np.where(N > 0, L / np.maximum(N, 1), 0.0)
++    num = ndimage.uniform_filter(np.where(N > 0, L, 0.0), (k0, k1), mode="constant"); den = ndimage.uniform_filter(N.astype(float), (k0, k1), mode="constant")
++    cover = ndimage.uniform_filter((N > 0).astype(float), (k0, k1), mode="constant")
++    r = lm - num / np.maximum(den, 1e-9); W = np.where((N > 0) & (cover > 0.5), N, 0.0)
++    q0 = np.floor(((np.arange(L.shape[0]) / P0) % 1) * nb0).astype(int) % nb0; q1 = np.floor(((np.arange(L.shape[1]) / P1) % 1) * nb1).astype(int) % nb1
++    lab = (q0[:, None] * nb1 + q1[None, :]).ravel()
++    sw = np.bincount(lab, W.ravel(), nb0 * nb1).reshape(nb0, nb1)
++    if sw.sum() <= 0:
++        return np.zeros((nb0, nb1)), q0, q1, {"nb": [nb0, nb1], "P": [float(P0), float(P1)], "reason": "no_weight"}
++    F2 = np.bincount(lab, (W * r).ravel(), nb0 * nb1).reshape(nb0, nb1) / np.maximum(sw, 1e-9)
++    if smooth_bins: F2 = ndimage.gaussian_filter(F2, smooth_bins, mode="wrap")
++    F2 -= (sw * F2).sum() / sw.sum()
++    a0 = (sw * F2).sum(1) / np.maximum(sw.sum(1), 1e-9); a1 = np.zeros(nb1)
++    for _ in range(10): a1 = (sw * (F2 - a0[:, None])).sum(0) / np.maximum(sw.sum(0), 1e-9); a0 = (sw * (F2 - a1[None, :])).sum(1) / np.maximum(sw.sum(1), 1e-9)
++    sep = a0[:, None] + a1[None, :]; v2 = (sw * F2 ** 2).sum() / sw.sum(); vs = (sw * sep ** 2).sum() / sw.sum()
++    resvar = (W * r ** 2).sum() / max(W.sum(), 1e-9)
++    info = {"nb": [nb0, nb1], "P": [float(P0), float(P1)], "bin_vox": float(bin_vox), "smooth_bins": float(smooth_bins), "log_std": float(np.sqrt(v2)), "log_p2p": float(F2.max() - F2.min()),
++            "separable_R2": float(vs / v2) if v2 > 0 else None, "field_var_over_residual_var": float(v2 / resvar) if resvar > 0 else None,
++            "marginal_p2p_axis0": float(a0.max() - a0.min()), "marginal_p2p_axis1": float(a1.max() - a1.min())}
++    return F2, q0, q1, info
++
++
++def tile_flatfield_inplace(vol: np.ndarray, mask: np.ndarray | None, sect_axis: int, periods_vox=None, bin_vox: float = 2.0, smooth_bins: float = 1.0,
++                           band_vox=(15.0, 100.0), cap: float = CAP_F16, chunk: int = 64, residual: bool = True, min_contrast: float = 0.15,
++                           min_cycles: float = 5.0, max_field_log_std: float = 0.05, group_planes: int = 0, group_mode: str = "global",
++                           min_group_frac: float = 0.2) -> dict:
++    """Multiplicative 2-D tile flat field IN PLACE: en-face log maps over the sectioning axis (vol > 0 & mask), tile periods per en-face
++    axis (``periods_vox`` = (P0, P1) in voxels, or estimate_tile_period with the weak-axis rule below), tile_field_2d, vol /= exp(F2[q0][:, q1]) broadcast along the
++    sectioning axis; valid voxels clipped to [1, cap], zeros stay 0.  ``residual``: one more map pass and the field of the corrected
++    volume (its log std is the residual tile amplitude).
++
++    Plausibility (review 2026-09-14): the fold needs enough tile cycles inside the valid en-face extent (>= ``min_cycles`` on both axes)
++    and a mosaic field is a few % (I58 log std 0.012-0.015), so a fitted field with log std > ``max_field_log_std`` is anatomy or a wrong
++    period.  ESTIMATED periods that fail either rule are rejected (applied False, nothing changed); GIVEN periods are applied and the
++    failures are recorded in plausibility.warnings.
++
++    Section groups (``group_planes`` > 0): the sectioning axis is cut into contiguous groups of that many planes.  The per-group fold of
++    the uncorrected volume (log std, correlation with the global fold) and, with ``residual``, the per-group residual after the correction
++    are reported (groups.per_group, groups.summary.n_groups_after_gt_before: a group whose tile pattern is shifted relative to the global
++    one gets a LARGER tile amplitude from the global field; P11 I58: groups 0-2 fold correlation 0.05-0.26).  ``group_mode`` 'per_group'
++    estimates and divides one field per group (same periods; groups with < ``min_group_frac`` x the mean group voxel count use the global
++    field) instead of the single global field ('global', default).
++    -> info (periods, estimation scans, field statistics, plausibility, groups, residual)."""
++    t0 = time.time(); sect_axis = int(sect_axis); e0, e1 = enface_axes(sect_axis); assert group_mode in ("global", "per_group"), group_mode
++    group_planes = int(group_planes or 0)
++    if group_mode == "per_group" and group_planes <= 0: raise ValueError("group_mode 'per_group' needs group_planes > 0")
++    bounds = group_bounds(vol.shape[sect_axis], group_planes) if group_planes > 0 else None
++    if bounds is not None:
++        Lg, Ng = enface_log_maps_grouped(vol, mask, sect_axis, bounds, chunk); L = Lg.sum(0); N = Ng.sum(0)
++    else:
++        L, N = enface_log_maps(vol, mask, sect_axis, chunk); Lg = Ng = None
++    est = {}
++    if periods_vox is None:
++        P0, est0 = estimate_tile_period(L, N, 0, band_vox); P1, est1 = estimate_tile_period(L, N, 1, band_vox); est = {"axis_a": est0, "axis_b": est1, "borrowed": None}
++        # A per-slice normalisation along an en-face axis (v1's axis-0 slab normalisation on I58) removes most of that axis's 1-D tile marginal while the
++        # non-separable 2-D field stays: that axis then has no reliable 1-D period.  Mosaic tiles are square to ~1 % (I58 2.818 / 2.789 mm), so a
++        # weak axis (contrast < max(min_contrast, 1/3 of the other axis's), or < 1/2 of it with a period > 5 % away from the other axis's) takes the
++        # other axis's period; recorded in estimate.borrowed.  I58 raw-stream values (contrast ~0.27 / 0.57, periods 1 % apart) keep their own periods.
++        con = [(e.get("chosen") or {}).get("contrast", -1.0) if P is not None else -1.0 for P, e in ((P0, est0), (P1, est1))]
++        Ps_ = (P0, P1)
++        def _weak(i):
++            j = 1 - i
++            if con[i] < max(min_contrast, con[j] / 3.0): return True
++            return Ps_[i] is not None and Ps_[j] is not None and con[i] < 0.5 * con[j] and abs(Ps_[i] / Ps_[j] - 1.0) > 0.05
++        weak = [_weak(0), _weak(1)]
++        if weak[0] and not weak[1]: est["borrowed"] = {"axis_a_from_axis_b": P1, "contrast": con}; P0 = P1
++        elif weak[1] and not weak[0]: est["borrowed"] = {"axis_b_from_axis_a": P0, "contrast": con}; P1 = P0
++        elif weak[0] and weak[1]:
++            return {"applied": False, "reason": "no_reliable_tile_period", "enface_axes": [e0, e1], "estimate": est, "seconds": time.time() - t0}
++    else:
++        P0, P1 = (float(p) for p in periods_vox)
++    F2, q0, q1, finfo = tile_field_2d(L, N, P0, P1, bin_vox, smooth_bins)
++    ext = [_valid_extent(N, 0), _valid_extent(N, 1)]; cyc = [float(ext[0] / P0), float(ext[1] / P1)]; del L, N
++    warn = []
++    if min(cyc) < min_cycles: warn.append(f"only {min(cyc):.1f} tile cycles in the valid en-face extent (< {min_cycles:g}): the fold is not reliable")
++    if finfo.get("log_std") is None or finfo["log_std"] > max_field_log_std:
++        warn.append(f"field log std {finfo.get('log_std')} > {max_field_log_std:g}: larger than a mosaic flat field (I58 0.012-0.015), anatomy or a wrong period")
++    plaus = {"valid_extent_vox": ext, "cycles": cyc, "min_cycles": float(min_cycles), "field_log_std": finfo.get("log_std"), "max_field_log_std": float(max_field_log_std), "warnings": warn}
++    if warn and periods_vox is None:
++        return {"applied": False, "reason": "implausible_estimated_tile_field: " + "; ".join(warn), "sect_axis": sect_axis, "enface_axes": [e0, e1], "rejected_periods_vox": [float(P0), float(P1)],
++                "periods_source": "estimated", "estimate": est, "field": finfo, "plausibility": plaus, "band_vox": list(band_vox), "seconds": time.time() - t0}
++    tile = np.exp(F2[q0][:, q1]).astype(np.float32)                          # [n_e0, n_e1]
++    shp = [1, 1, 1]; shp[e0] = tile.shape[0]; shp[e1] = tile.shape[1]; t3 = tile.reshape(shp)
++    groups = None; tiles_g = None
++    if bounds is not None:
++        cnt = Ng.sum((1, 2)); mean_cnt = float(cnt[cnt > 0].mean()) if (cnt > 0).any() else 0.0; per_g = []; F2g_all = []
++        for g, (g0, g1) in enumerate(bounds):
++            rec = {"group": g, "planes": [int(g0), int(g1)], "voxel_frac": float(cnt[g] / max(cnt.sum(), 1.0))}
++            F2g = None
++            if mean_cnt > 0 and cnt[g] >= min_group_frac * mean_cnt:
++                F2g, _, _, fi = tile_field_2d(Lg[g], Ng[g], P0, P1, bin_vox, smooth_bins)
++                if fi.get("reason") == "no_weight": F2g = None
++                else:
++                    rec["field_log_std_before"] = fi["log_std"]
++                    rec["fold_corr_with_global"] = float(np.corrcoef(F2g.ravel(), F2.ravel())[0, 1]) if F2g.std() > 0 and F2.std() > 0 else None
++            rec["field_used"] = ("own" if F2g is not None else "global (too few voxels)") if group_mode == "per_group" else "global"
++            per_g.append(rec); F2g_all.append(F2g)
++        del Lg, Ng
++        if group_mode == "per_group":
++            tiles_g = [(np.exp(Fg[q0][:, q1]).astype(np.float32) if Fg is not None else tile).reshape(shp) for Fg in F2g_all]
++        groups = {"group_planes": group_planes, "mode": group_mode, "min_group_frac": float(min_group_frac), "per_group": per_g,
++                  "field_log": [None if Fg is None else np.round(Fg, 5).tolist() for Fg in F2g_all] if group_mode == "per_group" else None}
++    for z0 in range(0, vol.shape[0], chunk):
++        z1 = min(vol.shape[0], z0 + chunk); x = np.asarray(vol[z0:z1]).astype(np.float32)
++        valid = x > 0
++        if tiles_g is None:
++            tz = t3[z0:z1] if e0 == 0 else t3                                    # the en-face field indexes axis 0 only when axis 0 is en-face
++            vol[z0:z1] = np.where(valid, np.clip(x / tz, 1.0, cap), 0.0).astype(vol.dtype, copy=False)
++        else:
++            for (g0, g1), tg in zip(bounds, tiles_g):
++                if sect_axis == 0:
++                    s0, s1 = max(g0, z0), min(g1, z1)
++                    if s0 < s1: x[s0 - z0:s1 - z0] /= tg
++                else:
++                    sl = [slice(None)] * 3; sl[sect_axis] = slice(g0, g1); tz = tg[z0:z1] if e0 == 0 else tg
++                    x[tuple(sl)] /= tz
++            vol[z0:z1] = np.where(valid, np.clip(x, 1.0, cap), 0.0).astype(vol.dtype, copy=False)
++        del x, valid
++    out = {"applied": True, "sect_axis": sect_axis, "enface_axes": [e0, e1], "periods_vox": [float(P0), float(P1)], "periods_source": "given" if periods_vox is not None else "estimated",
++           "estimate": est, "field": finfo, "plausibility": plaus, "field_log": np.round(F2, 5).tolist(), "tile_min_max": [float(tile.min()), float(tile.max())], "band_vox": list(band_vox)}
++    if residual:
++        if bounds is not None:
++            Lg2, Ng2 = enface_log_maps_grouped(vol, mask, sect_axis, bounds, chunk); _, _, _, after = tile_field_2d(Lg2.sum(0), Ng2.sum(0), P0, P1, bin_vox, smooth_bins)
++            for rec in groups["per_group"]:
++                if "field_log_std_before" not in rec: continue
++                _, _, _, fa = tile_field_2d(Lg2[rec["group"]], Ng2[rec["group"]], P0, P1, bin_vox, smooth_bins)
++                rec["residual_log_std_after"] = fa.get("log_std"); rec["after_over_before"] = float(fa["log_std"] / rec["field_log_std_before"]) if fa.get("log_std") is not None and rec["field_log_std_before"] > 0 else None
++            del Lg2, Ng2
++        else:
++            L2, N2 = enface_log_maps(vol, mask, sect_axis, chunk); _, _, _, after = tile_field_2d(L2, N2, P0, P1, bin_vox, smooth_bins)
++        out["residual_field"] = after
++    if groups is not None:
++        pg = [r for r in groups["per_group"] if "field_log_std_before" in r]; ratios = [r["after_over_before"] for r in pg if r.get("after_over_before") is not None]
++        corrs = [r["fold_corr_with_global"] for r in pg if r.get("fold_corr_with_global") is not None]
++        groups["summary"] = {"n_groups": len(groups["per_group"]), "n_groups_scored": len(pg), "n_groups_corr_below_0.3": int(sum(c < 0.3 for c in corrs)),
++                             "min_fold_corr_with_global": min(corrs) if corrs else None, "n_groups_after_gt_before": int(sum(q > 1.0 for q in ratios)) if ratios else None,
++                             "max_after_over_before": max(ratios) if ratios else None}
++        out["groups"] = groups
++    out["seconds"] = time.time() - t0
++    return out
++
++
++def pop_group_fields(info: dict, file_name: str = "oct_tile_field_groups.npy"):
++    """Take groups.field_log (per_group mode) out of a tile_flatfield_inplace info -> [G, nb0, nb1] float32 array (nan = the group used the
++    global field) or None; records ``file_name`` in info.groups.field_log_file (the caller saves the array under that name)."""
++    g = info.get("groups") or {}
++    fl = g.pop("field_log", None)
++    if fl is None: return None
++    nb = (info.get("field") or {}).get("nb") or [1, 1]
++    g["field_log_file"] = file_name
++    return np.stack([np.asarray(f, np.float32) if f is not None else np.full(tuple(nb), np.nan, np.float32) for f in fl])
++
++
++# ----------------------------------------------------------------------------- 0.15 mm level (prep_subject.py level150, destripe-on path)
++def level150_from_octv(vol_v: np.ndarray, A_nat: np.ndarray, sp_um, kv, k150, A150: np.ndarray, shape150):
++    """oct150 from a vessel-level volume exactly as prep_subject.py's level150(): block means by k150 // kv, then trilinear resampling
++    from pooled_affine(A_nat, k150) onto the stored 0.15 mm grid (A150, shape150).  Uses octreg.common (GPU when available)."""
++    from .common import pool_mean_np, pooled_affine, resample_to_grid, to_t
++    kv = np.asarray(kv, int); k150 = np.asarray(k150, int)
++    A_p = pooled_affine(np.asarray(A_nat), k150)
++    p150 = pool_mean_np(vol_v, k150 // kv)
++    return resample_to_grid(to_t(p150)[None], to_t(A_p), to_t(np.asarray(A150)), tuple(int(s) for s in shape150)).cpu().numpy()[0]
+diff --git a/scripts/renorm_prep.py b/scripts/renorm_prep.py
+new file mode 100644
+index 0000000..edadd80
+--- /dev/null
++++ b/scripts/renorm_prep.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""Re-derive oct150 of an existing destripe-on prep with the v1.2 vessel-level normalisation options, without the native OCT:
++
++    python scripts/renorm_prep.py --work W --out W2 [--plane-norm off|auto|0|1|2] [--plane-norm-window-mm 1.2] [--tile-flatfield off|on]
++                                  [--tile-axes auto|a,b] [--tile-period-mm auto|Pa,Pb] [--tile-band-mm 0.6,4.0] [--tile-bin-vox 2] [--tile-smooth-bins 1]
++                                  [--mask octv_mask|none] [--save-octv] [--check-identity]
++
++Why: a native I58 prep holds the 20 um float32 NIfTI (18.7 GB) plus its float16 normalised copy (9.4 GB) in RAM, which the AutoDL rules
++(one process, < ~12 GB) do not allow.  This script loads W/octv.npy (the destriped vessel level, 1.2 GB float16 on I58) into RAM, applies
++the same octreg.octnorm functions in the same order as prep_subject.py (--slab-axis auto: per-plane median normalisation along the
++sectioning axis; --tile-flatfield on: 2-D tile flat field on the en-face axes), rebuilds the 0.15 mm level exactly like prep's
++level150 (block means by k150 // kv, resample onto the stored oct150 grid), and writes W2 = symlinks to every file of W except
++oct150.npy / prep.json / octv.npy / oct150_mask_qc.png, a new oct150.npy, oct_tile_field.npy / octv_slab_factor.npy when computed, and
++prep.json with oct.renorm (options, statistics, source) and oct150_provenance + '_renorm'.  The masks (oct150_mask.npy, octv_mask.npy)
++are the source prep's, so a register.py run on W2 differs from one on W only in the oct150 intensities (the P11 probe's setting).
++The source octv already carries the native axis-0 slab correction (the P11 probe: undoing it changes nothing, N1 ~ N0), and its
++destripe field and masks were estimated on that corrected octv.  So --plane-norm auto --tile-flatfield on here is N0 + axis-2 plane
++normalisation + tile field: an APPROXIMATION of prep_subject.py --slab-axis auto --tile-flatfield on (gain-only native level, mask,
++detection and destripe on the uncorrected octv) and not the probe's N4 (= N1 + N2 + tile); it validates neither.
++
++--check-identity: no options -> the rebuilt oct150 must equal W/oct150.npy (exit 1 otherwise; the level150 replication test; run on
++the device the prep used, since the trilinear resampling is on the GPU when present).  Nothing is written into --work."""
++from __future__ import annotations
++import argparse, json, os, sys, time
++from pathlib import Path
++import numpy as np
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from octreg import octnorm
++from octreg.common import write_json
++
++ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++ap.add_argument("--work", type=Path, required=True); ap.add_argument("--out", type=Path, default=None)
++ap.add_argument("--plane-norm", choices=["off", "auto", "0", "1", "2"], default="off", help="per-plane median normalisation of octv along this axis (auto = the prep's destripe axis)")
++ap.add_argument("--plane-norm-window-mm", type=float, default=1.2)
++ap.add_argument("--tile-flatfield", choices=["off", "on"], default="off"); ap.add_argument("--tile-axes", type=str, default="auto", help="auto = the axes other than the prep's destripe axis | 'a,b'")
++ap.add_argument("--tile-period-mm", type=str, default="auto"); ap.add_argument("--tile-band-mm", type=str, default="0.6,4.0")
++ap.add_argument("--tile-bin-vox", type=float, default=2.0); ap.add_argument("--tile-smooth-bins", type=float, default=1.0)
++ap.add_argument("--tile-group-mm", type=float, default=2.0, help="section groups (mm along the sectioning axis) for the per-group tile diagnostics; 0 = off")
++ap.add_argument("--tile-group-mode", choices=["global", "per_group"], default="global", help="global = one tile field; per_group = one field per section group")
++ap.add_argument("--mask", choices=["octv_mask", "none"], default="octv_mask", help="voxels entering the per-plane medians and the tile maps (octv_mask = the prep's chosen mask on the octv grid)")
++ap.add_argument("--save-octv", action="store_true", help="also write the re-normalised octv.npy into --out (1.2 GB on I58)")
++ap.add_argument("--check-identity", action="store_true", help="no options: verify that the rebuilt oct150 equals W/oct150.npy (exit 1 if not)")
++ap.add_argument("--force", action="store_true", help="allow a prep whose oct150 was not derived from octv (destripe off): the rebuild then is NOT that prep's oct150")
++a = ap.parse_args(); t0 = time.time()
++def say(*x): print(*x, f"[{time.time()-t0:.0f}s]", flush=True)
++ops = a.plane_norm != "off" or a.tile_flatfield == "on"
++if a.check_identity and ops: raise SystemExit("--check-identity takes no options")
++if not a.check_identity and (a.out is None or not ops): raise SystemExit("give --out and at least one of --plane-norm / --tile-flatfield (or --check-identity)")
++if a.out is not None and a.out.resolve() == a.work.resolve(): raise SystemExit("--out must differ from --work")
++
++prep = json.load(open(a.work / "prep.json")); po = prep["oct"]
++prov = po.get("oct150_provenance", "v1")
++if not prov.startswith(("from_destriped_octv", "from_octv_nodestripe")) and not a.force:
++    raise SystemExit(f"oct150_provenance {prov!r}: oct150 of this prep was not derived from octv (destripe off) -> rebuild would differ; --force to proceed anyway")
++sp = np.asarray(po["spacing_um_zyx"], float); sp_v = np.asarray(po["vessel_level_spacing_um"], float)
++A_nat = np.load(a.work / "oct_native_affine.npy"); A150 = np.load(a.work / "oct150_affine.npy"); shape150 = tuple(int(s) for s in po["shape150"])
++target_mm = round(float(np.linalg.norm(A150[:3, :3], axis=0).mean()), 6)
++k150 = np.maximum(1, np.round(target_mm * 1000 / sp)).astype(int); kv = np.maximum(1, np.round(sp_v / sp)).astype(int)
++ds = po.get("destripe") or {}; axis_prep = int(ds["axis"]) if ds.get("applied") and ds.get("axis") is not None else None
++say(f"work {a.work}: provenance {prov}, spacing {sp.tolist()} um, vessel level {sp_v.tolist()} um, k150 {k150.tolist()}, kv {kv.tolist()}, shape150 {shape150}, destripe axis {axis_prep}")
++
++octv = np.load(a.work / "octv.npy")                                           # in RAM (the copy that is modified)
++A_v = np.load(a.work / "octv_affine.npy")
++mask = np.load(a.work / "octv_mask.npy", mmap_mode="r") if a.mask == "octv_mask" else None
++say("octv", octv.shape, octv.dtype, "mask", None if mask is None else f"{a.work / 'octv_mask.npy'}")
++R = {"source_work": str(a.work), "options": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}, "k150": k150.tolist(), "kv": kv.tolist(), "target_mm": target_mm}
++extra = {}
++if a.plane_norm != "off":
++    ax = axis_prep if a.plane_norm == "auto" else int(a.plane_norm)
++    if ax is None: raise SystemExit("--plane-norm auto: the prep has no applied destripe axis; pass the axis explicitly")
++    win = max(1, int(round(a.plane_norm_window_mm / (float(sp_v[ax]) / 1000.0))))
++    pn = octnorm.plane_normalize_inplace(octv, axis=int(ax), window=win, mask=mask)
++    if pn.get("factor") is not None: extra["octv_slab_factor.npy"] = np.asarray(pn.pop("factor"), np.float32); pn["file"] = "octv_slab_factor.npy"
++    pn["window_mm"] = float(win * sp_v[ax] / 1000.0); R["plane_norm"] = pn; say("per-plane normalisation:", pn)
++if a.tile_flatfield == "on":
++    sect = axis_prep if a.tile_axes == "auto" else ({0, 1, 2} - {int(x) for x in a.tile_axes.split(",")}).pop()
++    if sect is None: raise SystemExit("--tile-flatfield on with --tile-axes auto: the prep has no applied destripe axis; pass --tile-axes")
++    en = octnorm.enface_axes(sect); vox_en = float(np.mean(sp_v[list(en)])) / 1000.0; bmm = [float(x) for x in a.tile_band_mm.split(",")]
++    per = None if a.tile_period_mm == "auto" else [float(p) / (float(sp_v[e]) / 1000.0) for p, e in zip(a.tile_period_mm.split(","), en)]
++    if a.tile_group_mode == "per_group" and a.tile_group_mm <= 0: raise SystemExit("--tile-group-mode per_group needs --tile-group-mm > 0")
++    gpl = int(round(a.tile_group_mm / (float(sp_v[sect]) / 1000.0))) if a.tile_group_mm > 0 else 0
++    ti = octnorm.tile_flatfield_inplace(octv, mask, sect, periods_vox=per, bin_vox=a.tile_bin_vox, smooth_bins=a.tile_smooth_bins, band_vox=(bmm[0] / vox_en, bmm[1] / vox_en),
++                                        group_planes=gpl, group_mode=a.tile_group_mode)
++    if ti.get("field_log") is not None: extra["oct_tile_field.npy"] = np.asarray(ti.pop("field_log"), np.float32); ti["file"] = "oct_tile_field.npy"
++    _fg = octnorm.pop_group_fields(ti)
++    if _fg is not None: extra["oct_tile_field_groups.npy"] = _fg
++    if ti.get("groups") is not None: ti["groups"]["group_mm"] = float(gpl * sp_v[sect] / 1000.0)
++    if ti.get("periods_vox"): ti["periods_mm"] = [float(p * sp_v[e] / 1000.0) for p, e in zip(ti["periods_vox"], en)]
++    R["tile_flatfield"] = ti; say("tile flat field:", {k: v for k, v in ti.items() if k not in ("estimate", "groups")}); say("period estimation:", ti.get("estimate"))
++    say("tile section groups:", (ti.get("groups") or {}).get("summary"))
++del mask
++o150 = octnorm.level150_from_octv(octv, A_nat, sp, kv, k150, A150, shape150).astype(np.float32)
++src = np.load(a.work / "oct150.npy", mmap_mode="r"); m150 = np.load(a.work / "oct150_mask.npy", mmap_mode="r").astype(bool)
++d = np.abs(o150.astype(np.float64) - np.asarray(src, np.float64)); lr = np.log(np.maximum(o150[m150], 1e-6) / np.maximum(np.asarray(src)[m150], 1e-6))
++R["vs_source_oct150"] = {"array_equal": bool(np.array_equal(o150, np.asarray(src))), "max_abs": float(d.max()), "zero_pattern_equal": bool(np.array_equal(o150 > 0, np.asarray(src) > 0)),
++                         "std_log_ratio_in_mask": float(lr.std()), "median_log_ratio_in_mask": float(np.median(lr))}
++say("rebuilt oct150 vs the source oct150:", R["vs_source_oct150"])
++if a.check_identity:
++    ok = R["vs_source_oct150"]["array_equal"]; say("IDENTITY", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)
++
++a.out.mkdir(parents=True, exist_ok=True)
++skip = {"oct150.npy", "prep.json", "octv.npy", "oct150_mask_qc.png"} | set(extra)
++for f in sorted(a.work.iterdir()):
++    if f.name in skip or f.is_dir(): continue
++    dst = a.out / f.name
++    if not dst.exists() and not dst.is_symlink(): os.symlink(f.resolve(), dst)
++np.save(a.out / "oct150.npy", o150)
++for name, arr in extra.items(): np.save(a.out / name, arr)
++if a.save_octv: np.save(a.out / "octv.npy", octv)
++R["octv_saved"] = bool(a.save_octv); R["seconds"] = time.time() - t0
++prep2 = json.loads(json.dumps(prep)); prep2["oct"]["oct150_provenance"] = prov + "_renorm"; prep2["oct"]["renorm"] = R
++write_json(prep2, a.out / "prep.json"); say("wrote", a.out)
+diff --git a/scripts/make_exclusion_masks_i58.py b/scripts/make_exclusion_masks_i58.py
+new file mode 100644
+index 0000000..dcc95bc
+--- /dev/null
++++ b/scripts/make_exclusion_masks_i58.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python3
++"""Rebuild the I58 non-correspondence (exclusion) masks of the P11 probe:exclude from their sources, so they are not orphan probe files:
++
++    python scripts/make_exclusion_masks_i58.py --work work/v11/xiangrui_I58bs --piece-labels work/probe_xr/pieces/piece_labels_tex2.npy --out DIR
++                                               [--pose work/runs/v11/xiangrui_I58bs/T_oct2mri_structural.npy] [--ref-dir DIR] [--figure]
++
++MRI grid (mri.npy, I58 343 x 489 x 495 @ 0.08 mm):
++  mri_cereb_excl_d{0.5,1.0}.npy  P7 piece label 2 (the chosen texture + brightness cut, piece_labels_tex2.npy: 1 body 9.35 cm3, 2 cerebellum 4.15 cm3)
++                                 dilated by 0.5 / 1.0 mm (EDT <= r)
++  mri_fov_rind_1.0mm.npy         voxels within ceil(1.0 mm / voxel) voxels of any array face (the crop field-of-view rind)
++OCT grid (oct150.npy, I58 194 x 267 x 212 @ 0.15 mm):
++  oct_folia_excl.npy             oct150_mask & the deep folded-piece boxes (index space): [z 90-193, y >= max(140, 190 - 1.25 (z - 90)) for z < 130
++                                 else 140, x < 125] | [z 60-89, y >= 195, x 80-139]; chosen from the probe's deep_{z,y,x}.png and P10 (torn folia at
++                                 z 125-175, y 150-240, x 30-120).  A geometric region, not a segmentation (mask erosion never separates the pieces).
++  oct_shell_1.0mm.npy            oct150_mask & EDT(mask, box faces = background) < 1.0 mm
++masks.json: the volumes of the probe's masks.json, grids.{oct150,mri} = shape and affine of the grids the masks were built on (qc_fine.py
++checks them against its --work), and, with --pose, the MRI body / cerebellum labels nearest-resampled onto oct150 through that pose
++(overlap volumes + oct_exclusion_overlay.png with --figure).  --ref-dir: every written mask must exist there under the same name and be
++np.array_equal to it; a missing or different reference exits 1 (e.g. /root/autodl-tmp/v11_dev/P11/exclude/masks).
++
++P11 probe:exclude, as re-read in the 2026-09-14 review: adding these exclusions to register.py did not help I58.  The search winners became
++a mirrored, 5 % shrunk pose (V1, V2) or a FOV-degenerate pose (V3, V4), and refinement from P_R5 moved 6.5-8.2 mm / 15-19 deg.  Under the
++C3 boundary rule the rigid exclusion solutions are WORSE than P_R5 and the V1 affine solution scored without exclusions is EQUIVALENT
++(C1 was not testable: V0 already had 11/12 small restarts).  The mirrored pose is not a consequence of removing the cerebellum:
++register.py's own 0.15 mm NCC already scores the mirrored V1 winner above P_R5 without any exclusion (0.1358 vs 0.1241); what kept it out
++of R5 was the adaptive overlap gate (0.590, 880 orientations admitted vs 16000 at V1's 0.425).  That is a register.py weakness, not an
++exclusion effect.  Use the masks only for the report-only body block of scripts/qc_fine.py (--oct-exclude-mask oct_folia_excl.npy
++--mri-exclude-mask mri_cereb_excl_d1.0.npy), within one pose set (body numbers depend on the pose set: P_R5 body fwd 3.24 vs 2.40 mm)."""
++from __future__ import annotations
++import argparse, json, sys, time
++from pathlib import Path
++import numpy as np
++from scipy import ndimage
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++FOLIA_BOXES = [((90, 194), (140, 267), (0, 125)),      # main cluster of torn lobules, bottom of the block
++               ((60, 90), (195, 267), (80, 140))]      # the few upper lobules
++SLOPE = {"z_range": (90, 130), "y_top": 140, "y_at_z90": 190, "dy_dz": -1.25, "x_range": (0, 125)}
++R_CEREB = (0.5, 1.0); R_SHELL = (1.0,); R_FOV = 1.0
++I58_SHAPES = {"oct150": (194, 267, 212), "mri": (343, 489, 495)}
++
++ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++ap.add_argument("--work", type=Path, required=True, help="the I58 prep dir (mri_tissue.npy, mri_affine.npy, oct150.npy, oct150_mask.npy, oct150_affine.npy)")
++ap.add_argument("--piece-labels", type=Path, required=True, help="P7 piece labels on the MRI grid (1 body, 2 cerebellum)")
++ap.add_argument("--out", type=Path, required=True); ap.add_argument("--pose", type=Path, default=None, help="optional OCT world -> MRI world pose for the labels-via-pose numbers / figure")
++ap.add_argument("--ref-dir", type=Path, default=None, help="compare every mask with the same-named .npy in this dir (exit 1 on any difference)")
++ap.add_argument("--figure", action="store_true", help="oct_exclusion_overlay.png (needs --pose for the MRI label contours)")
++ap.add_argument("--force", action="store_true", help="allow grids that are not the I58 grids (the folia boxes are I58 index boxes)")
++a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True); t0 = time.time()
++def say(*x): print(*x, f"[{time.time()-t0:.0f}s]", flush=True)
++
++mask = np.load(a.work / "oct150_mask.npy").astype(bool); A_oct = np.load(a.work / "oct150_affine.npy"); A_mri = np.load(a.work / "mri_affine.npy")
++tis = np.load(a.work / "mri_tissue.npy").astype(bool); L = np.load(a.piece_labels)
++if not a.force and (tuple(mask.shape) != I58_SHAPES["oct150"] or tuple(tis.shape) != I58_SHAPES["mri"]):
++    raise SystemExit(f"grids {mask.shape} / {tis.shape} are not the I58 grids {I58_SHAPES}: the folia boxes are I58 index boxes (--force to build anyway)")
++if L.shape != tis.shape: raise SystemExit(f"piece labels {L.shape} != MRI grid {tis.shape}")
++vox_o = round(float(np.linalg.norm(A_oct[:3, :3], axis=0).mean()), 6); vox_m = round(float(np.linalg.norm(A_mri[:3, :3], axis=0).mean()), 6)
++V_O = vox_o ** 3 / 1000; V_M = vox_m ** 3 / 1000
++info = {"folia_boxes_zyx": FOLIA_BOXES, "folia_main_box_y0_of_z": "max(140, 190 - 1.25 (z - 90)) for z in [90,130); 140 for z >= 130", "cereb_dilation_mm": list(R_CEREB), "shell_mm": list(R_SHELL),
++        "fov_rind_mm": R_FOV, "sources": {"work": str(a.work), "piece_labels": str(a.piece_labels), "pose": None if a.pose is None else str(a.pose)}, "voxel_mm": {"oct150": vox_o, "mri": vox_m}}
++written = {}
++info["grids"] = {"oct150": {"shape": list(mask.shape), "affine": A_oct.tolist()}, "mri": {"shape": list(tis.shape), "affine": A_mri.tolist()}}
++
++# ---------------- MRI
++cer = L == 2; body = L == 1
++info["mri"] = {"cereb_cm3": float(cer.sum() * V_M), "body_cm3": float(body.sum() * V_M), "raw_tissue_cm3": float(tis.sum() * V_M)}
++d = ndimage.distance_transform_edt(~cer, sampling=(vox_m,) * 3).astype(np.float32)
++for r in R_CEREB:
++    m = d <= r; name = f"mri_cereb_excl_d{r}.npy"; np.save(a.out / name, m); written[name] = m.shape
++    bb = np.argwhere(m)
++    info["mri"][f"cereb_excl_d{r}"] = {"cm3": float(m.sum() * V_M), "raw_tissue_removed_cm3": float((m & tis).sum() * V_M), "body_label_removed_cm3": float((m & body).sum() * V_M),
++                                       "raw_tissue_kept_cm3": float((tis & ~m).sum() * V_M), "background_in_region_cm3": float((m & ~tis).sum() * V_M),
++                                       "bbox_ijk": [bb.min(0).tolist(), bb.max(0).tolist()] if len(bb) else None}
++    say("MRI cerebellum exclusion", r, "mm:", info["mri"][f"cereb_excl_d{r}"]); del m, bb
++del d
++k = int(np.ceil(R_FOV / vox_m)); rind = np.zeros(L.shape, bool); rind[:k] = rind[-k:] = True; rind[:, :k] = rind[:, -k:] = True; rind[:, :, :k] = rind[:, :, -k:] = True
++np.save(a.out / "mri_fov_rind_1.0mm.npy", rind); written["mri_fov_rind_1.0mm.npy"] = rind.shape
++info["mri"]["fov_rind_1.0mm"] = {"rind_voxels": k, "cm3": float(rind.sum() * V_M), "raw_tissue_in_rind_cm3": float((rind & tis).sum() * V_M), "body_in_rind_cm3": float((rind & body).sum() * V_M),
++                                 "cereb_in_rind_cm3": float((rind & cer).sum() * V_M)}
++m1 = np.load(a.out / "mri_cereb_excl_d1.0.npy"); info["mri"]["cereb_d1.0_plus_fov_raw_tissue_kept_cm3"] = float((tis & ~m1 & ~rind).sum() * V_M); del m1, rind, tis
++
++# ---------------- OCT
++box = np.zeros(mask.shape, bool)
++for (z0, z1), (y0, y1), (x0, x1) in FOLIA_BOXES: box[z0:z1, y0:y1, x0:x1] = True
++zz = np.arange(mask.shape[0]); y0z = np.maximum(SLOPE["y_top"], np.ceil(SLOPE["y_at_z90"] + SLOPE["dy_dz"] * (zz - 90))).astype(int)
++for z in range(SLOPE["z_range"][0], min(SLOPE["z_range"][1], mask.shape[0])): box[z, SLOPE["y_top"]:y0z[z], SLOPE["x_range"][0]:SLOPE["x_range"][1]] = False
++fol = mask & box; np.save(a.out / "oct_folia_excl.npy", fol); written["oct_folia_excl.npy"] = fol.shape
++edt = ndimage.distance_transform_edt(np.pad(mask, 1), sampling=(vox_o,) * 3)[1:-1, 1:-1, 1:-1]
++shells = {}
++for r in R_SHELL:
++    s = mask & (edt < r); name = f"oct_shell_{r}mm.npy"; np.save(a.out / name, s); shells[r] = s; written[name] = s.shape
++oct150 = np.load(a.work / "oct150.npy", mmap_mode="r"); valid = np.asarray(oct150) > 0
++Lo = None
++if a.pose is not None:     # MRI piece labels through the pose onto the oct150 grid (nearest), sanity numbers + figure only
++    from octreg.common import resample_to_grid, to_t
++    T = np.load(a.pose) if a.pose.suffix == ".npy" else np.array(json.load(open(a.pose)), float)
++    Lo = np.rint(resample_to_grid(to_t(L.astype(np.float32))[None], to_t(A_mri), to_t(A_oct), mask.shape, T_grid_to_vol=to_t(T), mode="nearest")[0].cpu().numpy()).astype(np.uint8)
++del L, cer, body
++def comp(m):
++    c = {"cm3": float(m.sum() * V_O), "frac_of_mask": float(m.sum() / max(1, mask.sum())), "on_black_tiles_cm3": float((m & ~valid).sum() * V_O)}
++    if Lo is not None: c.update({"MRI_body_via_pose_cm3": float((m & (Lo == 1)).sum() * V_O), "MRI_cereb_via_pose_cm3": float((m & (Lo == 2)).sum() * V_O)})
++    return c
++def boxmask(b):
++    (z0, z1), (y0, y1), (x0, x1) = b; bm = np.zeros(mask.shape, bool); bm[z0:z1, y0:y1, x0:x1] = True; return bm
++info["oct"] = {"mask_cm3": float(mask.sum() * V_O), "folia": comp(fol), "folia_per_box_unsloped": [comp(mask & boxmask(b)) for b in FOLIA_BOXES]}
++bnd = mask & ~ndimage.binary_erosion(mask)
++info["oct"]["folia"]["touches_array_faces"] = {f: bool(v) for f, v in {"z-": fol[0].any(), "z+": fol[-1].any(), "y-": fol[:, 0].any(), "y+": fol[:, -1].any(), "x-": fol[:, :, 0].any(), "x+": fol[:, :, -1].any()}.items()}
++info["oct"]["folia"]["mask_boundary_voxels_removed_frac"] = float((bnd & fol).sum() / max(1, bnd.sum()))
++if fol.any(): info["oct"]["folia"]["z_p10_50_90"] = np.percentile(np.argwhere(fol)[:, 0], [10, 50, 90]).tolist()
++for r, s in shells.items():
++    info["oct"][f"shell_{r}mm"] = comp(s); info["oct"][f"shell_{r}mm_minus_folia"] = comp(s & ~fol)
++info["oct"]["kept_after_folia_cm3"] = float((mask & ~fol).sum() * V_O)
++if 1.0 in shells: info["oct"]["kept_after_folia_and_shell1.0_cm3"] = float((mask & ~fol & ~shells[1.0]).sum() * V_O)
++say("OCT exclusions:", json.dumps(info["oct"]))
++
++# ---------------- reference comparison
++rc = 0
++if a.ref_dir is not None:
++    info["ref_compare"] = {}
++    for name in written:
++        ref = a.ref_dir / name
++        if not ref.exists(): info["ref_compare"][name] = {"equal": False, "reason": f"reference missing: {ref}"}; rc = 1; continue
++        x = np.load(a.out / name); y = np.load(ref)
++        eq = bool(x.shape == y.shape and np.array_equal(x, y)); info["ref_compare"][name] = {"equal": eq, "n_diff": None if x.shape != y.shape else int((x != y).sum())}
++        rc |= (not eq)
++    info["ref_compare_all_equal"] = rc == 0 and len(info["ref_compare"]) == len(written)
++    say("reference comparison:", info["ref_compare"])
++info["seconds"] = time.time() - t0
++json.dump(info, open(a.out / "masks.json", "w"), indent=1)
++
++if a.figure:
++    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
++    o = np.asarray(oct150, np.float32); vo = np.percentile(o[mask], 99) if mask.any() else 1.0; s1 = shells.get(1.0, np.zeros(mask.shape, bool))
++    def ov(ax, img, m, f, s, lo, title):
++        ax.imshow(np.clip(img / vo, 0, 1), cmap="gray"); rgba = np.zeros(img.shape + (4,)); rgba[f] = (1, 0, 1, 0.35); rgba[s & ~f] = (1, 0.6, 0, 0.25); ax.imshow(rgba)
++        ax.contour(m, levels=[0.5], colors="yellow", linewidths=0.5)
++        if lo is not None:
++            ax.contour(lo == 1, levels=[0.5], colors="lime", linewidths=0.6); ax.contour(lo == 2, levels=[0.5], colors="cyan", linewidths=0.6)
++        ax.set_title(title, fontsize=8); ax.axis("off")
++    sl = lambda v, ax_, i: None if v is None else np.take(v, i, axis=ax_)
++    fig, axs = plt.subplots(3, 5, figsize=(25, 16))
++    for ax_, (row, idxs, lab) in enumerate(((axs[0], (70, 100, 125, 150, 170), "z"), (axs[1], (130, 160, 195, 220, 245), "y"), (axs[2], (30, 60, 90, 120, 150), "x"))):
++        for axi, i in zip(row, idxs):
++            i = min(i, mask.shape[ax_] - 1); ov(axi, np.take(o, i, axis=ax_), np.take(mask, i, axis=ax_), np.take(fol, i, axis=ax_), np.take(s1, i, axis=ax_), sl(Lo, ax_, i), f"{lab}={i}")
++    fig.suptitle("I58 exclusion masks on oct150: magenta = OCT folia exclusion, orange = 1 mm outer shell, yellow = OCT mask" + ("; lime / cyan = MRI body / cerebellum via --pose" if Lo is not None else ""))
++    plt.tight_layout(); plt.savefig(a.out / "oct_exclusion_overlay.png", dpi=75); plt.close(fig)
++say("done", "(reference MISMATCH)" if rc else "")
++sys.exit(1 if rc else 0)
+diff --git a/scripts/p11_impl_check.py b/scripts/p11_impl_check.py
+new file mode 100644
+index 0000000..6e5802d
+--- /dev/null
++++ b/scripts/p11_impl_check.py
+@@ -0,0 +1,265 @@
++#!/usr/bin/env python3
++"""Checks and the label-free comparison for the I58 test chain of the P11 implementation (scripts/run_p11_impl_i58.sh).  CPU, seconds.
++
++    python scripts/p11_impl_check.py json-identity A.json B.json                     exit 1 unless equal (keys 'seconds*' ignored)
++    python scripts/p11_impl_check.py body-repro --qc QC.json --probe-body qc_body.json --probe-noexcl qc_body.json [--tol 1e-3]
++    python scripts/p11_impl_check.py renorm-check --work W2 [--probe-variant oct150_N0t.npy] [--probe-periods-vox 70.44,69.72] [--period-tol 0.01] [--out-json W2/renorm_check.json]
++    python scripts/p11_impl_check.py detect-order --octv V1_OCTV.npy --fac factors.npz [--mask-work PREP_DIR --erode-mm 2] [--expect-axis 2]
++    python scripts/p11_impl_check.py summary --p-r5 T.npy --run NAME=RUN_DIR:WORK_DIR [...] [--base-name base] --out JSON
++
++Label-free criteria of 'summary' (declared before any of these runs exist; revised in the 2026-09-14 review, still before any run;
++P_R5 = work/runs/v11/xiangrui_I58bs/T_oct2mri_structural.npy):
++  SCOPE  These criteria can only CONFIRM NEUTRALITY (a variant lands on P_R5).  They cannot show that a different pose is better: on I58
++       the qc_fine rim medians hardly separate poses 5-30 mm apart (probe:exclude, scored with P_R5 in one call: polish_b 4.9 mm,
++       V1 affine 7.4 mm and V1_Lrestart_best 10.2 mm are all EQUIVALENT; the mirrored V1 winner 30 mm away is WORSE only because its
++       reverse median rises 0.212 mm), no probed pose ever had a lower reverse median than P_R5, and search margins >= 1.015 with >= 9/12
++       restarts also occur in wrong basins (V2 / V4 mirrored or half outside the MRI).  No verdict adopts a pose; a different pose needs landmarks.
++  DET  the base re-run (native prep, same flags, --fine off) reproduces P_R5: block-corner mean <= 0.05 mm and delta rotation <= 0.1 deg
++       (informative only: CUDA grid_sample backward is not bit-deterministic; the base-to-P_R5 distance is the run-to-run floor, and
++       every variant is also reported vs the base re-run: E1_vs_base).
++  E1   equivalent pose: block-corner mean <= 1.0 mm and delta rotation <= 2.0 deg vs P_R5 (seed / destripe spread on the native prep:
++       0.56 / 0.67 mm and 1.1 / 1.4 deg, REPORT 3.3).
++  E2   better-defined structural stage: search top1/top2 >= 1.015 AND structural restarts converged >= 9/12 (R5: 1.005 and 6/12).
++  E3   geometry, a variant of probe:exclude's C3 rule on the qc_fine rim medians of the run's final pose vs P_R5 scored in the SAME qc_fine
++       call (--pose P_R5=...); face = per-face median of one direction without the deep-end class; d_fwd / d_rev = rim median change:
++       BETTER  d_fwd <= -0.2 and d_rev <= -0.2 and no face of either direction > 0.5 mm worse;
++       WORSE   d_fwd >= +0.2, or d_rev >= +0.2, or a forward face > 1.0 mm worse while d_rev > -0.2, or a reverse face > 1.0 mm worse while
++               d_fwd > -0.2 (C3: 'a face worse by > 1 mm while the other direction is not better by >= 0.2 mm', here applied to both directions);
++       else EQUIVALENT.
++  S    plausibility of the run's pose: same handedness as P_R5 (sign of det T[:3,:3]); stretch along every OCT array axis within [0.95, 1.05];
++       cover not below P_R5's by more than 0.02 in the same qc_fine call, forward = fraction of usable OCT boundary points inside the
++       MRI FOV margin, reverse = frac_mri_boundary_inside_oct.
++  CHECK  a re-levelled prep (oct.renorm in its prep.json) must have renorm_check.json next to it with pass true (the chain writes it in T5).
++  verdict (first match): NO-RUN (outputs missing or unreadable); CHECK-FAILED (CHECK fails; numbers still reported); NO-QC (no qc_fine
++       with P_R5); WORSE (E3 WORSE); IMPLAUSIBLE (S fails); NEUTRAL (E1 and E3 EQUIVALENT); DIFFERENT-NEEDS-LANDMARKS (E2 and E3 BETTER:
++       a different pose that the label-free numbers cannot confirm; never adopted on these numbers); UNSTABLE (anything else).
++  The body-only block (boundary_body, mi_landscape_body) and the MI32 landscape are reported, never used (probe:exclude).
++  The 'pn2tile' variant (renorm_prep --plane-norm auto --tile-flatfield on) is N0 + axis-2 plane normalisation + tile field: an
++  approximation of the v1.2 order, not prep_subject.py --slab-axis auto and not the probe's N4; no probe prediction covers it."""
++from __future__ import annotations
++import argparse, json, math, sys
++from pathlib import Path
++import numpy as np
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++
++def _strip(o):
++    if isinstance(o, dict): return {k: _strip(v) for k, v in o.items() if not str(k).startswith("seconds")}
++    if isinstance(o, list): return [_strip(v) for v in o]
++    return o
++
++
++def _diffs(a, b, path="", out=None, tol=0.0):
++    out = [] if out is None else out
++    if isinstance(a, dict) and isinstance(b, dict):
++        for k in sorted(set(a) | set(b)):
++            if k not in a or k not in b: out.append(f"{path}/{k}: missing in {'A' if k not in a else 'B'}")
++            else: _diffs(a[k], b[k], f"{path}/{k}", out, tol)
++    elif isinstance(a, list) and isinstance(b, list):
++        if len(a) != len(b): out.append(f"{path}: length {len(a)} != {len(b)}")
++        else:
++            for i, (x, y) in enumerate(zip(a, b)): _diffs(x, y, f"{path}[{i}]", out, tol)
++    elif isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool) and not isinstance(b, bool):
++        if not (a == b or (math.isnan(a) and math.isnan(b)) or abs(a - b) <= tol): out.append(f"{path}: {a} != {b}")
++    elif a != b: out.append(f"{path}: {a!r} != {b!r}")
++    return out
++
++
++def cmd_json_identity(a):
++    A = _strip(json.load(open(a.A))); B = _strip(json.load(open(a.B))); d = _diffs(A, B, tol=a.tol)
++    print(json.dumps({"equal": not d, "n_diff": len(d), "first_diffs": d[:20]}, indent=1)); return 0 if not d else 1
++
++
++def cmd_body_repro(a):
++    Q = json.load(open(a.qc)); PB = json.load(open(a.probe_body)); PN = json.load(open(a.probe_noexcl)) if a.probe_noexcl else None
++    names = dict(x.split("=", 1) for x in a.name_map)                    # qc name -> probe name
++    rows = []; ok = True
++    def cmpstat(tag, q, p):
++        nonlocal ok
++        for part in ("overall", "rim_faces", "deep_end"):
++            for key in ("median_mm", "n"):
++                qv, pv = (q or {}).get(part, {}).get(key), (p or {}).get(part, {}).get(key)
++                good = (qv is None and pv is None) or (qv is not None and pv is not None and abs(qv - pv) <= (a.tol if key == "median_mm" else 0))
++                ok &= good; rows.append({"what": f"{tag}.{part}.{key}", "qc": qv, "probe": pv, "ok": good})
++    for qn in Q["T_used"]:
++        pn = names.get(qn, qn)
++        if pn not in PB["boundary"]: rows.append({"what": f"{qn}", "qc": "present", "probe": "missing", "ok": False}); ok = False; continue
++        for d in ("forward_oct_to_mri", "reverse_mri_to_oct"):
++            cmpstat(f"body[{qn}].{d}", Q["boundary_body"][qn][d], PB["boundary"][pn][d])
++            if PN is not None: cmpstat(f"main[{qn}].{d}", Q["boundary"][qn][d], PN["boundary"][pn][d])
++    Lq = (Q.get("mi_landscape_body") or {}).get("final"); Lp = (PB.get("mi_landscape") or {}).get(names.get("final", "final"))
++    if Lq and Lp:
++        good = abs(Lq["value_at_T"] - Lp["value_at_T"]) <= 1e-6 and Lq["n_axes_at_range_end"] == Lp["n_axes_at_range_end"]
++        ok &= good; rows.append({"what": "mi_body[final] value_at_T / n_axes_at_range_end", "qc": [Lq["value_at_T"], Lq["n_axes_at_range_end"]], "probe": [Lp["value_at_T"], Lp["n_axes_at_range_end"]], "ok": good})
++    ex = Q.get("exclusion") or {}; es = PB.get("settings") or {}
++    for k_q, k_p in (("n_oct_boundary_body", "n_oct_boundary_body"), ("n_forward_union_excluded", "n_fwd_union_excluded"), ("n_reverse_union_excluded", "n_rev_union_excluded")):
++        good = ex.get(k_q) == es.get(k_p); ok &= good; rows.append({"what": f"exclusion.{k_q}", "qc": ex.get(k_q), "probe": es.get(k_p), "ok": good})
++    bad = [r for r in rows if not r["ok"]]
++    print(json.dumps({"reproduced": ok, "n_checks": len(rows), "n_bad": len(bad), "bad": bad[:30]}, indent=1, default=str)); return 0 if ok else 1
++
++
++def cmd_renorm_check(a):
++    W = Path(a.work); p = json.load(open(W / "prep.json"))["oct"]; rn = p.get("renorm") or {}; ti = rn.get("tile_flatfield") or {}; pn = rn.get("plane_norm") or {}
++    R = {"work": str(W), "provenance": p.get("oct150_provenance"), "vs_source_oct150": rn.get("vs_source_oct150"), "plane_norm": {k: pn.get(k) for k in ("applied", "axis", "window", "std_log_fac", "fac_min_max", "dominant_period_planes")} if pn else None}
++    ok = True
++    if ti:
++        per = ti.get("periods_vox"); ref = [float(x) for x in a.probe_periods_vox.split(",")]
++        per_ok = bool(ti.get("applied")) and per is not None and all(abs(q / r - 1) <= a.period_tol for q, r in zip(per, ref))
++        R["tile"] = {"applied": ti.get("applied"), "periods_vox": per, "periods_mm": ti.get("periods_mm"), "periods_source": ti.get("periods_source"), "probe_periods_vox": ref, "periods_within_tol": per_ok,
++                     "borrowed": (ti.get("estimate") or {}).get("borrowed"), "field_log_std": (ti.get("field") or {}).get("log_std"), "field_log_p2p": (ti.get("field") or {}).get("log_p2p"),
++                     "separable_R2": (ti.get("field") or {}).get("separable_R2"), "residual_log_std": (ti.get("residual_field") or {}).get("log_std")}
++        ok &= per_ok
++    if a.probe_variant:
++        o = np.load(W / "oct150.npy"); v = np.load(a.probe_variant); m = np.load(W / "oct150_mask.npy").astype(bool) & (o > 0) & (v > 0)
++        lr = np.abs(np.log(o[m] / v[m])); med = float(np.median(lr)); R["vs_probe_variant"] = {"file": a.probe_variant, "median_abs_log_ratio": med, "p99": float(np.percentile(lr, 99)), "within_2e-3": med <= 2e-3}
++        ok &= med <= 2e-3
++    if ti:
++        R["tile"]["plausibility_warnings"] = (ti.get("plausibility") or {}).get("warnings"); R["tile"]["reason_if_not_applied"] = ti.get("reason")
++        R["tile"]["section_groups"] = (ti.get("groups") or {}).get("summary")
++    R["pass"] = bool(ok); txt = json.dumps(R, indent=1, default=str); print(txt)
++    oj = Path(a.out_json) if a.out_json else W / "renorm_check.json"
++    oj.write_text(txt); return 0 if ok else 1
++
++
++def cmd_detect_order(a):
++    """--slab-axis auto detects the sectioning axis on octv after a gain-only native normalisation instead of v1's axis-0 per-slice one.
++    Real-data check: detect_stripe_axis on the un-destriped v1 40 um octv (axis-0 corrected, = N0) and on the same volume with that
++    correction undone per 40 um slice (the P11 probe's fac1_40, = N1), both inside prep's diagnostic mask (the chosen mask 2 mm inside its
++    boundary).  PASS: the same decisive axis both times, equal to --expect-axis (I58: 2; 'any' to skip), and |ratio difference| <= 0.05."""
++    from octreg.destripe import detect_stripe_axis
++    v = np.load(a.octv, mmap_mode="r"); fac = np.load(a.fac)["fac1_40"].astype(np.float32); m = None
++    if a.mask_work:     # prep's diagnostic mask: the chosen 0.15 mm mask eroded --erode-mm (EDT, box faces = boundary), nearest-resampled onto the octv grid
++        from octreg.specimen import erode_mm
++        W = Path(a.mask_work); m150 = np.load(W / "oct150_mask.npy").astype(bool); A150 = np.load(W / "oct150_affine.npy"); A_v = np.load(W / "octv_affine.npy")
++        m150 = erode_mm(m150, a.erode_mm, float(np.linalg.norm(A150[:3, :3], axis=0).mean()))
++        M_ = np.linalg.inv(A150) @ A_v; idx = [np.clip(np.rint(M_[r, r] * np.arange(v.shape[r]) + M_[r, 3]).astype(int), 0, m150.shape[r] - 1) for r in range(3)]
++        m = m150[idx[0][:, None, None], idx[1][None, :, None], idx[2][None, None, :]]
++    ax0, d0 = detect_stripe_axis(v, mask=m, n_planes=40, hp_sigma_vox=3.0)
++    n1 = np.empty(v.shape, np.float16)
++    for z0 in range(0, v.shape[0], 64):
++        z1 = min(v.shape[0], z0 + 64); x = np.asarray(v[z0:z1]).astype(np.float32) * fac[z0:z1, None, None]; n1[z0:z1] = np.clip(x, 0, 60000).astype(np.float16)
++    ax1, d1 = detect_stripe_axis(n1, mask=m, n_planes=40, hp_sigma_vox=3.0)
++    exp_ax = None if a.expect_axis == "any" else int(a.expect_axis)
++    ok = ax0 == ax1 and ax0 is not None and (exp_ax is None or ax0 == exp_ax) and abs(d0["ratio"] - d1["ratio"]) <= 0.05
++    keys = ("ncc_median_per_axis", "ratio", "period_vox")
++    print(json.dumps({"pass": bool(ok), "expect_axis": exp_ax, "axis_N0": ax0, "axis_N1_gain_only": ax1, "N0": {k: d0[k] for k in keys}, "N1": {k: d1[k] for k in keys},
++                      "note": "checks only the gain-insensitivity of the stripe-axis detection; the real --slab-axis auto path (mask, detection and destripe on a gain-only octv) is exercised only by OPT_prep_smoke"}, indent=1, default=float)); return 0 if ok else 1
++
++
++def _load_T(p):
++    p = Path(p); return np.load(p) if p.suffix == ".npy" else np.array(json.load(open(p)), float)
++
++
++def _e3(bF, bP, tol_rim=0.2, face_better=0.5, face_worse=1.0):
++    """E3 (docstring) from two qc_fine boundary entries (final, P_R5) of one call -> (label, details)."""
++    def rim(b, d): return (((b.get(d) or {}).get("rim_faces")) or {}).get("median_mm")
++    def faces(d):
++        F, P = (bF.get(d) or {}), (bP.get(d) or {}); deep = F.get("deep_end_class") or P.get("deep_end_class") or "z+"
++        pf, pp = F.get("per_face") or {}, P.get("per_face") or {}
++        return {c: v["median_mm"] - pp[c]["median_mm"] for c, v in pf.items() if c != deep and c in pp and v.get("median_mm") is not None and pp[c].get("median_mm") is not None}
++    f_F, f_P, r_F, r_P = rim(bF, "forward_oct_to_mri"), rim(bP, "forward_oct_to_mri"), rim(bF, "reverse_mri_to_oct"), rim(bP, "reverse_mri_to_oct")
++    d_f = None if f_F is None or f_P is None else f_F - f_P; d_r = None if r_F is None or r_P is None else r_F - r_P
++    ff, fr = faces("forward_oct_to_mri"), faces("reverse_mri_to_oct"); wf = max(ff.values()) if ff else 0.0; wr = max(fr.values()) if fr else 0.0
++    det = {"rim_fwd_final_vs_P_R5": [f_F, f_P], "rim_rev_final_vs_P_R5": [r_F, r_P], "d_fwd": d_f, "d_rev": d_r, "face_change_fwd_mm": ff, "face_change_rev_mm": fr, "worst_face_fwd": wf, "worst_face_rev": wr}
++    if d_f is None: return None, det
++    rev_better = d_r is not None and d_r <= -tol_rim; fwd_better = d_f <= -tol_rim
++    if fwd_better and rev_better and max(wf, wr) <= face_better: return "BETTER", det
++    if d_f >= tol_rim or (d_r is not None and d_r >= tol_rim) or (wf > face_worse and not rev_better) or (wr > face_worse and not fwd_better): return "WORSE", det
++    return "EQUIVALENT", det
++
++
++def _stretch(T, A_oct):
++    R_axes = A_oct[:3, :3] / np.linalg.norm(A_oct[:3, :3], axis=0); return [float(np.linalg.norm(T[:3, :3] @ R_axes[:, q])) for q in range(3)]
++
++
++def _cover(b):
++    fwd = b.get("forward_oct_to_mri") or {}; rev = b.get("reverse_mri_to_oct") or {}; n = b.get("n_usable_oct_boundary")
++    cf = None if not n else 1.0 - float(fwd.get("n_excluded_fov_margin", 0)) / n
++    return {"fwd_oct_boundary_in_mri_fov": cf, "rev_mri_boundary_inside_oct": rev.get("frac_mri_boundary_inside_oct")}
++
++
++def cmd_summary(a):
++    from octreg.fine import block_corners, pose_move
++    P = _load_T(a.p_r5); out = {"criteria": __doc__.split("Label-free criteria of 'summary'")[1].strip(), "p_r5": str(a.p_r5), "runs": {}}
++    base_T = None
++    for sp in a.run:
++        if sp.split("=", 1)[0] == a.base_name:
++            f = Path(sp.split("=", 1)[1].split(":", 1)[0]) / "T_oct2mri_structural.npy"
++            base_T = np.load(f) if f.exists() else None
++    for spec in a.run:
++        name, rest = spec.split("=", 1); run, work = rest.split(":", 1); run = Path(run); work = Path(work)
++        try:
++            r = _summary_one(a, name, run, work, P, base_T, block_corners, pose_move)
++        except Exception as e:     # one missing / broken run must not take the table of the others with it
++            r = {"run": str(run), "work": str(work), "verdict": "NO-RUN", "error": f"{type(e).__name__}: {e}"}
++        out["runs"][name] = r
++    Path(a.out).parent.mkdir(parents=True, exist_ok=True); json.dump(out, open(a.out, "w"), indent=1, default=str)
++    fm = lambda v, d=3: "n/a" if v is None else f"{v:.{d}f}"
++    print("| run | search ratio | restarts | NCC | vs P_R5 block mm / deg | vs base mm / deg | rim fwd / rev final vs P_R5 (mm) | E1 | E2 | E3 | S | check | verdict |"); print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
++    for n, r in out["runs"].items():
++        if r.get("verdict") == "NO-RUN" and "vs_P_R5" not in r:
++            print(f"| {n} | NO-RUN: {r.get('error')} |" + " |" * 11); continue
++        q = r.get("qc") or {}; rf = q.get("rim_fwd_final_vs_P_R5") or [None, None]; rr = q.get("rim_rev_final_vs_P_R5") or [None, None]; vb = r.get("vs_base_rerun") or {}
++        print(f"| {n} | {fm(r['search_ratio'])} | {r['restarts'][0]}/{r['restarts'][1]} | {fm(r['structural_ncc'])} | {r['vs_P_R5']['block_corner_mean_mm']:.2f} / {r['vs_P_R5']['delta_rotation_deg']:.2f} | "
++              f"{fm(vb.get('block_corner_mean_mm'), 2)} / {fm(vb.get('delta_rotation_deg'), 2)} | {fm(rf[0])} vs {fm(rf[1])} / {fm(rr[0])} vs {fm(rr[1])} | "
++              f"{r['E1_equivalent_pose']} | {r['E2_better_defined']} | {r['E3_geometry']} | {r['S_plausible']} | {r['CHECK']} | {r['verdict']}{' (DET ' + str(r['DET_reproduces_P_R5']) + ')' if 'DET_reproduces_P_R5' in r else ''} |")
++    return 0
++
++
++def _summary_one(a, name, run, work, P, base_T, block_corners, pose_move):
++    res = json.load(open(run / "result.json")); Ts = np.load(run / "T_oct2mri_structural.npy")
++    A_oct = np.load(work / "oct150_affine.npy"); shape = np.load(work / "oct150.npy", mmap_mode="r").shape; c_o = (A_oct @ np.r_[(np.array(shape) - 1) / 2.0, 1.0])[:3]
++    mv = pose_move(Ts, P, c_o, block_corners(A_oct, shape))
++    s = res.get("search") or {}; t1, t2 = s.get("top1"), s.get("top2"); ratio = (t1 / t2) if (t1 and t2) else None
++    rs = (res.get("evaluation") or {}).get("restarts") or {}
++    r = {"run": str(run), "work": str(work), "oct_wm_bright": res.get("oct_wm_bright"), "search_top1_top2": [t1, t2], "search_ratio": ratio, "restarts": [rs.get("n_converged"), rs.get("n")],
++         "structural_ncc": (res.get("refine") or {}).get("final_ncc"), "overlap_gate": (res.get("overlap_gate") or {}).get("effective"),
++         "det": float(np.linalg.det(Ts[:3, :3])), "det_P_R5": float(np.linalg.det(P[:3, :3])), "stretch_ijk": _stretch(Ts, A_oct),
++         "vs_P_R5": {k: mv[k] for k in ("block_corner_mean_mm", "block_corner_max_mm", "delta_rotation_deg", "centre_mm", "corner_mean_mm")}}
++    if base_T is not None and name != a.base_name:     # the base re-run's distance to P_R5 is the run-to-run floor (CUDA grid_sample backward is not deterministic)
++        mb = pose_move(Ts, base_T, c_o, block_corners(A_oct, shape)); r["vs_base_rerun"] = {k: mb[k] for k in ("block_corner_mean_mm", "delta_rotation_deg")}
++        r["E1_vs_base"] = mb["block_corner_mean_mm"] <= 1.0 and mb["delta_rotation_deg"] <= 2.0
++    r["E1_equivalent_pose"] = mv["block_corner_mean_mm"] <= 1.0 and mv["delta_rotation_deg"] <= 2.0
++    r["E2_better_defined"] = bool(ratio is not None and ratio >= 1.015 and (rs.get("n_converged") or 0) >= 9)
++    s_ok = {"same_handedness_as_P_R5": bool(np.sign(r["det"]) == np.sign(r["det_P_R5"])), "stretch_within_0.95_1.05": bool(all(0.95 <= x <= 1.05 for x in r["stretch_ijk"])), "cover_not_below_P_R5": None}
++    qf = run / "qc_fine.json"; e3 = None; qc_ok = False
++    if qf.exists():
++        Q = json.load(open(qf)); pr5 = next((k for k, v in Q["T_used"].items() if k != "final" and np.allclose(np.array(v["T"]), P, atol=1e-9)), None)
++        final_ok = np.allclose(np.array(Q["T_used"]["final"]["T"]), np.load(run / "T_oct2mri.npy"), atol=1e-9) if (run / "T_oct2mri.npy").exists() else None
++        if pr5 is not None:
++            qc_ok = True; bF, bP = Q["boundary"]["final"], Q["boundary"][pr5]
++            e3, det3 = _e3(bF, bP); cF, cP = _cover(bF), _cover(bP)
++            s_ok["cover_not_below_P_R5"] = bool(all(cF[k] is not None and cP[k] is not None and cF[k] >= cP[k] - 0.02 for k in cF))
++            r["qc"] = dict(det3, cover_final=cF, cover_P_R5=cP, qc_final_is_run_T_oct2mri=final_ok, mi32_value_at_T_final=((Q.get("mi_landscape") or {}).get("final") or {}).get("value_at_T"))
++            if Q.get("boundary_body"):
++                bb = Q["boundary_body"]; g = lambda n, d: (((bb.get(n) or {}).get(d) or {}).get("rim_faces") or {}).get("median_mm")
++                r["qc"]["body_report_only"] = {"rim_fwd_final_vs_P_R5": [g("final", "forward_oct_to_mri"), g(pr5, "forward_oct_to_mri")], "rim_rev_final_vs_P_R5": [g("final", "reverse_mri_to_oct"), g(pr5, "reverse_mri_to_oct")]}
++        else: r["qc"] = {"error": "P_R5 not among the qc poses (run qc_fine with --pose P_R5=...)"}
++    r["E3_geometry"] = e3; r["S_checks"] = s_ok; r["S_plausible"] = bool(s_ok["same_handedness_as_P_R5"] and s_ok["stretch_within_0.95_1.05"] and s_ok["cover_not_below_P_R5"] is True)
++    pj = json.load(open(work / "prep.json")).get("oct", {}) if (work / "prep.json").exists() else {}; rn = pj.get("renorm") or {}
++    if rn:
++        ti = rn.get("tile_flatfield") or {}; cj = work / "renorm_check.json"; chk = json.load(open(cj)) if cj.exists() else None
++        r["renorm"] = {"tile_applied": ti.get("applied"), "tile_periods_mm": ti.get("periods_mm"), "tile_field_log_std": (ti.get("field") or {}).get("log_std"),
++                       "tile_residual_log_std": (ti.get("residual_field") or {}).get("log_std"), "tile_plausibility_warnings": (ti.get("plausibility") or {}).get("warnings"),
++                       "tile_section_groups": (ti.get("groups") or {}).get("summary"), "plane_norm_std_log_fac": (rn.get("plane_norm") or {}).get("std_log_fac"),
++                       "oct150_std_log_ratio_vs_source": (rn.get("vs_source_oct150") or {}).get("std_log_ratio_in_mask"),
++                       "renorm_check": None if chk is None else {k: chk.get(k) for k in ("pass", "tile", "vs_probe_variant")}}
++        r["CHECK"] = bool(chk is not None and chk.get("pass") is True)
++    else: r["CHECK"] = None                     # not a re-levelled prep: nothing to check
++    if name == a.base_name: r["DET_reproduces_P_R5"] = mv["block_corner_mean_mm"] <= 0.05 and mv["delta_rotation_deg"] <= 0.1
++    r["verdict"] = ("CHECK-FAILED" if r["CHECK"] is False else "NO-QC" if not qc_ok or e3 is None else "WORSE" if e3 == "WORSE" else "IMPLAUSIBLE" if not r["S_plausible"]
++                    else "NEUTRAL" if (r["E1_equivalent_pose"] and e3 == "EQUIVALENT") else "DIFFERENT-NEEDS-LANDMARKS" if (r["E2_better_defined"] and e3 == "BETTER") else "UNSTABLE")
++    return r
++
++
++ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); sub = ap.add_subparsers(dest="cmd", required=True)
++p = sub.add_parser("json-identity"); p.add_argument("A"); p.add_argument("B"); p.add_argument("--tol", type=float, default=0.0)
++p = sub.add_parser("body-repro"); p.add_argument("--qc", required=True); p.add_argument("--probe-body", required=True); p.add_argument("--probe-noexcl", default=None)
++p.add_argument("--name-map", action="append", default=["final=P_R5"]); p.add_argument("--tol", type=float, default=1e-3)
++p = sub.add_parser("renorm-check"); p.add_argument("--work", required=True); p.add_argument("--probe-variant", default=None); p.add_argument("--probe-periods-vox", default="70.44,69.72"); p.add_argument("--period-tol", type=float, default=0.01)
++p.add_argument("--out-json", default=None, help="where the check result is written (default WORK/renorm_check.json; summary reads it from there)")
++p = sub.add_parser("detect-order"); p.add_argument("--octv", required=True); p.add_argument("--fac", required=True); p.add_argument("--mask-work", default=None, help="prep dir whose oct150_mask / affines give the diagnostic mask (same octv grid)"); p.add_argument("--erode-mm", type=float, default=2.0)
++p.add_argument("--expect-axis", choices=["0", "1", "2", "any"], default="2", help="the sectioning axis both detections must return (I58: 2)")
++p = sub.add_parser("summary"); p.add_argument("--p-r5", required=True); p.add_argument("--run", action="append", required=True, help="NAME=RUN_DIR:WORK_DIR"); p.add_argument("--base-name", default="base"); p.add_argument("--out", required=True)
++a = ap.parse_args()
++sys.exit({"json-identity": cmd_json_identity, "body-repro": cmd_body_repro, "renorm-check": cmd_renorm_check, "detect-order": cmd_detect_order, "summary": cmd_summary}[a.cmd](a))
+diff --git a/scripts/run_p11_impl_i58.sh b/scripts/run_p11_impl_i58.sh
+new file mode 100644
+index 0000000..0780851
+--- /dev/null
++++ b/scripts/run_p11_impl_i58.sh
+@@ -0,0 +1,131 @@
++#!/bin/bash
++# I58-only test chain for the P11 implementation (octnorm prep options, renorm_prep.py, qc_fine body block, exclusion-mask builder).
++# Strictly serial: one python process at a time (no python parent while a python child runs), OMP_NUM_THREADS=4, GPU 0 only where a step
++# says gpu; never any DANDI subject.  Every output goes under $IMPL (= /root/autodl-tmp/v11_dev/P11/impl); work/, runs, logs/ and octreg/
++# of the live tree are read-only inputs, and the only rm -rf is on directories under $IMPL (safe_rm refuses anything else).
++# A failed step is logged and the chain continues (no set -e), except that T5 falls back to the probe's explicit tile periods and T6/T7
++# skip a re-levelled prep whose renorm check did not pass (the summary then reports it as NO-RUN).
++# Run it detached and registered with the memory watchdog (run plan in the implementation record); poll $LOG/chain.log.
++#   CODE=/root/autodl-tmp/v11_dev/P11/impl/octreg bash $CODE/scripts/run_p11_impl_i58.sh [T0 T1 ...]   (default: T0..T8; OPT_* only on request)
++set -u
++BASE=/root/autodl-tmp/oct-mri-registration; cd $BASE
++source /root/miniconda3/etc/profile.d/conda.sh; conda activate octmri
++export OMP_NUM_THREADS=4
++IMPL=/root/autodl-tmp/v11_dev/P11/impl                                                   # the ONLY place this chain writes to
++C=${CODE:-$IMPL/octreg}; S=$C/scripts                                                    # the tree under test (uncommitted P11 implementation)
++LIVE=$BASE/octreg                                                                        # the live tree (= HEAD), reference for identity tests
++# read-only inputs
++W=work/v11/xiangrui_I58bs; R5=work/runs/v11/xiangrui_I58bs; P_R5=$R5/T_oct2mri_structural.npy; RUNS_IN=work/runs/v11
++EX=/root/autodl-tmp/v11_dev/P11/exclude; NORM=/root/autodl-tmp/v11_dev/P11/norm
++# outputs
++LOG=$IMPL/logs; MASKS=$IMPL/masks; T=$IMPL/tests; PREPS=$IMPL/preps; RUNS=$IMPL/runs
++WT=$PREPS/xiangrui_I58bs_p11tile; WV=$PREPS/xiangrui_I58bs_p11pn2tile
++PERIODS_MM=2.8176,2.7888                                                                 # P11 probe:norm fold-scan periods 70.44 / 69.72 voxels at 40 um
++mkdir -p $LOG $MASKS $T $PREPS $RUNS; CHAIN=$LOG/chain.log
++step() {  # step NAME cmd... -> $LOG/NAME.log; returns the command's exit code, never aborts the chain
++  local name=$1; shift
++  echo "[$name start] $(date '+%F %T')  $*" | tee -a $CHAIN
++  "$@" > $LOG/$name.log 2>&1; local rc=$?
++  echo "[$name done rc=$rc] $(date '+%F %T')" | tee -a $CHAIN
++  [ $rc -ne 0 ] && tail -5 $LOG/$name.log | tee -a $CHAIN
++  return $rc
++}
++safe_rm() {  # safe_rm DIR: rm -rf only inside $IMPL
++  case "$(realpath -m "$1")" in
++    $IMPL/?*) rm -rf "$1" ;;
++    *) echo "[safe_rm] REFUSED to remove $1 (outside $IMPL)" | tee -a $CHAIN; return 1 ;;
++  esac
++}
++cpu() { env CUDA_VISIBLE_DEVICES= "$@"; }
++gpu() { env CUDA_VISIBLE_DEVICES=0 "$@"; }
++variant_ok() {  # variant_ok DIR: the renorm check of that re-levelled prep passed (renorm_check.json written by p11_impl_check.py renorm-check)
++  [ -f "$1/renorm_check.json" ] && grep -q '^ "pass": true' "$1/renorm_check.json"          # top-level key (json.dumps indent=1)
++}
++QC_MASKS="--oct-exclude-mask $MASKS/oct_folia_excl.npy --mri-exclude-mask $MASKS/mri_cereb_excl_d1.0.npy"
++renorm_variant() {  # renorm_variant NAME OUTDIR extra-flags...: auto tile periods first; explicit probe periods if the check fails
++  local name=$1 out=$2; shift 2
++  safe_rm $out || return 1
++  step T5_${name} gpu python $S/renorm_prep.py --work $W --out $out --tile-flatfield on "$@"
++  local extra=""; [ "$name" = tile ] && extra="--probe-variant $NORM/variants/oct150_N0t.npy"
++  if ! step T5_${name}_check cpu python $S/p11_impl_check.py renorm-check --work $out $extra; then
++    echo "[T5_${name}] auto tile periods, their plausibility or the N0t comparison failed -> explicit periods $PERIODS_MM (the auto result stays in $LOG/T5_${name}.log / T5_${name}_check.log)" | tee -a $CHAIN
++    safe_rm $out || return 1
++    step T5_${name}_explicit gpu python $S/renorm_prep.py --work $W --out $out --tile-flatfield on --tile-period-mm $PERIODS_MM "$@"
++    step T5_${name}_explicit_check cpu python $S/p11_impl_check.py renorm-check --work $out $extra \
++      || echo "[T5_${name}] the explicit-period prep failed its check too: T6/T7 skip it, the summary reports it as NO-RUN" | tee -a $CHAIN
++  fi
++}
++reg_variant() {  # reg_variant NAME WORK: T6 structural registration of a re-levelled prep, only if its check passed
++  local name=$1 work=$2
++  if variant_ok $work; then step T6_$name gpu python $S/register.py --work $work --out $RUNS/I58_p11_$name --oct-wm-bright auto --fine off
++  else echo "[T6_$name] SKIPPED: $work/renorm_check.json missing or not passed" | tee -a $CHAIN; fi
++}
++qc_variant() {  # qc_variant NAME WORK
++  local name=$1 work=$2
++  if variant_ok $work && [ -f $RUNS/I58_p11_$name/T_oct2mri.npy ]; then step T7_qc_$name gpu python $S/qc_fine.py --work $work --run $RUNS/I58_p11_$name --pose P_R5=$P_R5 $QC_MASKS
++  else echo "[T7_qc_$name] SKIPPED: no passed renorm check or no registration output" | tee -a $CHAIN; fi
++}
++STEPS=${*:-"T0 T1 T2 T3 T4 T5 T6 T7 T8"}
++for R in $STEPS; do case $R in
++T0)  # CPU ~3 min: synthetic tests on the server's numpy/scipy/torch. test_qc_options runs in three stages so that no python parent waits on a python child:
++     # gen (data + children.sh), the qc_fine children one at a time from bash (this tree and the live tree for the default identity), check.
++  step T0_octnorm cpu python $S/test_octnorm.py --out $T/test_octnorm
++  safe_rm $T/test_qc
++  step T0_qc_gen cpu python $S/test_qc_options.py --stage gen --out $T/test_qc --ref-tree $LIVE
++  step T0_qc_children cpu bash $T/test_qc/children.sh
++  step T0_qc_check cpu python $S/test_qc_options.py --stage check --out $T/test_qc --ref-tree $LIVE ;;
++T1)  # CPU ~2 min: rebuild the probe:exclude masks from P7's labels; every mask must exist in the probe dir and equal it
++  step T1_masks cpu python $S/make_exclusion_masks_i58.py --work $W --piece-labels work/probe_xr/pieces/piece_labels_tex2.npy --out $MASKS --pose $P_R5 --ref-dir $EX/masks --figure ;;
++T2)  # GPU ~6 min: qc_fine default identity on the shipped run (live tree vs tree under test, both fresh, both written under $T)
++  step T2_qc_live gpu python $LIVE/scripts/qc_fine.py --work $W --run $R5 --out $T/qc_ident_live
++  step T2_qc_new gpu python $S/qc_fine.py --work $W --run $R5 --out $T/qc_ident_new
++  step T2_compare cpu python $S/p11_impl_check.py json-identity $T/qc_ident_live/qc_fine.json $T/qc_ident_new/qc_fine.json ;;
++T3)  # GPU ~6 min: body block reproduces probe:exclude qc/body_A and qc/noexcl_A (same 8 poses; P_R5 = final via --T and an empty run dir)
++  mkdir -p $T/empty_run
++  step T3_qc_bodyA gpu python $S/qc_fine.py --work $W --run $T/empty_run --T $P_R5 --out $T/qc_bodyA $QC_MASKS \
++       --pose polish_b=$RUNS_IN/I58_polish_b/T_oct2mri_fine_candidate.npy --pose V1_rigid=$EX/runs/V1/T_rigid_from_P_R5.npy --pose V1_affine=$EX/runs/V1/T_affine_from_P_R5.npy \
++       --pose V1z_rigid=$EX/runs/V1z/T_rigid_from_P_R5.npy --pose V2_rigid=$EX/runs/V2/T_rigid_from_P_R5.npy --pose V3_affine=$EX/runs/V3/T_affine_from_P_R5.npy \
++       --pose P7_bodyB=work/probe_xr/pieces/T_body_rigid_R5_best.npy
++  step T3_compare cpu python $S/p11_impl_check.py body-repro --qc $T/qc_bodyA/qc_fine.json --probe-body $EX/qc/body_A/qc_body.json --probe-noexcl $EX/qc/noexcl_A/qc_body.json ;;
++T4)  # GPU ~2 min: renorm_prep.py rebuilds the native prep's oct150 from its octv byte-identically (no options, nothing written); CPU ~3 min:
++     # gain-insensitivity of the stripe-axis detection on real data (un-destriped v1 octv with and without the axis-0 correction; must be axis 2 both times)
++  step T4_renorm_identity gpu python $S/renorm_prep.py --work $W --check-identity
++  step T4_detect_order cpu python $S/p11_impl_check.py detect-order --octv work/xiangrui_I58bs/octv.npy --mask-work $W --fac $NORM/factors.npz --expect-axis 2 ;;
++T5)  # GPU+CPU ~10 min: the two re-levelled native preps under $PREPS (masks = the shipped prep's, via symlinks); tile section-group diagnostics at 2 mm
++  renorm_variant tile $WT                                                                # N0t: tile flat field only (global field, as the probe)
++  renorm_variant pn2tile $WV --plane-norm auto ;;                                        # N0 + per-plane normalisation along axis 2 + tile field (approximation of the v1.2 order)
++T6)  # GPU ~25 min: structural registration, same flags as R5 minus the (rejected) fine stage; outputs under $RUNS
++  step T6_base gpu python $S/register.py --work $W --out $RUNS/I58_p11_base --oct-wm-bright auto --fine off
++  reg_variant tile $WT
++  reg_variant pn2tile $WV ;;
++T7)  # GPU ~12 min: qc_fine of each run with P_R5 in the same call (+ the report-only body block); qc_fine.json lands in the run dir under $RUNS
++  if [ -f $RUNS/I58_p11_base/T_oct2mri.npy ]; then step T7_qc_base gpu python $S/qc_fine.py --work $W --run $RUNS/I58_p11_base --pose P_R5=$P_R5 $QC_MASKS
++  else echo "[T7_qc_base] SKIPPED: no registration output" | tee -a $CHAIN; fi
++  qc_variant tile $WT
++  qc_variant pn2tile $WV ;;
++T8)  # CPU <1 min: label-free comparison with the criteria declared in p11_impl_check.py (a missing run is reported as NO-RUN)
++  step T8_summary cpu python $S/p11_impl_check.py summary --p-r5 $P_R5 --run base=$RUNS/I58_p11_base:$W --run tile=$RUNS/I58_p11_tile:$WT --run pn2tile=$RUNS/I58_p11_pn2tile:$WV --out $RUNS/p11_impl_summary.json
++  cat $LOG/T8_summary.log | tee -a $CHAIN ;;
++OPT_tile_pergroup)  # GPU+CPU ~25 min, NOT default: tile field fitted per 2 mm section group (for tile patterns shifted between sections), then register + qc + summary row
++  WG=$PREPS/xiangrui_I58bs_p11tilegrp
++  renorm_variant tilegrp $WG --tile-group-mode per_group
++  reg_variant tilegrp $WG; qc_variant tilegrp $WG
++  step OPT_summary_tilegrp cpu python $S/p11_impl_check.py summary --p-r5 $P_R5 --run base=$RUNS/I58_p11_base:$W --run tilegrp=$RUNS/I58_p11_tilegrp:$WG --out $RUNS/p11_impl_summary_tilegrp.json ;;
++OPT_prep_synthetic)  # CPU ~10 min, NOT default: synthetic prep identity vs the live tree in three stages (gen, children from bash, check). Each prep child's
++                     # destripe still forks a 4-worker pool (small arrays): run only when that is explicitly accepted.
++  safe_rm $T/test_prep
++  step OPT_prep_gen cpu python $S/test_prep_options.py --stage gen --out $T/test_prep --ref-tree $LIVE
++  step OPT_prep_children cpu bash $T/test_prep/children.sh
++  step OPT_prep_check cpu python $S/test_prep_options.py --stage check --out $T/test_prep --ref-tree $LIVE ;;
++OPT_prep_smoke)  # GPU+CPU ~10 min, NOT default: real-data prep_subject.py on the cached v1 40 um octv (R2 route), preps under $PREPS. The texture mask forks
++                 # 4 workers of ~4.3 GB RSS each (R0_mask), i.e. it breaks the one-process / 12 GB rule: run only when that is explicitly accepted.
++  for D in $PREPS/I58bs_s40_p11base $PREPS/I58bs_s40_p11auto; do
++    safe_rm $D; mkdir -p $D; for f in mri.npy mri_affine.npy mri_tissue.npy; do ln -s $BASE/work/xiangrui_I58bs/$f $D/$f; done
++    python -c "import json; d=json.load(open('work/xiangrui_I58bs/prep.json')); json.dump({'mri': d['mri']}, open('$D/prep.json','w'), indent=1)"
++  done
++  step OPT_prep_s40_base gpu python $S/prep_subject.py --work $PREPS/I58bs_s40_p11base --skip-mri --mri work/xiangrui_I58bs/mri.npy --oct work/xiangrui_I58bs/octv.npy --oct-spacing-um 40,40,40 --oct-mask auto --destripe on --skip-vessels
++  step OPT_prep_s40_base_cmp bash -c 'rc=0; for f in work/v11/I58bs_s40/*.npy; do b=$(basename $f); [ -L $f ] && continue; cmp -s $f '$PREPS'/I58bs_s40_p11base/$b && echo "same $b" || { echo "DIFF $b"; rc=1; }; done; for f in '$PREPS'/I58bs_s40_p11base/*.npy; do b=$(basename $f); [ -L $f ] || [ -e work/v11/I58bs_s40/$b ] || { echo "EXTRA $b"; rc=1; }; done; exit $rc'
++  step OPT_prep_s40_auto gpu python $S/prep_subject.py --work $PREPS/I58bs_s40_p11auto --skip-mri --mri work/xiangrui_I58bs/mri.npy --oct work/xiangrui_I58bs/octv.npy --oct-spacing-um 40,40,40 --oct-mask auto --destripe on --skip-vessels --slab-axis auto --tile-flatfield on ;;
++*) echo "unknown step $R" | tee -a $CHAIN ;;
++esac; done
++echo "[chain end] $(date '+%F %T')" | tee -a $CHAIN
+diff --git a/scripts/test_octnorm.py b/scripts/test_octnorm.py
+new file mode 100644
+index 0000000..88674a3
+--- /dev/null
++++ b/scripts/test_octnorm.py
+@@ -0,0 +1,201 @@
++#!/usr/bin/env python3
++"""Synthetic CPU tests of octreg.octnorm (no data needed; ~1 min):
++
++    python scripts/test_octnorm.py [--out DIR]
++
++T1 slab_normalize(axis=0, floor abs) is byte-identical to the frozen common.oct_slab_normalize (float16 and float32 outputs; mu_s-like and
++   DANDI-like intensities).
++T2 slab_normalize along axis 1 / 2 equals the axis-0 result on the transposed volume (byte-identical) and flattens a per-plane gain.
++T3 gain_only: scale 1 everywhere, the float16 gain equals v1's, output = clip(raw x gain) in float16.
++T4 floor: 'rel' equals 'abs' when no median is near 1e-3; with medians below 1e-3 'abs' leaves them uncorrected and 'rel' corrects them.
++T5 plane_normalize_inplace removes a per-plane gain along the sectioning axis (detrended profile std reduced >= 5 x), zeros stay 0,
++   valid voxels in [1, 60000]; exact medians.
++T6 tile_flatfield_inplace on a volume with a known non-separable alternating 2-D tile field: estimated periods within 1 %, field
++   correlation >= 0.9, residual field log std <= 0.3 x the field's, zeros unchanged; sectioning axis 0 gives the same field as axis 2 on
++   the transposed volume (to float16 rounding of a different summation order, <= 1e-3 relative); given periods reproduce the estimated-period result when equal; with the axis-0 tile marginal removed (a per-slice
++   normalisation along that en-face axis) axis 0 borrows axis 1's period.
++T7 destripe.detect_stripe_axis finds the same axis with and without a +-5 % per-slice gain along another axis (the 'auto' ordering).
++T8 plausibility guard (review 2026-09-14): estimated periods on an en-face extent with < 5 tile cycles, or a fitted field with log std > 0.05,
++   are rejected (applied False, volume unchanged); the same periods GIVEN are applied with the failure in plausibility.warnings.
++T9 section groups: a tile pattern shifted by one tile step (sign of the fundamental flipped) in 2 of 8 section groups: the global field
++   makes those groups' tile amplitude larger (after / before > 1, reported in groups.summary), 'per_group' removes it in every group
++   (after / before < 0.6) and leaves a lower true-field residual than 'global' in the shifted groups; group_planes > 0 with 'global'
++   gives the same field as group_planes 0 (to float rounding)."""
++from __future__ import annotations
++import argparse, json, sys, time
++from pathlib import Path
++import numpy as np
++from scipy import ndimage
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from octreg import octnorm
++from octreg.common import oct_slab_normalize
++from octreg.destripe import detect_stripe_axis, profile_residual
++
++ap = argparse.ArgumentParser(); ap.add_argument("--out", type=Path, default=None); a = ap.parse_args(); t0 = time.time()
++R = {}; FAIL = []
++def check(name, ok, **kv):
++    R[name] = {"pass": bool(ok), **{k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in kv.items()}}
++    print(f"[{'PASS' if ok else 'FAIL'}] {name} {kv}  [{time.time()-t0:.0f}s]", flush=True)
++    if not ok: FAIL.append(name)
++rng = np.random.default_rng(7)
++
++def raw_volume(shape, level, gain_axis=0, gain_amp=0.06, zero_frac=0.1):
++    base = ndimage.gaussian_filter(rng.normal(size=shape).astype(np.float32), 2.0); base = (base - base.mean()) / (base.std() + 1e-9)
++    v = level * np.exp(0.3 * base).astype(np.float32)
++    n = shape[gain_axis]; g = 1 + gain_amp * np.sin(2 * np.pi * np.arange(n) / 6.0) + 0.3 * np.arange(n) / n
++    sh = [1, 1, 1]; sh[gain_axis] = n; v *= g.reshape(sh).astype(np.float32)
++    v[rng.random(shape) < zero_frac] = 0; v[:, :4] = 0                         # speckle zeros + a black band
++    return v
++
++# ---------------------------------------------------------------- T1
++for tag, level, thr in (("mu_s", 0.002, 0.00096), ("dandi", 400.0, 30.0)):
++    raw = raw_volume((70, 90, 80), level)
++    for dt in (np.float16, np.float32):
++        o1, i1 = oct_slab_normalize(raw, tissue_thresh=thr, window=20, out_dtype=dt)
++        o2, i2 = octnorm.slab_normalize(raw, axis=0, tissue_thresh=thr, window=20, out_dtype=dt, floor="abs")
++        same_info = all(np.array_equal(np.asarray(i1[k], float), np.asarray(i2[k], float), equal_nan=True) for k in ("per_slice_median", "reference", "scale")) and i1["gain"] == i2["gain"]
++        check(f"T1_axis0_identity_{tag}_{np.dtype(dt).name}", o1.dtype == o2.dtype and np.array_equal(o1, o2) and o1.tobytes() == o2.tobytes() and same_info, gain=i1["gain"])
++
++# ---------------------------------------------------------------- T2
++for ax in (1, 2):
++    raw = raw_volume((60, 70, 80), 0.002, gain_axis=ax, gain_amp=0.08)
++    o_ax, i_ax = octnorm.slab_normalize(raw, axis=ax, tissue_thresh=0.00096, window=15, out_dtype=np.float16)
++    o_t, i_t = octnorm.slab_normalize(np.ascontiguousarray(np.moveaxis(raw, ax, 0)), axis=0, tissue_thresh=0.00096, window=15, out_dtype=np.float16)
++    same = np.array_equal(o_ax, np.moveaxis(o_t, 0, ax)) and np.array_equal(np.asarray(i_ax["scale"]), np.asarray(i_t["scale"]))
++    def pmed(v):
++        out = []
++        for i in range(v.shape[ax]):
++            p = np.take(v, i, axis=ax).astype(np.float32); p = p[p > 0]; out.append(np.median(p) if p.size > 2000 else np.nan)
++        return np.asarray(out, float)
++    hp = []
++    for v in (raw, o_ax):
++        r = pmed(v); ok = np.isfinite(r); lr = np.log(r[ok]); hp.append(float(np.std(lr - ndimage.uniform_filter1d(lr, 15, mode="nearest"))))
++    check(f"T2_axis{ax}_equals_transposed_axis0_and_flattens", same and hp[1] < 0.5 * hp[0], transposed_identical=same, hp_std_log_median_before_after=hp)
++
++# ---------------------------------------------------------------- T3
++raw = raw_volume((50, 60, 70), 0.002)
++o_v1, i_v1 = oct_slab_normalize(raw, tissue_thresh=0.00096, window=20, out_dtype=np.float16)
++o_g, i_g = octnorm.slab_normalize(raw, axis=0, tissue_thresh=0.00096, window=20, out_dtype=np.float16, gain_only=True)
++exp = np.clip(raw * np.float32(i_g["gain"]), 0, 60000.0).astype(np.float16)
++check("T3_gain_only", np.all(np.asarray(i_g["scale"]) == 1) and i_g["gain"] == i_v1["gain"] and np.array_equal(o_g, exp), gain=i_g["gain"])
++
++# ---------------------------------------------------------------- T4
++raw = raw_volume((50, 60, 70), 0.002)
++o_a, _ = octnorm.slab_normalize(raw, axis=0, tissue_thresh=0.00096, window=20, out_dtype=np.float16, floor="abs")
++o_r, _ = octnorm.slab_normalize(raw, axis=0, tissue_thresh=0.00096, window=20, out_dtype=np.float16, floor="rel")
++low = raw_volume((50, 60, 70), 0.0006)                                                  # medians ~0.0006-0.0008: below v1's absolute floor
++_, ia = octnorm.slab_normalize(low, axis=0, tissue_thresh=0.0002, window=20, out_dtype=np.float32, floor="abs")
++_, ir = octnorm.slab_normalize(low, axis=0, tissue_thresh=0.0002, window=20, out_dtype=np.float32, floor="rel")
++check("T4_floor", np.array_equal(o_a, o_r) and np.all(np.asarray(ia["scale"]) == 1) and np.std(ir["scale"]) > 0.01 and ia["n_planes_at_floor"] > 0 and ir["n_planes_at_floor"] == 0,
++      abs_planes_at_floor=ia["n_planes_at_floor"], rel_scale_std=float(np.std(ir["scale"])))
++
++# ---------------------------------------------------------------- T5
++Z, Y, X = 90, 110, 160
++base = ndimage.gaussian_filter(rng.normal(size=(Z, Y, X)).astype(np.float32), 3.0); base = 16000 * np.exp(0.25 * base / base.std())
++k = np.arange(X); g = 1 + 0.04 * ((k % 7.5) / 7.5 - 0.5) + 0.02 * np.sin(2 * np.pi * k / 40)
++vol = np.clip(base * g[None, None, :], 1, 60000).astype(np.float16); vol[rng.random(vol.shape) < 0.05] = 0; zeros0 = vol == 0
++mask = np.zeros(vol.shape, bool); mask[5:-5, 8:-8, :] = True
++med_before, _ = octnorm.plane_medians(vol, 2, mask); exact = float(np.median(vol[:, :, 17].astype(np.float32)[(vol[:, :, 17] > 0) & mask[:, :, 17]]))
++info5 = octnorm.plane_normalize_inplace(vol, axis=2, window=30, mask=mask)
++med_after, _ = octnorm.plane_medians(vol, 2, mask)
++r_b = profile_residual(med_before, 30)[0]["resid_std"]; r_a = profile_residual(med_after, 30)[0]["resid_std"]
++nz = vol[vol > 0].astype(np.float32)
++check("T5_plane_normalize", info5["applied"] and r_a < 0.2 * r_b and np.array_equal(vol == 0, zeros0) and nz.min() >= 1 and nz.max() <= 60000 and med_before[17] == exact,
++      resid_std_before_after=[r_b, r_a], std_log_fac=info5["std_log_fac"], period=info5["dominant_period_planes"])
++
++# ---------------------------------------------------------------- T6
++N0, N1, NS = 728, 1006, 8; P0, P1 = 70.44, 69.72                                         # the I58 octv en-face size and tile periods
++yy, xx = np.meshgrid(np.arange(N0), np.arange(N1), indexing="ij"); ph0 = (yy / P0) % 1.0; ph1 = (xx / P1) % 1.0
++F_true = (0.02 * np.cos(2 * np.pi * ph0) + 0.02 * np.cos(2 * np.pi * 2 * ph0) + 0.025 * np.cos(2 * np.pi * ph1) + 0.015 * np.cos(2 * np.pi * ph0) * np.cos(2 * np.pi * ph1)
++          + 0.01 * np.sin(2 * np.pi * 2 * ph1) + 0.015 * ((ph0 < 0.5) & (ph1 < 0.5)))           # alternating (fundamental = 2 x step), non-separable
++anat = ndimage.gaussian_filter(rng.normal(size=(N0, N1, NS)).astype(np.float32), (3, 3, 1)); anat = 16000 * np.exp(0.25 * anat / anat.std())
++speck = np.exp(0.15 * rng.normal(size=(N0, N1, NS))).astype(np.float32)
++spec = (((yy - N0 / 2) / (0.46 * N0)) ** 2 + ((xx - N1 / 2) / (0.46 * N1)) ** 2) < 1; F_true -= F_true[spec].mean()
++vol6 = np.clip(anat * speck * np.exp(F_true)[:, :, None], 1, 60000).astype(np.float16); del anat, speck
++m6 = np.repeat(spec[:, :, None], NS, 2); vol6[~m6] = 0; vol6[100:120, 200:230, :] = 0; zeros6 = vol6 == 0
++L0, N0m = octnorm.enface_log_maps(vol6, m6, 2); before_true = octnorm.tile_field_2d(L0, N0m, P0, P1)[3]["log_std"]
++v6 = vol6.copy(); info6 = octnorm.tile_flatfield_inplace(v6, m6, sect_axis=2, band_vox=(15.0, 100.0))
++Pest = info6.get("periods_vox") or [None, None]; corr = None; after_true = None
++if info6["applied"]:
++    nb0, nb1 = info6["field"]["nb"]; F2 = np.asarray(info6["field_log"])
++    est = F2[np.floor(((np.arange(N0) / Pest[0]) % 1) * nb0).astype(int) % nb0][:, np.floor(((np.arange(N1) / Pest[1]) % 1) * nb1).astype(int) % nb1]
++    corr = float(np.corrcoef(est[spec], F_true[spec])[0, 1])
++    L1, N1m = octnorm.enface_log_maps(v6, m6, 2); after_true = octnorm.tile_field_2d(L1, N1m, P0, P1)[3]["log_std"]
++ok6 = info6["applied"] and abs(Pest[0] / P0 - 1) < 0.01 and abs(Pest[1] / P1 - 1) < 0.01 and corr >= 0.9 and after_true <= 0.3 * before_true and np.array_equal(v6 == 0, zeros6)
++check("T6a_tile_estimated", ok6, periods=Pest, field_corr=corr, field_log_std_at_true_periods_before_after=[before_true, after_true], separable_R2=info6["field"]["separable_R2"],
++      chosen=[info6["estimate"]["axis_a"].get("chosen"), info6["estimate"]["axis_b"].get("chosen")])
++v6t = np.ascontiguousarray(np.moveaxis(vol6, 2, 0)); m6t = np.ascontiguousarray(np.moveaxis(m6, 2, 0))
++info6t = octnorm.tile_flatfield_inplace(v6t, m6t, sect_axis=0, band_vox=(15.0, 100.0), residual=False)
++dmax = float((np.abs(np.moveaxis(v6t, 0, 2).astype(np.float32) - v6.astype(np.float32)) / np.maximum(v6.astype(np.float32), 1.0)).max())
++check("T6b_tile_sect_axis0_equals_axis2", info6t["applied"] and np.allclose(info6t["periods_vox"], info6["periods_vox"], atol=1e-9) and np.allclose(info6t["field_log"], info6["field_log"], atol=1e-4)
++      and dmax <= 1e-3 and np.array_equal(np.moveaxis(v6t, 0, 2) == 0, zeros6), periods=info6t.get("periods_vox"), max_rel_diff=dmax)
++v6g = vol6.copy(); info6g = octnorm.tile_flatfield_inplace(v6g, m6, sect_axis=2, periods_vox=info6["periods_vox"], residual=False)
++check("T6c_tile_given_periods", info6g["periods_source"] == "given" and np.array_equal(v6g, v6))
++# T6d: remove the axis-0 marginal of the tile (what a per-slice normalisation along en-face axis 0 does): axis 0 must borrow axis 1's period
++marg0 = np.array([F_true[i][spec[i]].mean() if spec[i].any() else 0.0 for i in range(N0)])
++v6d = np.clip(vol6.astype(np.float32) * np.exp(-marg0)[:, None, None], 0, 60000).astype(np.float16); v6d[zeros6] = 0
++info6d = octnorm.tile_flatfield_inplace(v6d, m6, sect_axis=2, band_vox=(15.0, 100.0), residual=False)
++bor = (info6d.get("estimate") or {}).get("borrowed")
++check("T6d_weak_axis_borrows_period", info6d["applied"] and bor is not None and "axis_a_from_axis_b" in bor and abs(info6d["periods_vox"][0] / P0 - 1) < 0.02, borrowed=bor, periods=info6d.get("periods_vox"))
++del vol6, v6, v6t, m6, m6t, v6g, v6d
++
++# ---------------------------------------------------------------- T7
++Z7 = 120; tex = ndimage.gaussian_filter(rng.normal(size=(Z7, Z7, Z7)).astype(np.float32), (2.5, 2.5, 0.7))  # texture decorrelates fastest along axis 2
++vol7 = np.clip(16000 * np.exp(0.3 * tex / tex.std()), 1, 60000).astype(np.float32)
++ax_a, d_a = detect_stripe_axis(vol7, None, n_planes=30)
++gain = (1 + 0.05 * np.sin(2 * np.pi * np.arange(Z7) / 23.0) + 0.1 * np.arange(Z7) / Z7).astype(np.float32)
++ax_b, d_b = detect_stripe_axis(vol7 * gain[:, None, None], None, n_planes=30)
++check("T7_detection_unaffected_by_gain", ax_a == 2 and ax_b == 2 and abs(d_a["ratio"] - d_b["ratio"]) < 0.05, ratio_without_with=[d_a["ratio"], d_b["ratio"]], ncc=[d_a["ncc_median_per_axis"], d_b["ncc_median_per_axis"]])
++
++# ---------------------------------------------------------------- T8
++def tile_block(n0, n1, ns, F, seed, lvl=16000.0):
++    r = np.random.default_rng(seed); an = ndimage.gaussian_filter(r.normal(size=(n0, n1, ns)).astype(np.float32), (3, 3, 1)); an = lvl * np.exp(0.25 * an / an.std())
++    sp_ = np.exp(0.15 * r.normal(size=(n0, n1, ns))).astype(np.float32)
++    y_, x_ = np.meshgrid(np.arange(n0), np.arange(n1), indexing="ij"); sp2 = (((y_ - n0 / 2) / (0.46 * n0)) ** 2 + ((x_ - n1 / 2) / (0.46 * n1)) ** 2) < 1
++    v = np.clip(an * sp_ * np.exp(F(y_, x_))[..., None] if F(y_, x_).ndim == 2 else an * sp_ * np.exp(F(y_, x_)), 1, 60000).astype(np.float16)
++    m = np.repeat(sp2[:, :, None], ns, 2); v[~m] = 0; return v, m
++Fmod = lambda y_, x_: 0.02 * np.cos(2 * np.pi * y_ / 70.44) + 0.02 * np.cos(2 * np.pi * x_ / 69.72) + 0.01 * np.cos(2 * np.pi * y_ / 70.44) * np.cos(2 * np.pi * x_ / 69.72)
++v8, m8 = tile_block(728, 1006, 4, Fmod, 81); v8c = v8.copy()
++i8d = octnorm.tile_flatfield_inplace(v8.copy(), m8, 2, band_vox=(15.0, 100.0), residual=False)                       # default guard: a real mosaic at I58 size passes
++i8 = octnorm.tile_flatfield_inplace(v8, m8, 2, band_vox=(15.0, 100.0), residual=False, min_cycles=15.0)             # 9-12 cycles < 15: rejected
++rej_cyc = i8d["applied"] and not i8d["plausibility"]["warnings"] and (not i8["applied"]) and np.array_equal(v8, v8c) and "cycles" in i8.get("reason", "")
++i8g = octnorm.tile_flatfield_inplace(v8c, m8, 2, periods_vox=(70.44, 69.72), residual=False, min_cycles=15.0)
++given_warn = i8g["applied"] and any("cycles" in w for w in i8g["plausibility"]["warnings"])
++Fbig = lambda y_, x_: 0.15 * np.cos(2 * np.pi * y_ / 70.44) + 0.15 * np.cos(2 * np.pi * x_ / 69.72)
++v8b, m8b = tile_block(728, 1006, 4, Fbig, 82); v8bc = v8b.copy()
++i8b = octnorm.tile_flatfield_inplace(v8b, m8b, 2, band_vox=(15.0, 100.0), residual=False)
++rej_amp = (not i8b["applied"]) and np.array_equal(v8b, v8bc) and "field log std" in i8b.get("reason", "")
++i8bg = octnorm.tile_flatfield_inplace(v8bc, m8b, 2, periods_vox=(70.44, 69.72), residual=False)
++check("T8_plausibility_guard", rej_cyc and given_warn and rej_amp and i8bg["applied"] and any("field log std" in w for w in i8bg["plausibility"]["warnings"]),
++      default_guard=[i8d["applied"], i8d["plausibility"]["cycles"], i8d["field"]["log_std"]], min_cycles15_estimated=[i8["applied"], i8.get("reason")], min_cycles15_given_warnings=i8g["plausibility"]["warnings"],
++      big_estimated=[i8b["applied"], i8b.get("reason")], big_given_warnings=i8bg["plausibility"]["warnings"])
++del v8, v8c, m8, v8b, v8bc, m8b
++
++# ---------------------------------------------------------------- T9
++n0, n1, ns, gp, PP = 360, 380, 64, 8, 36.0
++y_, x_ = np.meshgrid(np.arange(n0), np.arange(n1), indexing="ij")
++def Fgrp(shift):
++    p0 = (y_ / PP + (0.5 if shift else 0.0)) % 1.0; p1 = (x_ / PP) % 1.0
++    return 0.025 * np.cos(2 * np.pi * p0) + 0.008 * np.cos(2 * np.pi * 2 * p0) + 0.012 * np.cos(2 * np.pi * p1)
++F3 = np.empty((n0, n1, ns), np.float32)
++for g in range(ns // gp): F3[:, :, g * gp:(g + 1) * gp] = Fgrp(g in (0, 1))[:, :, None]
++v9, m9 = tile_block(n0, n1, ns, lambda a_, b_: F3, 91)
++true_res = lambda vol: [float(np.std((np.log(np.maximum(vol[:, :, g * gp:(g + 1) * gp].astype(np.float32), 1)).mean(2) - np.log(np.maximum(v9ref[:, :, g * gp:(g + 1) * gp].astype(np.float32), 1)).mean(2))[m9[:, :, 0]])) for g in range(ns // gp)]
++v9ref = np.clip(v9.astype(np.float32) * np.exp(-F3), 1, 60000).astype(np.float32); v9ref[~m9] = 0      # the tile-free volume (up to float16 rounding)
++vg_, vp_, v0_ = v9.copy(), v9.copy(), v9.copy()
++ig = octnorm.tile_flatfield_inplace(vg_, m9, 2, periods_vox=(PP, PP), group_planes=gp, group_mode="global")
++ip = octnorm.tile_flatfield_inplace(vp_, m9, 2, periods_vox=(PP, PP), group_planes=gp, group_mode="per_group")
++i0 = octnorm.tile_flatfield_inplace(v0_, m9, 2, periods_vox=(PP, PP), residual=False)
++rg = [r.get("after_over_before") for r in ig["groups"]["per_group"]]; rp = [r.get("after_over_before") for r in ip["groups"]["per_group"]]
++tg_, tp_ = true_res(vg_), true_res(vp_)
++same_global = np.allclose(ig["field_log"], i0["field_log"], atol=2e-5) and float((np.abs(vg_.astype(np.float32) - v0_.astype(np.float32)) / np.maximum(v0_.astype(np.float32), 1)).max()) <= 1e-3
++ok9 = (all(q is not None and q > 1.0 for q in rg[:2]) and ig["groups"]["summary"]["n_groups_after_gt_before"] >= 2 and all(q is not None and q < 0.6 for q in rp)
++       and all(tp_[g] < tg_[g] for g in (0, 1)) and same_global and ig["groups"]["summary"]["min_fold_corr_with_global"] < 0.3 and np.array_equal(vp_ == 0, v9 == 0))
++check("T9_section_groups", ok9, global_after_over_before=[round(q, 3) for q in rg], per_group_after_over_before=[round(q, 3) for q in rp],
++      true_residual_global_vs_per_group_shifted=[tg_[:2], tp_[:2]], field_maxdiff_rel_maxdiff=[float(np.abs(np.asarray(ig["field_log"]) - np.asarray(i0["field_log"])).max()), float((np.abs(vg_.astype(np.float32) - v0_.astype(np.float32)) / np.maximum(v0_.astype(np.float32), 1)).max())], corr=[r.get("fold_corr_with_global") for r in ig["groups"]["per_group"]], same_global_with_groups=same_global)
++del v9, vg_, vp_, v0_, v9ref, F3, m9
++
++R["n_fail"] = len(FAIL); R["failed"] = FAIL; R["seconds"] = time.time() - t0
++if a.out: a.out.mkdir(parents=True, exist_ok=True); json.dump(R, open(a.out / "test_octnorm.json", "w"), indent=1, default=float)
++print("ALL PASS" if not FAIL else f"FAILED: {FAIL}")
++sys.exit(1 if FAIL else 0)
+diff --git a/scripts/test_prep_options.py b/scripts/test_prep_options.py
+new file mode 100644
+index 0000000..519a381
+--- /dev/null
++++ b/scripts/test_prep_options.py
+@@ -0,0 +1,231 @@
++#!/usr/bin/env python3
++"""Synthetic end-to-end test of prep_subject.py's normalisation options and scripts/renorm_prep.py (CPU, ~12 min, no data needed):
++
++    python scripts/test_prep_options.py --out DIR [--ref-tree PATH_TO_A_CHECKOUT_OF_THE_PREVIOUS_COMMIT] [--keep] [--stage all|gen|check]
++
++--stage all (default) generates the data, runs every prep / renorm_prep child from this process, then checks.  On the AutoDL server
++(one python process at a time): 'gen' (data + DIR/children.sh), 'bash DIR/children.sh' (children one after another, each writing
++DIR/NAME.log and DIR/NAME.rc), then 'check' (reads the outputs, starts no child).
++
++Builds a 20 um mu_s-like OCT block (640 x 720 x 280, float32 .npy) with a specimen cylinder along axis 2, WM/GM-like texture, black tiles, section
++stripes along array axis 2 (15 slices), an aperiodic 3 % (std) per-slice gain along axis 0 and a non-separable alternating tile field on axes 0 / 1
++(fundamental 1.0 mm = 25 voxels at 40 um), plus a 0.08 mm MRI NIfTI; then runs prep (--oct-mask intensity --skip-vessels) and checks:
++
++P0 (with --ref-tree) default identity: destripe on and off, the same set of output files as the reference tree's prep, every .npy
++   byte-identical, and prep.json equal after removing only the 'seconds*' keys (no extra file, no extra key).
++PA --slab-audit on: every default .npy byte-identical, plus oct_slab_correction.npy (consistent with the v1 formula) and prep.json oct.slab /
++   oct.tile_flatfield ({applied: false, reason: off}); prep.json otherwise equal to the default's.
++P1 --slab-floor rel == default arrays (no median near 1e-3).
++P2 --slab-axis none: applied scale 1, the float16 gain equals the default's, octv(default) / octv(none) per axis-0 plane follows the default's applied scale (correlation > 0.95).
++P3 --slab-axis 2: native normalisation along axis 2 recorded; octv(axis 2) / octv(none) per axis-2 plane follows the axis-2 scale (correlation > 0.95; compared on destripe-off preps, since the destripe removes the section part of the scale from both).
++P4 --slab-axis auto --tile-flatfield on: vessel-level normalisation along the detected axis 2 (window 30 planes = 1.2 mm), tile periods within
++   3 % of 25 voxels, the tile fold at the true periods in octv reduced >= 2 x vs the default prep, provenance from_destriped_octv_renorm,
++   octv_slab_factor.npy / oct_tile_field.npy written, plausibility without warnings, section-group summary present, zero pattern of oct150 unchanged.
++P5 --slab-axis auto without --destripe on exits non-zero.
++P6 --tile-flatfield on --tile-period-mm 1.0,1.0: periods given (25, 25 voxels).
++P7 renorm_prep.py --check-identity on the default destripe-on prep passes (level150 replication).
++P8 renorm_prep.py --tile-flatfield on on the default prep ~= prep --tile-flatfield on (same octv; masks differ only by the intensity mask
++   of the destriped vs un-destriped oct150): median |log ratio| of oct150 inside the mask <= 2e-3.
++P9 --tile-flatfield on --tile-group-mode per_group: applied, one field per 2 mm group (oct_tile_field_groups.npy [G, nb0, nb1], G >= 2),
++   every group's residual after / before < 1."""
++from __future__ import annotations
++import argparse, hashlib, json, os, shutil, subprocess, sys, time
++from pathlib import Path
++import numpy as np
++from scipy import ndimage
++HERE = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(HERE))
++
++ap = argparse.ArgumentParser(); ap.add_argument("--out", type=Path, required=True); ap.add_argument("--ref-tree", type=Path, default=None); ap.add_argument("--keep", action="store_true")
++ap.add_argument("--stage", choices=["all", "gen", "check"], default="all")
++a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True); t0 = time.time()
++R = {}; FAIL = []
++def say(*x): print(*x, f"[{time.time()-t0:.0f}s]", flush=True)
++def check(name, ok, **kv):
++    R[name] = {"pass": bool(ok), **kv}; say(f"[{'PASS' if ok else 'FAIL'}] {name} {kv}")
++    if not ok: FAIL.append(name)
++
++# ------------------------------------------------------------------ synthetic data
++D = a.out / "data"; D.mkdir(exist_ok=True)
++oct_f = D / "oct20.npy"; mri_f = D / "mri.nii.gz"
++TILE_P = 50.0                                                                              # raw slices = 1.0 mm = 25 voxels at 40 um
++if a.stage != "check" and not oct_f.exists():
++    rng = np.random.default_rng(3); Z, Y, X = 640, 720, 280
++    tex = ndimage.gaussian_filter(rng.normal(size=(Z, Y, X)).astype(np.float32), (4, 4, 1.5)); tex /= tex.std()
++    cls = ndimage.gaussian_filter(rng.normal(size=(Z // 4, Y // 4, X // 4)).astype(np.float32), 1.5); cls = ndimage.zoom(cls, 4, order=1)[:Z, :Y, :X] > 0
++    yy, zz = np.meshgrid(np.arange(Y), np.arange(Z)); spec = ((((zz - Z / 2) / (0.44 * Z)) ** 2 + ((yy - Y / 2) / (0.44 * Y)) ** 2) < 1)[:, :, None]   # cylinder along axis 2
++    v = np.where(cls, 0.0026, 0.0018).astype(np.float32) * np.exp(0.25 * tex)
++    v = np.where(spec, v, 0.00025 * np.exp(0.2 * tex)).astype(np.float32); del tex, cls
++    k = np.arange(X); sec = np.exp(-0.25 * ((k % 15) / 15.0)).astype(np.float32); v *= sec[None, None, :] / sec.mean()          # section attenuation along axis 2
++    gsl = ndimage.gaussian_filter1d(rng.normal(size=Z), 3.0); gsl = 1 + 0.03 * gsl / gsl.std(); np.save(D / "gain_axis0.npy", gsl); v *= gsl.astype(np.float32)[:, None, None]   # aperiodic per-slice gain along axis 0
++    ph0 = (np.arange(Z) / TILE_P) % 1.0; ph1 = (np.arange(Y) / TILE_P) % 1.0
++    F = 0.03 * np.cos(2 * np.pi * ph0)[:, None] + 0.025 * np.cos(2 * np.pi * ph1)[None, :] + 0.02 * np.cos(2 * np.pi * 2 * ph0)[:, None] * np.cos(2 * np.pi * ph1)[None, :]
++    v *= np.exp(F - F.mean()).astype(np.float32)[:, :, None]
++    v[80:180, 100:200, :] = 0; v[400:460, 500:600, 140:] = 0; v[:, :, :4] = 0                                                  # black tiles
++    np.save(oct_f, v.astype(np.float32)); del v
++    import nibabel as nib
++    M = 170; zz, yy, xx = np.ogrid[:M, :M, :M]
++    tis = ((zz - M / 2) / (0.3 * M)) ** 2 + ((yy - M / 2) / (0.33 * M)) ** 2 + ((xx - M / 2) / (0.3 * M)) ** 2 < 1
++    mri = np.where(tis, 1.0 + 0.3 * (ndimage.gaussian_filter(rng.normal(size=(M, M, M)).astype(np.float32), 3) > 0), 0.08).astype(np.float32)
++    mri += 0.02 * rng.normal(size=mri.shape).astype(np.float32)
++    A = np.diag([0.08, 0.08, 0.08, 1.0]); A[:3, 3] = -0.08 * M / 2
++    nib.save(nib.Nifti1Image(mri, A), str(mri_f))
++    say("synthetic data written", oct_f, mri_f)
++
++# ------------------------------------------------------------------ the children (name, argv, expect_fail), in dependency order
++PY = sys.executable; NEW = HERE
++def prep_cmd(tree: Path, name: str, *flags):
++    return [PY, str(tree / "scripts/prep_subject.py"), "--work", str(a.out / name), "--mri", str(mri_f), "--oct", str(oct_f), "--oct-spacing-um", "20,20,20", "--oct-mask", "intensity", "--skip-vessels", *flags]
++CH = [("new_on", prep_cmd(NEW, "new_on", "--destripe", "on"), False), ("new_off", prep_cmd(NEW, "new_off"), False)]
++if a.ref_tree is not None: CH += [("ref_on", prep_cmd(a.ref_tree, "ref_on", "--destripe", "on"), False), ("ref_off", prep_cmd(a.ref_tree, "ref_off"), False)]
++CH += [("new_on_audit", prep_cmd(NEW, "new_on_audit", "--destripe", "on", "--slab-audit", "on"), False),
++       ("opt_rel", prep_cmd(NEW, "opt_rel", "--destripe", "on", "--slab-floor", "rel"), False),
++       ("opt_none", prep_cmd(NEW, "opt_none", "--destripe", "on", "--slab-axis", "none"), False),
++       ("opt_axis2", prep_cmd(NEW, "opt_axis2", "--destripe", "on", "--slab-axis", "2"), False),
++       ("opt_axis2_nodestripe", prep_cmd(NEW, "opt_axis2_nodestripe", "--slab-axis", "2"), False),
++       ("opt_none_nodestripe", prep_cmd(NEW, "opt_none_nodestripe", "--slab-axis", "none"), False),
++       ("opt_auto_tile", prep_cmd(NEW, "opt_auto_tile", "--destripe", "on", "--slab-axis", "auto", "--tile-flatfield", "on"), False),
++       ("opt_auto_nodestripe", prep_cmd(NEW, "opt_auto_nodestripe", "--slab-axis", "auto"), True),
++       ("opt_tile_given", prep_cmd(NEW, "opt_tile_given", "--destripe", "on", "--tile-flatfield", "on", "--tile-period-mm", "1.0,1.0"), False),
++       ("renorm_identity", [PY, str(NEW / "scripts/renorm_prep.py"), "--work", str(a.out / "new_on"), "--check-identity"], False),
++       ("renorm_tile", [PY, str(NEW / "scripts/renorm_prep.py"), "--work", str(a.out / "new_on"), "--out", str(a.out / "renorm_tile"), "--tile-flatfield", "on"], False),
++       ("opt_tile", prep_cmd(NEW, "opt_tile", "--destripe", "on", "--tile-flatfield", "on"), False),
++       ("opt_tile_pergroup", prep_cmd(NEW, "opt_tile_pergroup", "--destripe", "on", "--tile-flatfield", "on", "--tile-group-mode", "per_group"), False)]
++
++if a.stage == "gen":
++    import shlex
++    L_ = ["#!/bin/bash", "# generated by test_prep_options.py --stage gen: prep / renorm_prep children one at a time (no python parent)", "export OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES="]
++    for name, cmd, _ in CH:
++        rm = "" if name == "renorm_identity" else f"rm -rf {shlex.quote(str(a.out / name))}; "
++        L_.append(f"{rm}{' '.join(shlex.quote(c) for c in cmd)} > {shlex.quote(str(a.out / (name + '.log')))} 2>&1; rc=$?; echo $rc > {shlex.quote(str(a.out / (name + '.rc')))}; echo \"{name} rc $rc\"")
++    L_.append("exit 0   # pass / fail is decided by --stage check")
++    (a.out / "children.sh").write_text("\n".join(L_) + "\n"); say("wrote", a.out / "children.sh", f"({len(CH)} children)"); sys.exit(0)
++if a.stage == "all":
++    env = dict(os.environ, OMP_NUM_THREADS="4", CUDA_VISIBLE_DEVICES="")
++    for name, cmd, expect_fail in CH:
++        if name != "renorm_identity": shutil.rmtree(a.out / name, ignore_errors=True)
++        p = subprocess.run(cmd, capture_output=True, text=True, env=env); (a.out / f"{name}.log").write_text(p.stdout + p.stderr); (a.out / f"{name}.rc").write_text(str(p.returncode))
++        say(f"{name} rc {p.returncode}")
++        if (p.returncode != 0) != expect_fail: say(p.stdout[-2000:], p.stderr[-3000:])
++
++# ------------------------------------------------------------------ checks (read-only)
++def rc_of(name):
++    f = a.out / f"{name}.rc"; return int(f.read_text().strip()) if f.exists() else 99
++def md5(f): return hashlib.md5(open(f, "rb").read()).hexdigest()
++def strip(o, drop=()):
++    if isinstance(o, dict): return {k: strip(v) for k, v in o.items() if not k.startswith("seconds") and k not in drop}
++    if isinstance(o, list): return [strip(v) for v in o]
++    return o
++def prep_json(w, drop_oct=()):
++    j = json.load(open(w / "prep.json")); j = {k: strip(v) for k, v in j.items() if not k.startswith("seconds")}
++    if "oct" in j: j["oct"] = {k: v for k, v in j["oct"].items() if k not in drop_oct}
++    return j
++def scale_recovery(w_num, w_den, corr_file, ax):
++    """correlation between the per-plane median of octv(w_num) / octv(w_den) along axis ``ax`` (valid voxels of both, sampled every 4th voxel)
++    and the applied native scale of ``corr_file`` (row 2) mean-pooled by 2 (the vessel level); planes with too few voxels skipped."""
++    a_ = np.load(w_num / "octv.npy", mmap_mode="r"); b_ = np.load(w_den / "octv.npy", mmap_mode="r"); sc = np.load(corr_file)[2]; sc = sc[:len(sc) // 2 * 2].reshape(-1, 2).mean(1)
++    r = []
++    for i in range(min(a_.shape[ax], len(sc))):
++        x = np.take(a_, i, axis=ax)[::4, ::4].astype(np.float32); y = np.take(b_, i, axis=ax)[::4, ::4].astype(np.float32); m = (x > 1) & (y > 1)
++        r.append(np.median(x[m] / y[m]) if m.sum() > 200 else np.nan)
++    r = np.asarray(r); ok = np.isfinite(r); return float(np.corrcoef(np.log(r[ok]), np.log(sc[:len(r)][ok]))[0, 1])
++def tile_fold_true(w):
++    from octreg import octnorm
++    L, N = octnorm.enface_log_maps(np.load(w / "octv.npy", mmap_mode="r"), np.load(w / "octv_mask.npy", mmap_mode="r"), 2)
++    return octnorm.tile_field_2d(L, N, TILE_P / 2, TILE_P / 2)[3]["log_std"]
++def run_check(name, fn):
++    try: fn()
++    except Exception as e: check(name, False, error=f"{type(e).__name__}: {e}")
++
++w_on, w_off = a.out / "new_on", a.out / "new_off"
++if rc_of("new_on") or rc_of("new_off"):
++    check("P_new_default_runs", False, rc=[rc_of("new_on"), rc_of("new_off")]); json.dump(R, open(a.out / "test_prep_options.json", "w"), indent=1, default=str); print(f"FAILED: {FAIL}"); sys.exit(1)
++
++def c_P0():
++    for tag in ("on", "off"):
++        w_ref, w_new = a.out / f"ref_{tag}", (w_on if tag == "on" else w_off)
++        names_ref = sorted(p.name for p in w_ref.iterdir()); names_new = sorted(p.name for p in w_new.iterdir())
++        diff = [f for f in names_ref if f.endswith(".npy") and (not (w_new / f).exists() or md5(w_ref / f) != md5(w_new / f))]
++        same_json = json.dumps(prep_json(w_ref), sort_keys=True, default=str) == json.dumps(prep_json(w_new), sort_keys=True, default=str)
++        check(f"P0_default_identity_destripe_{tag}", rc_of(f"ref_{tag}") == 0 and not diff and same_json and names_ref == names_new, n_npy_ref=sum(f.endswith(".npy") for f in names_ref),
++              extra_in_new=sorted(set(names_new) - set(names_ref)), missing_in_new=sorted(set(names_ref) - set(names_new)), differing=diff, prep_json_equal=same_json)
++if a.ref_tree is not None: run_check("P0_default_identity", c_P0)
++
++w_au = a.out / "new_on_audit"
++def c_PA():
++    jd = json.load(open(w_au / "prep.json"))["oct"]; corr = np.load(w_au / "oct_slab_correction.npy"); fin = np.isfinite(corr[0])
++    medf = np.interp(np.arange(640), np.where(fin)[0], corr[0][fin])
++    d = [f.name for f in w_on.glob("*.npy") if md5(f) != md5(w_au / f.name)]
++    extra = sorted(set(p.name for p in w_au.iterdir()) - set(p.name for p in w_on.iterdir()))
++    same_json = json.dumps(prep_json(w_on), sort_keys=True, default=str) == json.dumps(prep_json(w_au, drop_oct=("slab", "tile_flatfield")), sort_keys=True, default=str)
++    check("PA_slab_audit_on", rc_of("new_on_audit") == 0 and not d and extra == ["oct_slab_correction.npy"] and same_json and "slab" not in json.load(open(w_on / "prep.json"))["oct"]
++          and jd["slab"]["option"] == "0" and jd["slab"]["axis"] == 0 and jd["slab"]["window_planes"] == 60 and corr.shape == (3, 640) and np.allclose(corr[2][fin], (corr[1] / medf)[fin], rtol=1e-6)
++          and jd["tile_flatfield"] == {"applied": False, "reason": "off"}, differing=d, extra=extra, prep_json_equal_without_audit_keys=same_json,
++          slab={k: jd["slab"][k] for k in ("window_planes", "window_mm", "floor_value", "min_median_over_floor")}, applied=jd["slab"]["applied"])
++run_check("PA_slab_audit_on", c_PA)
++
++def c_P1():
++    w1 = a.out / "opt_rel"; d1 = [f.name for f in w_on.glob("*.npy") if md5(f) != md5(w1 / f.name)]
++    check("P1_rel_floor_equals_default", rc_of("opt_rel") == 0 and not d1, differing=d1)
++run_check("P1_rel_floor_equals_default", c_P1)
++
++def c_P2():
++    w2 = a.out / "opt_none"; j2 = json.load(open(w2 / "prep.json"))["oct"]; c2 = np.load(w2 / "oct_slab_correction.npy"); jau = json.load(open(w_au / "prep.json"))["oct"]
++    r_none = scale_recovery(w_on, w2, w_au / "oct_slab_correction.npy", 0)
++    check("P2_slab_none", np.all(c2[2] == 1) and j2["slab"]["gain"] == jau["slab"]["gain"] and j2["slab"]["gain_only"] and r_none > 0.95 and j2["destripe"]["axis"] == 2 and j2["slab"]["vessel_level"] is None,
++          corr_octv_ratio_default_over_none_vs_v1_scale=r_none, v1_formula_correction=j2["slab"]["v1_formula_correction"])
++run_check("P2_slab_none", c_P2)
++
++def c_P3():
++    w3 = a.out / "opt_axis2"; j3 = json.load(open(w3 / "prep.json"))["oct"]; c3 = np.load(w3 / "oct_slab_correction.npy"); w3n, w2n = a.out / "opt_axis2_nodestripe", a.out / "opt_none_nodestripe"
++    r3 = scale_recovery(w3n, w2n, w3n / "oct_slab_correction.npy", 2)
++    check("P3_slab_axis2", j3["slab"]["axis"] == 2 and c3.shape == (3, 280) and j3["slab"]["window_planes"] == 60 and r3 > 0.95 and j3["destripe"]["axis"] == 2, corr_octv_ratio_axis2_over_none_vs_axis2_scale=r3, applied=j3["slab"]["applied"])
++run_check("P3_slab_axis2", c_P3)
++
++def c_P4():
++    w4 = a.out / "opt_auto_tile"; j4 = json.load(open(w4 / "prep.json"))["oct"]; vl = j4["slab"]["vessel_level"] or {}; ti = j4["tile_flatfield"]
++    tf_def, tf_4 = tile_fold_true(w_on), tile_fold_true(w4)
++    o_def = np.load(w_on / "oct150.npy"); o4 = np.load(w4 / "oct150.npy")
++    per = ti.get("periods_vox") or [0, 0]
++    check("P4_auto_and_tile", vl.get("applied") and vl.get("axis") == 2 and vl.get("window") == 30 and ti.get("applied") and all(abs(p / 25.0 - 1) < 0.03 for p in per) and tf_4 <= 0.5 * tf_def
++          and j4["oct150_provenance"] == "from_destriped_octv_renorm" and (w4 / "octv_slab_factor.npy").exists() and (w4 / "oct_tile_field.npy").exists() and np.array_equal(o_def > 0, o4 > 0)
++          and not ti["plausibility"]["warnings"] and (ti.get("groups") or {}).get("summary", {}).get("n_groups", 0) >= 2,
++          periods_vox=per, periods_mm=ti.get("periods_mm"), tile_fold_log_std_default_vs_option=[tf_def, tf_4], vessel_level={k: vl.get(k) for k in ("std_log_fac", "dominant_period_planes", "fac_min_max")},
++          residual=(ti.get("residual_field") or {}).get("log_std"), plausibility=ti.get("plausibility"), groups=(ti.get("groups") or {}).get("summary"))
++run_check("P4_auto_and_tile", c_P4)
++
++check("P5_auto_needs_destripe", rc_of("opt_auto_nodestripe") not in (0, 99), rc=rc_of("opt_auto_nodestripe"))
++
++def c_P6():
++    t6 = json.load(open(a.out / "opt_tile_given" / "prep.json"))["oct"]["tile_flatfield"]
++    check("P6_tile_given_periods", t6.get("applied") and t6.get("periods_source") == "given" and np.allclose(t6.get("periods_vox"), [25.0, 25.0]), periods_vox=t6.get("periods_vox"))
++run_check("P6_tile_given_periods", c_P6)
++
++def c_P7():
++    lg = (a.out / "renorm_identity.log").read_text() if (a.out / "renorm_identity.log").exists() else ""
++    check("P7_renorm_check_identity", rc_of("renorm_identity") == 0 and "IDENTITY PASS" in lg, tail=lg.strip().splitlines()[-1:])
++run_check("P7_renorm_check_identity", c_P7)
++
++def c_P8():
++    w8r, w8p = a.out / "renorm_tile", a.out / "opt_tile"
++    oa = np.load(w8r / "oct150.npy"); ob = np.load(w8p / "oct150.npy"); m = np.load(w_on / "oct150_mask.npy") & (oa > 0) & (ob > 0)
++    lr = np.abs(np.log(oa[m] / ob[m])); jr = json.load(open(w8r / "prep.json"))["oct"]
++    ok8 = rc_of("renorm_tile") == 0 and float(np.median(lr)) <= 2e-3 and jr["oct150_provenance"] == "from_destriped_octv_renorm" and os.path.islink(w8r / "oct150_mask.npy") and not (w8r / "octv.npy").exists()
++    check("P8_renorm_equals_prep_tile", ok8, median_abs_log_ratio=float(np.median(lr)), p99=float(np.percentile(lr, 99)), periods_renorm=jr["renorm"]["tile_flatfield"].get("periods_vox"),
++          periods_prep=json.load(open(w8p / "prep.json"))["oct"]["tile_flatfield"].get("periods_vox"), groups_renorm=(jr["renorm"]["tile_flatfield"].get("groups") or {}).get("summary"))
++run_check("P8_renorm_equals_prep_tile", c_P8)
++
++def c_P9():
++    w9 = a.out / "opt_tile_pergroup"; t9 = json.load(open(w9 / "prep.json"))["oct"]["tile_flatfield"]; g = t9.get("groups") or {}; fg = np.load(w9 / "oct_tile_field_groups.npy")
++    ratios = [r.get("after_over_before") for r in g.get("per_group", []) if "field_log_std_before" in r]
++    check("P9_tile_per_group", rc_of("opt_tile_pergroup") == 0 and t9.get("applied") and g.get("mode") == "per_group" and fg.shape[0] == len(g["per_group"]) >= 2 and tuple(fg.shape[1:]) == tuple(t9["field"]["nb"])
++          and g.get("field_log_file") == "oct_tile_field_groups.npy" and ratios and all(q is not None and q < 1.0 for q in ratios), n_groups=len(g.get("per_group", [])), after_over_before=ratios, group_mm=g.get("group_mm"))
++run_check("P9_tile_per_group", c_P9)
++
++R["n_fail"] = len(FAIL); R["failed"] = FAIL; R["seconds"] = time.time() - t0; R["stage"] = a.stage
++json.dump(R, open(a.out / "test_prep_options.json", "w"), indent=1, default=str)
++if not a.keep:
++    for d in a.out.iterdir():
++        if d.is_dir() and d.name != "data": shutil.rmtree(d, ignore_errors=True)
++print("ALL PASS" if not FAIL else f"FAILED: {FAIL}")
++sys.exit(1 if FAIL else 0)
+diff --git a/scripts/test_qc_options.py b/scripts/test_qc_options.py
+new file mode 100644
+index 0000000..962ef70
+--- /dev/null
++++ b/scripts/test_qc_options.py
+@@ -0,0 +1,168 @@
++#!/usr/bin/env python3
++"""Synthetic CPU test of scripts/qc_fine.py's P11 options (~2 min, no data needed):
++
++    python scripts/test_qc_options.py --out DIR [--ref-tree PATH_TO_A_CHECKOUT_OF_THE_PREVIOUS_COMMIT] [--stage all|gen|check]
++
++--stage all (default) generates the data, runs every qc_fine child from this process and checks.  On the AutoDL server (one python
++process at a time) run it in three stages: 'gen' (data, exclusion masks and DIR/children.sh), 'bash DIR/children.sh' (the qc_fine
++children one after another, each writing DIR/NAME.log and DIR/NAME.rc), then 'check' (reads the outputs; no child is started).
++
++Builds a 0.15 mm OCT block (60 x 70 x 56) and a 0.08 mm MRI whose tissue ellipsoid and texture correspond through a known rigid pose
++(the run's T_oct2mri.npy; T_oct2mri_prefine.npy = a 0.4 mm / 3 deg perturbation), then checks:
++
++Q0 (with --ref-tree) defaults: qc_fine.json of this tree equals the reference tree's (every key except 'seconds').
++Q1 --pose alt=T: the extra pose is scored in 'boundary' and 'pose_diffs'; the final pose's rim medians stay within 0.05 mm of the default run.
++Q2 all-False exclusion masks: 'boundary_body' equals 'boundary' for every pose (forward / reverse overall, rim and deep-end statistics) and
++   'mi_landscape_body' equals 'mi_landscape' (values at T and every landscape value).
++Q3 an OCT exclusion (z+ half of the mask) and an MRI exclusion (the MRI-world image of that half dilated 1.6 mm): fewer body boundary points,
++   no forward deep-end points left, forward points dropped by the union rule, union exclusion counts do not decrease when a pose is added, report_only flag and union pose list recorded.
++Q4 a mask of the wrong shape exits non-zero.
++Q5 an exclusion mask with label values (uint8 0/1/2) exits non-zero; a uint8 0/1 mask gives the same body block as the bool mask; a
++   masks.json whose grids.oct150 affine differs from --work exits non-zero."""
++from __future__ import annotations
++import argparse, json, math, os, shutil, subprocess, sys, time
++from pathlib import Path
++import numpy as np
++from scipy import ndimage
++HERE = Path(__file__).resolve().parents[1]
++
++ap = argparse.ArgumentParser(); ap.add_argument("--out", type=Path, required=True); ap.add_argument("--ref-tree", type=Path, default=None)
++ap.add_argument("--stage", choices=["all", "gen", "check"], default="all")
++a = ap.parse_args(); a.out.mkdir(parents=True, exist_ok=True); t0 = time.time(); R = {}; FAIL = []
++def say(*x): print(*x, f"[{time.time()-t0:.0f}s]", flush=True)
++def check(name, ok, **kv):
++    R[name] = {"pass": bool(ok), **kv}; say(f"[{'PASS' if ok else 'FAIL'}] {name} {kv}")
++    if not ok: FAIL.append(name)
++
++# ------------------------------------------------------------------ synthetic pair (+ every exclusion mask the runs need)
++W = a.out / "work"; RUN = a.out / "run"
++def generate():
++    W.mkdir(exist_ok=True); RUN.mkdir(exist_ok=True)
++    rng = np.random.default_rng(11)
++    def rot(axis, deg):
++        u = np.asarray(axis, float); u /= np.linalg.norm(u); th = math.radians(deg); K = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
++        return np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * K @ K
++    so = (60, 70, 56); A_oct = np.diag([0.15, 0.15, 0.15, 1.0]); A_oct[:3, 3] = [1.0, -2.0, 0.5]
++    sm = (150, 170, 150); A_mri = np.diag([0.08, 0.08, 0.08, 1.0]); A_mri[:3, 3] = [-3.0, -6.0, -3.5]
++    c_o = (A_oct @ np.r_[(np.array(so) - 1) / 2.0, 1])[:3]; c_m = (A_mri @ np.r_[(np.array(sm) - 1) / 2.0, 1])[:3]
++    T = np.eye(4); T[:3, :3] = rot([0.3, 1.0, 0.2], 12.0); T[:3, 3] = c_m - T[:3, :3] @ c_o                     # OCT world -> MRI world
++    waves = [(rng.normal(size=3) * 2.2, rng.uniform(0, 2 * np.pi)) for _ in range(12)]
++    def tex(p):                                                                                                   # smooth texture in MRI world coordinates
++        return sum(np.sin(p @ k + ph) for k, ph in waves) / math.sqrt(len(waves))
++    def ellip(p, s=1.0):
++        q = p - c_m; return (q[..., 0] / (3.3 * s)) ** 2 + (q[..., 1] / (4.2 * s)) ** 2 + (q[..., 2] / (3.0 * s)) ** 2 < 1
++    gi = np.stack(np.meshgrid(*[np.arange(n) for n in sm], indexing="ij"), -1).reshape(-1, 3).astype(float); pm = gi @ A_mri[:3, :3].T + A_mri[:3, 3]
++    tis = ellip(pm).reshape(sm); mri = np.where(tis, 1.0 + 0.3 * tex(pm).reshape(sm), 0.1) + 0.02 * rng.normal(size=sm)
++    tis_thr = tis & (rng.random(sm) > 0.002)                                                                     # threshold-only mask with speckle holes
++    go = np.stack(np.meshgrid(*[np.arange(n) for n in so], indexing="ij"), -1).reshape(-1, 3).astype(float); po = go @ A_oct[:3, :3].T + A_oct[:3, 3]
++    pom = po @ T[:3, :3].T + T[:3, 3]; mask_o = ellip(pom, 0.98).reshape(so)
++    oct150 = np.where(mask_o, 150 + 60 * tex(pom).reshape(so), 40 + 5 * rng.random(so)).astype(np.float32); oct150[5:14, 8:20, 20:34] = 0
++    np.save(W / "oct150.npy", oct150); np.save(W / "oct150_mask.npy", mask_o); np.save(W / "oct150_affine.npy", A_oct)
++    np.save(W / "mri.npy", mri.astype(np.float32)); np.save(W / "mri_affine.npy", A_mri); np.save(W / "mri_tissue.npy", tis_thr)
++    np.save(RUN / "T_oct2mri.npy", T)
++    Tp = T.copy(); Tp[:3, :3] = rot([1, 0, 0], 3.0) @ T[:3, :3]; Tp[:3, 3] = (T @ np.r_[c_o, 1])[:3] + np.array([0.4, 0, 0]) - Tp[:3, :3] @ c_o
++    np.save(RUN / "T_oct2mri_prefine.npy", Tp)
++    Ta = T.copy(); Ra = rot([0, 0, 1], -4.0); Ta[:3, :3] = Ra @ T[:3, :3]; Ta[:3, 3] = (T @ np.r_[c_o, 1])[:3] + np.array([0, 0.5, -0.3]) - Ta[:3, :3] @ c_o
++    np.save(a.out / "T_alt.npy", Ta)
++    np.save(a.out / "oct_excl_empty.npy", np.zeros(so, bool)); np.save(a.out / "mri_excl_empty.npy", np.zeros(sm, bool))
++    ox = mask_o.copy(); ox[: so[0] // 2] = False                                                                     # z+ half of the OCT mask
++    np.save(a.out / "oct_excl_half.npy", ox)
++    mx = np.zeros(sm, bool); pom_h = (np.argwhere(ox) @ A_oct[:3, :3].T + A_oct[:3, 3]) @ T[:3, :3].T + T[:3, 3]
++    ijk = np.rint((pom_h - A_mri[:3, 3]) / 0.08).astype(int); ijk = ijk[((ijk >= 0) & (ijk < np.array(sm))).all(1)]; mx[tuple(ijk.T)] = True
++    mx = ndimage.binary_dilation(mx, iterations=20); np.save(a.out / "mri_excl_half.npy", mx)
++    np.save(a.out / "oct_excl_bad.npy", np.zeros((5, 5, 5), bool))
++    lab = np.zeros(so, np.uint8); lab[mask_o] = 1; lab[ox] = 2; np.save(a.out / "oct_excl_labels.npy", lab)                   # a label map, not a mask
++    np.save(a.out / "oct_excl_half_u8.npy", ox.astype(np.uint8))
++    G = a.out / "grid_mismatch"; G.mkdir(exist_ok=True); np.save(G / "oct_excl_half.npy", ox)
++    A_bad = A_oct.copy(); A_bad[:3, 3] += 0.15
++    json.dump({"grids": {"oct150": {"shape": list(so), "affine": A_bad.tolist()}, "mri": {"shape": list(sm), "affine": A_mri.tolist()}}}, open(G / "masks.json", "w"))
++    say("synthetic pair: OCT mask", int(mask_o.sum()), "MRI tissue", int(tis.sum()))
++
++# ------------------------------------------------------------------ the qc_fine children (name, tree, flags, expect_fail)
++X = lambda f: str(a.out / f)
++RUNS = [("new_default", HERE, (), False)]
++if a.ref_tree is not None: RUNS.append(("ref_default", a.ref_tree, (), False))
++RUNS += [("opt_pose", HERE, ("--pose", f"alt={X('T_alt.npy')}"), False),
++         ("opt_empty_excl", HERE, ("--oct-exclude-mask", X("oct_excl_empty.npy"), "--mri-exclude-mask", X("mri_excl_empty.npy")), False),
++         ("opt_half_excl", HERE, ("--oct-exclude-mask", X("oct_excl_half.npy"), "--mri-exclude-mask", X("mri_excl_half.npy"), "--skip-landscape"), False),
++         ("opt_half_excl_pose", HERE, ("--oct-exclude-mask", X("oct_excl_half.npy"), "--mri-exclude-mask", X("mri_excl_half.npy"), "--skip-landscape", "--pose", f"alt={X('T_alt.npy')}"), False),
++         ("opt_bad_shape", HERE, ("--oct-exclude-mask", X("oct_excl_bad.npy"), "--skip-landscape"), True),
++         ("opt_label_values", HERE, ("--oct-exclude-mask", X("oct_excl_labels.npy"), "--skip-landscape"), True),
++         ("opt_half_u8", HERE, ("--oct-exclude-mask", X("oct_excl_half_u8.npy"), "--mri-exclude-mask", X("mri_excl_half.npy"), "--skip-landscape"), False),
++         ("opt_grid_mismatch", HERE, ("--oct-exclude-mask", X("grid_mismatch/oct_excl_half.npy"), "--skip-landscape"), True)]
++def cmd_of(name, tree, flags):
++    return [sys.executable, str(tree / "scripts/qc_fine.py"), "--work", str(W), "--run", str(RUN), "--out", str(a.out / name), *flags]
++
++if a.stage in ("all", "gen"):
++    generate()
++if a.stage == "gen":
++    import shlex
++    lines = ["#!/bin/bash", "# generated by test_qc_options.py --stage gen: the qc_fine children, one at a time (no python parent)", "export OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES=", "fail=0"]
++    for name, tree, flags, expect_fail in RUNS:
++        o = a.out / name
++        lines.append(f"rm -rf {shlex.quote(str(o))}; {' '.join(shlex.quote(c) for c in cmd_of(name, tree, flags))} > {shlex.quote(str(a.out / (name + '.log')))} 2>&1; rc=$?; echo $rc > {shlex.quote(str(a.out / (name + '.rc')))}; echo \"{name} rc $rc\"")
++    lines.append("exit 0   # pass / fail is decided by --stage check")
++    (a.out / "children.sh").write_text("\n".join(lines) + "\n"); say("wrote", a.out / "children.sh", f"({len(RUNS)} qc_fine runs)"); sys.exit(0)
++if a.stage == "all":
++    env = dict(os.environ, OMP_NUM_THREADS="4", CUDA_VISIBLE_DEVICES="")
++    for name, tree, flags, expect_fail in RUNS:
++        shutil.rmtree(a.out / name, ignore_errors=True)
++        p = subprocess.run(cmd_of(name, tree, flags), capture_output=True, text=True, env=env)
++        (a.out / f"{name}.log").write_text(p.stdout + p.stderr); (a.out / f"{name}.rc").write_text(str(p.returncode)); say(f"qc {name} ({tree.name}) rc {p.returncode}")
++        if (p.returncode != 0) != expect_fail: say(p.stdout[-1500:], p.stderr[-2500:])
++
++# ------------------------------------------------------------------ checks (read-only)
++def qc(name):
++    f = a.out / f"{name}.rc"; rc = int(f.read_text().strip()) if f.exists() else 99; o = a.out / name
++    return (json.load(open(o / "qc_fine.json")) if (o / "qc_fine.json").exists() and rc == 0 else None), rc
++def strip(o):
++    if isinstance(o, dict): return {k: strip(v) for k, v in o.items() if not k.startswith("seconds")}
++    if isinstance(o, list): return [strip(v) for v in o]
++    return o
++
++Qd, rc = qc("new_default")
++if rc: check("Q_default_runs", False, rc=rc); json.dump(R, open(a.out / "test_qc_options.json", "w"), indent=1); print(f"FAILED: {FAIL}"); sys.exit(1)
++if a.ref_tree is not None:
++    Qr, rcr = qc("ref_default")
++    same = rcr == 0 and json.dumps(strip(Qr), sort_keys=True) == json.dumps(strip(Qd), sort_keys=True)
++    check("Q0_default_identity", same, keys_ref=sorted(Qr.keys()) if Qr else None, keys_new=sorted(Qd.keys()))
++
++Q1, _ = qc("opt_pose")
++fr = lambda q, nm, d="forward_oct_to_mri": q["boundary"][nm][d]["rim_faces"]["median_mm"]
++check("Q1_extra_pose", Q1 is not None and "alt" in Q1["boundary"] and "alt_vs_final" in Q1["pose_diffs"] and abs(fr(Q1, "final") - fr(Qd, "final")) <= 0.05 and abs(fr(Q1, "final", "reverse_mri_to_oct") - fr(Qd, "final", "reverse_mri_to_oct")) <= 0.05,
++      final_fwd_default_vs_pose=[fr(Qd, "final"), fr(Q1, "final") if Q1 else None], alt_fwd=fr(Q1, "alt") if Q1 else None)
++
++Q2, _ = qc("opt_empty_excl")
++ok2 = Q2 is not None and set(Q2["boundary_body"]) == set(Q2["T_used"])
++if ok2:
++    for nm in Q2["T_used"]:
++        for d in ("forward_oct_to_mri", "reverse_mri_to_oct"):
++            for part in ("overall", "rim_faces", "deep_end"):
++                ok2 &= Q2["boundary_body"][nm][d][part] == Q2["boundary"][nm][d][part]
++    for nm, L in Q2["mi_landscape"].items():
++        Lb = Q2["mi_landscape_body"][nm]; ok2 &= Lb["value_at_T"] == L["value_at_T"]
++        ok2 &= all(Lb[k]["values"] == L[k]["values"] for k in L if isinstance(L[k], dict) and "values" in L[k])
++    ok2 &= json.dumps(strip({k: v for k, v in Q2.items() if k not in ("boundary_body", "mi_landscape_body", "exclusion")}), sort_keys=True) == json.dumps(strip(Qd), sort_keys=True)
++check("Q2_empty_exclusions_equal_main_block", ok2, n_union=(Q2 or {}).get("exclusion", {}).get("n_forward_union_excluded"))
++
++Q3, _ = qc("opt_half_excl"); Q3b, _ = qc("opt_half_excl_pose")
++ok3 = Q3 is not None and Q3b is not None
++if ok3:
++    e, eb = Q3["exclusion"], Q3b["exclusion"]; bf = Q3["boundary_body"]["final"]["forward_oct_to_mri"]
++    ok3 = (e["n_oct_boundary_body"] < 0.7 * e["n_oct_boundary_usable"] and bf["deep_end"]["n"] == 0 and Q3["boundary"]["final"]["forward_oct_to_mri"]["deep_end"]["n"] > 0
++           and e["n_forward_union_excluded"] > 0 and eb["n_forward_union_excluded"] >= e["n_forward_union_excluded"] and eb["n_reverse_union_excluded"] >= e["n_reverse_union_excluded"] and e["report_only"] and eb["union_poses"] == ["final", "prefine", "alt"]
++           and Q3.get("mi_landscape_body") is None)
++    check("Q3_half_exclusion", ok3, n_boundary_usable_body=[e["n_oct_boundary_usable"], e["n_oct_boundary_body"]], deep_end_n_main_body=[Q3["boundary"]["final"]["forward_oct_to_mri"]["deep_end"]["n"], bf["deep_end"]["n"]],
++          union_fwd_rev_1pose_2poses=[[e["n_forward_union_excluded"], e["n_reverse_union_excluded"]], [eb["n_forward_union_excluded"], eb["n_reverse_union_excluded"]]],
++          body_rim_fwd_rev=[bf["rim_faces"]["median_mm"], (Q3["boundary_body"]["final"]["reverse_mri_to_oct"] or {}).get("rim_faces", {}).get("median_mm")])
++else:
++    check("Q3_half_exclusion", False)
++_, rc4 = qc("opt_bad_shape")
++check("Q4_bad_shape_exits", rc4 not in (0, 99))
++_, rc5a = qc("opt_label_values"); Q5u, rc5u = qc("opt_half_u8"); _, rc5g = qc("opt_grid_mismatch")
++same_u8 = Q5u is not None and Q3 is not None and json.dumps(strip(Q5u["boundary_body"]), sort_keys=True) == json.dumps(strip(Q3["boundary_body"]), sort_keys=True)
++check("Q5_mask_values_and_grid", rc5a not in (0, 99) and same_u8 and rc5g not in (0, 99), label_map_rc=rc5a, u8_equals_bool=same_u8, grid_mismatch_rc=rc5g,
++      label_msg=[l for l in (a.out / "opt_label_values.log").read_text().splitlines() if "exclusion mask must be" in l][:1] if (a.out / "opt_label_values.log").exists() else None)
++R["n_fail"] = len(FAIL); R["failed"] = FAIL; R["seconds"] = time.time() - t0; R["stage"] = a.stage
++json.dump(R, open(a.out / "test_qc_options.json", "w"), indent=1, default=str)
++print("ALL PASS" if not FAIL else f"FAILED: {FAIL}"); sys.exit(1 if FAIL else 0)
