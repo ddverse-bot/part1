@@ -6,13 +6,13 @@ octreg 1.0 registered the two original files as given (OCT 1457x2013x1595 at 20 
 
 The result is judged by visual inspection of the overlays (docs/METHOD.md, "Evaluation"). The numbers below support that judgement.
 
-![Result and the best pose of the other handedness](../docs/figures/fig_handedness_xiangrui.png)
+![Result and the best pose of the other handedness](figures/fig_handedness_xiangrui.png)
 
 Planes through the centroid of the specimen mask, normal to each OCT array axis: the OCT, then for the result and for the best pose of the other handedness (ablation A8) the MRI through the transform (inverted inside its foreground, polarity -1) and a 2 mm checkerboard. The MRI outline of the result follows the OCT specimen in all three planes, and the cerebellar folia of the MRI lie on the folded folia pieces of the OCT, at the lower right of the axis-1 plane and at the upper right of the axis-2 plane. The mirrored pose fits the outline as well, with the higher S_outline (0.6438 against 0.5891) and the lower loss (L 0.7133 against 0.7296), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
 
 ![QC of the result](figures/fig_qc_xiangrui.png)
 
-qc.png of the run, with the MRI foreground through the transform (red) and the OCT specimen mask (cyan) in the fourth column. qc_montage.png, with four planes per axis, is [fig_qc_montage_xiangrui.png](../docs/figures/fig_qc_montage_xiangrui.png). In every plane the MRI outline follows the OCT specimen apart from the torn and folded cerebellar pieces, although the OCT mask outline takes in a margin of agarose in some planes (most in axis 1 at 8.32 mm and axis 2 at 6.37 mm). The folia also correspond in the axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm.
+qc.png of the run, with the MRI foreground through the transform (red) and the OCT specimen mask (cyan) in the fourth column. qc_montage.png, with four planes per axis, is [fig_qc_montage_xiangrui.png](figures/fig_qc_montage_xiangrui.png). In every plane the MRI outline follows the OCT specimen apart from the torn and folded cerebellar pieces, although the OCT mask outline takes in a margin of agarose in some planes (most in axis 1 at 8.32 mm and axis 2 at 6.37 mm). The folia also correspond in the axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm.
 
 ## Main result
 

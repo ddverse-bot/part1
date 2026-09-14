@@ -9,7 +9,7 @@ no labels, so every metric is label-free. Paths are those of the AutoDL server.
 | `evaluate.py` | pose against the reference R5, OCT mask volume and Dice, boundary agreement, raw-data frame check |
 | `ablate.py` | preprocessing once, then the variants base and A0-A9, one JSON table |
 | `report.py` | writes `bench/BENCHMARK.md` and the two figures in `bench/figures/` from the outputs |
-| `compose_pair.py` | two `octreg qc` outputs of one run side by side (`docs/figures/fig_handedness_xiangrui.png`) |
+| `compose_pair.py` | two `octreg qc` outputs of one run side by side (`bench/figures/fig_handedness_xiangrui.png`) |
 
 ## Running
 

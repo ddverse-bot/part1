@@ -5,7 +5,7 @@
 
 Columns: OCT | MRI and checkerboard of pose A | MRI and checkerboard of pose B, one row per plane: the three centroid planes of
 qc.png, or montage rows i, j, k of qc_montage.png. Plane images and row labels are cut pixel for pixel from the qc figures (layout
-constants from octreg.register); the OCT planes of the two inputs must be identical. docs/figures/fig_handedness_xiangrui.png:
+constants from octreg.register); the OCT planes of the two inputs must be identical. bench/figures/fig_handedness_xiangrui.png:
 
     python -m octreg qc --run RUN --oct OCT --mri MRI --T ABL/variants/A8/T_oct2mri.txt -o OTHER
     python bench/compose_pair.py RUN/qc OTHER OUT.png --titles "octreg result (handedness of the file headers)" \

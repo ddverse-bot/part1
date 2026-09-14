@@ -53,7 +53,7 @@ non-maximum suppression (3 mm, 10°) leaves 24 poses.
 
 Mirror images are not searched, so the handedness is that of the file headers. Two physical specimens are never mirror images,
 and the score cannot tell handedness on a nearly symmetric specimen: on I58 the best mirrored pose has the lower loss but its
-anatomy in the wrong place (docs/figures/fig_handedness_xiangrui.png). A mirrored stack, for example with a reversed section
+anatomy in the wrong place. A mirrored stack, for example with a reversed section
 order, has to be fixed in its header, or for TIFF and NPY by reversing one array axis.
 
 ## 4. Prior-bounded affine refinement
@@ -73,20 +73,19 @@ specimen must lie on the same anatomy in the MRI, internal structures must conti
 folded pieces must correspond and lie on the same side, and the contrast must be consistently inverted or not. Other candidate
 transforms can be rendered with `octreg qc --T` and compared side by side.
 
-### Xiangrui's I58 brainstem pair
+### I58 brainstem pair
 
 On the two original files (OCT 1457×2013×1595 at 20 µm, MRI crop 343×489×495 at 0.08 mm) the run took 9 min 36 s, 5.2 GiB of
 RAM and 1.8 GiB of GPU memory. S is 0.2747 (S_class −0.1175, S_outline 0.5891), polarity −1, scales 1.007 / 0.971 / 0.970. Raw
 20 µm OCT values mapped through the header and the transform correlate with the exported overlay at Spearman 0.991, against at
 most 0.270 with any OCT axis flipped.
 
-docs/figures/fig_registration_xiangrui.png shows the planes through the specimen centre read from the original files rather
-than the 0.15 mm base grid. In the QC montage of all planes (docs/figures/fig_qc_montage_xiangrui.png) the MRI outline follows
-the OCT specimen in every plane apart from the torn and folded cerebellar pieces, which have moved; the OCT mask takes in a
-margin of agarose in most planes. The cerebellar folia of the MRI land on the folded folia of the OCT, and a round nucleus at
-the top of the axis-2 planes corresponds. The best mirrored pose fits the outline as well (S_outline 0.6438) and has the lower
-loss (L 0.7133 against 0.7296), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right
-of the axis-2 plane.
+docs/figures/registration_I58.png shows the planes through the specimen centre before and after registration, read from the
+original files. In the qc_montage.png of the run the MRI outline follows the OCT specimen in every plane apart from the torn
+and folded cerebellar pieces, which have moved; the OCT mask takes in a margin of agarose in most planes. The cerebellar folia
+of the MRI land on the folded folia of the OCT, and a round nucleus at the top of the axis-2 planes corresponds. The best
+mirrored pose fits the outline as well (S_outline 0.6438) and has the lower loss (L 0.7133 against 0.7296), but its folia lie
+at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
 
 Each ablation changes one element and reruns search and refinement; pose changes are block-corner means against the result.
 

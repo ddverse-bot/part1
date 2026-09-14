@@ -5,10 +5,11 @@ Label-free affine registration of serial-section OCT blocks to ex-vivo MRI.
 octreg aligns an OCT volume of a tissue block embedded in scatterer-doped agarose to an MRI already cropped around the block.
 It writes the transform between the two input files, each volume resampled into the other's frame, and QC images.
 
-![Registration of Xiangrui's I58 brainstem pair](docs/figures/fig_registration_xiangrui.png)
+![Registration of the I58 brainstem pair](docs/figures/registration_I58.png)
 
-*Xiangrui's I58 brainstem pair, one plane per OCT axis through the specimen centre, read from the original files: the OCT, the
-MRI resampled onto the same plane through the transform, and a 2 mm checkerboard of the two (MRI contrast inverted).*
+*I58 brainstem pair, one plane per OCT axis through the specimen centre, read from the original files: the OCT, then the MRI
+before registration (orientation from the file headers, specimen centres matched) and after it, each with a 2 mm checkerboard
+against the OCT (MRI contrast inverted).*
 
 ## Installation
 
