@@ -7,8 +7,8 @@ It writes the transform between the two input files, each volume resampled into 
 
 ![Registration of Xiangrui's I58 brainstem pair](docs/figures/fig_registration_xiangrui.png)
 
-*Xiangrui's I58 brainstem pair, one plane per OCT axis: OCT, MRI through the transform (contrast inverted), checkerboard of
-the two, and the MRI foreground (red) and OCT mask (cyan) outlines.*
+*Xiangrui's I58 brainstem pair, one plane per OCT axis through the specimen centre, read from the original files: the OCT, the
+MRI resampled onto the same plane through the transform, and a 2 mm checkerboard of the two (MRI contrast inverted).*
 
 ## Installation
 
