@@ -80,12 +80,12 @@ RAM and 1.8 GiB of GPU memory. S is 0.2747 (S_class −0.1175, S_outline 0.5891)
 20 µm OCT values mapped through the header and the transform correlate with the exported overlay at Spearman 0.991, against at
 most 0.270 with any OCT axis flipped.
 
-docs/figures/registration_I58.png shows the planes through the specimen centre before and after registration, read from the
-original files. In the qc_montage.png of the run the MRI outline follows the OCT specimen in every plane apart from the torn
-and folded cerebellar pieces, which have moved; the OCT mask takes in a margin of agarose in most planes. The cerebellar folia
-of the MRI land on the folded folia of the OCT, and a round nucleus at the top of the axis-2 planes corresponds. The best
-mirrored pose fits the outline as well (S_outline 0.6438) and has the lower loss (L 0.7133 against 0.7296), but its folia lie
-at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
+docs/figures/registration_I58.png shows the OCT on three MRI planes through the registered specimen before and after
+registration, read from the original files. In the qc_montage.png of the run the MRI outline follows the OCT specimen in every
+plane apart from the torn and folded cerebellar pieces, which have moved; the OCT mask takes in a margin of agarose in most
+planes. The cerebellar folia of the MRI land on the folded folia of the OCT, and a round nucleus at the top of the axis-2
+planes corresponds. The best mirrored pose fits the outline as well (S_outline 0.6438) and has the lower loss (L 0.7133 against
+0.7296), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
 
 Each ablation changes one element and reruns search and refinement; pose changes are block-corner means against the result.
 
