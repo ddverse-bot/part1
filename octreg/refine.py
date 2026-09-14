@@ -1,7 +1,7 @@
 """Affine refinement (method step 5): every search pose is fitted on the base grid with its polarity fixed, poses that leave
 the MRI foreground are dropped, and the lowest loss wins.
 
-Model x_mri = R(r) Sh(sh) diag(exp(ls)) M (x_oct - c) + t, M = diag(1, 1, -1) for a mirrored pose, c = OCT grid box centre (mm).
+Model x_mri = R(r) Sh(sh) diag(exp(ls)) (x_oct - c) + t, c = OCT grid box centre (mm); no mirror (handedness from the file frames).
 S = mean over the two channel pairs of the OCT-weighted NCC between the OCT channels at the OCT voxels with weight > 0 (swapped
 for polarity -1) and the MRI channels sampled through the pose. L = 1 - S + lam (sum ls^2 + sum sh^2); after every Adam step
 (cosine schedule) |ls|, |sh| <= clamp (absolute).
@@ -16,26 +16,25 @@ from scipy.spatial.transform import Rotation
 
 from . import geometry as G
 from .params import Params
-from .search import EPS, MIRROR, box, to_torch
+from .search import EPS, box, to_torch
 
 
-def compose(r, t, ls, sh, c, mirror=False):
+def compose(r, t, ls, sh, c):
     """Torch parameters (rotation vector r rad, t = image of c in mm, log-scales, shears Sh[0,1], Sh[0,2], Sh[1,2]; each [3]) and
     c (mm, [3]) -> 4x4 OCT world -> MRI world (torch, differentiable; the rotation is exp([r]x), also at r = 0)."""
     z, one = torch.zeros_like(r[0]), torch.ones_like(r[0])
     K = torch.stack([torch.stack([z, -r[2], r[1]]), torch.stack([r[2], z, -r[0]]), torch.stack([-r[1], r[0], z])])
     Sh = torch.stack([torch.stack([one, sh[0], sh[1]]), torch.stack([z, one, sh[2]]), torch.stack([z, z, one])])
     A = torch.linalg.matrix_exp(K) @ Sh @ torch.diag(torch.exp(ls))
-    if mirror:
-        A = A * torch.tensor([1.0, 1.0, -1.0], dtype=r.dtype, device=r.device)
     return torch.cat([torch.cat([A, (t - A @ c)[:, None]], 1), torch.eye(4, dtype=r.dtype, device=r.device)[3:]])
 
 
 def decompose(T, c):
-    """Inverse of compose for a 4x4 numpy affine: A M = Q U (QR, diag U > 0) -> (r, t, ls, sh numpy [3], mirror = det A < 0)."""
+    """Inverse of compose for a 4x4 numpy affine: A = Q U (QR, diag U > 0) -> (r, t, ls, sh numpy [3]). A mirrored pose is refused."""
     A = np.asarray(T, float)[:3, :3]
-    mirror = bool(np.linalg.det(A) < 0)
-    Q, U = np.linalg.qr(A @ MIRROR if mirror else A)
+    if np.linalg.det(A) <= 0:
+        raise ValueError(f"mirrored or singular pose (det <= 0): the handedness comes from the file frames\n{T}")
+    Q, U = np.linalg.qr(A)
     d = np.where(np.diag(U) < 0, -1.0, 1.0)
     Q, U = Q * d, d[:, None] * U
     s = np.diag(U)
@@ -43,7 +42,7 @@ def decompose(T, c):
         raise ValueError(f"singular pose\n{T}")
     Sh = U / s
     return (Rotation.from_matrix(Q).as_rotvec(), A @ np.asarray(c, float) + np.asarray(T, float)[:3, 3], np.log(s),
-            np.array([Sh[0, 1], Sh[0, 2], Sh[1, 2]]), mirror)
+            np.array([Sh[0, 1], Sh[0, 2], Sh[1, 2]]))
 
 
 def masked_ncc(a, b, w):
@@ -86,8 +85,7 @@ def fit(grid, T0, polarity, params: Params = Params()):
     twelve affine parameters (r, t, 3 log-scales, 3 shears). -> (T numpy 4x4, S, L) of the iterate with the lowest L."""
     P, dev = params, grid.w.device
     f = lambda x: torch.tensor(np.asarray(x, float), dtype=torch.float32, device=dev, requires_grad=True)
-    *x0, mirror = decompose(T0, grid.c)
-    r, t, ls, sh = (f(x) for x in x0)
+    r, t, ls, sh = (f(x) for x in decompose(T0, grid.c))
     c = torch.tensor(np.asarray(grid.c, float), dtype=torch.float32, device=dev)
     opt = torch.optim.Adam([{"params": [r], "lr": P.lr_rot}, {"params": [t], "lr": P.lr_t}, {"params": [ls], "lr": P.lr_ls},
                             {"params": [sh], "lr": P.lr_sh}])
@@ -95,7 +93,7 @@ def fit(grid, T0, polarity, params: Params = Params()):
     best = (math.inf, None, None)
     for _ in range(P.iters):
         opt.zero_grad(set_to_none=True)
-        T = compose(r, t, ls, sh, c, mirror)
+        T = compose(r, t, ls, sh, c)
         S = grid.score(T, polarity)
         L = 1.0 - S + P.lam * ((ls ** 2).sum() + (sh ** 2).sum())
         L.backward()
@@ -114,15 +112,15 @@ def refine(candidates, mri, oct, params: Params = Params(), device="cuda", tau=0
     """Fit every search pose (fit, its polarity fixed) on the base grid, drop the poses whose overlap (BaseGrid.overlap) is below
     tau (the search's admissibility rule also holds after refinement) and sort by L. candidates: search output (T, polarity);
     mri = (v [2, D, H, W], mask, affine), oct = (u [2, d, h, w], w, affine) on the base grid; tau: the search's overlap threshold.
-    -> [{T, S, L, polarity, mirror, log_scales, shears, overlap, search_rank}] lowest L first.
+    -> [{T, S, L, polarity, log_scales, shears, overlap, search_rank}] lowest L first.
     Raises ValueError when no pose keeps overlap >= tau."""
     if not candidates or any(c["polarity"] not in (1, -1) for c in candidates):
         raise ValueError("refine needs candidates with polarity +1 or -1")
     grid, poses = BaseGrid(mri, oct, device), []
     for i, c in enumerate(candidates):
         T, S, L = fit(grid, np.asarray(c["T"], float), int(c["polarity"]), params)
-        _, _, ls, sh, mirror = decompose(T, grid.c)
-        poses.append(dict(T=T, S=S, L=L, polarity=int(c["polarity"]), mirror=mirror, log_scales=ls.tolist(), shears=sh.tolist(),
+        _, _, ls, sh = decompose(T, grid.c)
+        poses.append(dict(T=T, S=S, L=L, polarity=int(c["polarity"]), log_scales=ls.tolist(), shears=sh.tolist(),
                           overlap=grid.overlap(T), search_rank=i))
     poses = sorted((p for p in poses if p["overlap"] >= tau), key=lambda p: p["L"])
     if not poses:

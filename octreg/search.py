@@ -1,7 +1,8 @@
 """Orientation search (method step 4) on the search grid (Params.search_mm).
 
-For every rotation of a fixed uniform set, and each rotation mirrored, the OCT two-class template is correlated with the MRI
-crop over all translations by FFT (weighted NCC with a Padfield-style mask).
+For every rotation of a fixed uniform set the OCT two-class template is correlated with the MRI crop over all translations by FFT
+(weighted NCC with a Padfield-style mask). Rotations only: two physical specimens are never mirror images, so the handedness is
+that of the input file frames and is not searched (a mirrored stack has to be fixed in its header).
 The OCT channels are (p, 1 - p) with a separate weight, so swapping them gives exactly -S: one score map per orientation,
 argmax |S| over the admissible translations, and the sign of that score is the contrast polarity.
 """
@@ -17,7 +18,6 @@ import torch.nn.functional as F
 from . import geometry as G
 from .params import Params
 
-MIRROR = np.diag([1.0, 1.0, -1.0])
 EPS = 1e-6          # numerical guard of weight sums and NCC denominators
 VAR_FLOOR = 0.02    # local MRI variance >= this x its foreground variance: round-off guard of the FFT sums
 DIMS = (-3, -2, -1)
@@ -117,18 +117,16 @@ class Searcher:
 
 
 def search(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, params: Params = Params(), device="cuda", polarity=0):
-    """Orientation search at one grid (arguments as Searcher). Rotations: geometry.rotations(n_rot, seed), each also composed with
-    diag(1, 1, -1) (both handednesses). Per orientation the admissible argmax of |S|, whose sign is the polarity (polarity 0, the
+    """Orientation search at one grid (arguments as Searcher). Rotations: geometry.rotations(n_rot, seed) (proper rotations). Per orientation the admissible argmax of |S|, whose sign is the polarity (polarity 0, the
     method), or of polarity x S (polarity +1 / -1 forced). Greedy NMS on polarity x S: a pose duplicates a kept one iff centres
-    are closer than nms_mm and rotations (same handedness) closer than nms_deg; the best topk are kept.
-    -> (candidates [{T 4x4, S signed, polarity +1|-1, mirror bool, overlap}] best first,
+    are closer than nms_mm and rotations closer than nms_deg; the best topk are kept.
+    -> (candidates [{T 4x4, S signed, polarity +1|-1, overlap}] best first,
         info {top1, top2 (polarity x S of the first two), n_admissible orientations, tau, overlap_floor flag, n_orientations, seconds})."""
     P, t0 = params, time.time()
     if polarity not in (0, 1, -1):
         raise ValueError(f"polarity must be 0 (sign of the score), +1 or -1, got {polarity!r}")
     s = Searcher(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, P, device)
     Rs = G.rotations(P.n_rot, P.seed)
-    Rs = np.concatenate([Rs, Rs @ MIRROR])
     found = []
     for i, R in enumerate(Rs):
         S, overlap, adm = s.score(R)
@@ -145,7 +143,7 @@ def search(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, params: Params
         centre = G.apply_affine(T, s.c_o)
         if any(np.linalg.norm(centre - c) < P.nms_mm and angle_deg(Rs[i], R) < P.nms_deg for _, c, R, _ in kept):
             continue
-        kept.append((dict(T=T, S=Sj, polarity=pol, mirror=bool(np.linalg.det(Rs[i]) < 0), overlap=ov), centre, Rs[i], x))
+        kept.append((dict(T=T, S=Sj, polarity=pol, overlap=ov), centre, Rs[i], x))
         if len(kept) >= P.topk:
             break
     info = dict(top1=kept[0][3], top2=kept[1][3] if len(kept) > 1 else None, n_admissible=len(found), tau=s.tau,

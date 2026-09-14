@@ -69,7 +69,7 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
 
     best = poses[0]
     T = best["T"]
-    pose = {k: best[k] for k in ("S", "L", "polarity", "mirror", "log_scales", "shears", "overlap", "search_rank")}
+    pose = {k: best[k] for k in ("S", "L", "polarity", "log_scales", "shears", "overlap", "search_rank")}
     pose["scale_per_oct_axis"] = np.linalg.norm(T[:3, :3] @ (vo.affine[:3, :3] / vo.spacing_mm), axis=0).tolist()
     flags = ["mri_foreground_no_valley"] * (fg_m.get("status") == "no_valley") + ["overlap_floor"] * info["search"]["overlap_floor"]
     flags += ["nondefault_params"] * (P != Params())

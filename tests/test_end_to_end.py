@@ -91,7 +91,7 @@ def test_register_and_apply(tmp_path):
     res = json.loads((out / "result.json").read_text())
     T = np.loadtxt(out / "T_oct2mri.txt")
     assert distance(T, T_true, pts) < 0.4
-    assert res["pose"]["polarity"] == -1 and not res["pose"]["mirror"] and "nondefault_params" in res["flags"]
+    assert res["pose"]["polarity"] == -1 and np.linalg.det(np.loadtxt(out / "T_oct2mri.txt")[:3, :3]) > 0 and "nondefault_params" in res["flags"]
     assert np.allclose(np.loadtxt(out / "T_mri2oct.txt") @ T, np.eye(4), atol=1e-9) and np.allclose(res["T_oct2mri"], T)
     assert res["foreground"]["oct"]["source"] == "texture" and res["foreground"]["mri"]["status"] == "ok"
     oct_img = nib.load(str(oct_path))                          # equal intensities: no histogram valley; texture: the specimen

@@ -161,7 +161,7 @@ def run_variant(name, out, device, force):
         io.write_json({**head, "error": f"{type(e).__name__}: {e}", "seconds": time.time() - t0}, d / "result.json")
         print(f"{name}: failed: {e}", flush=True)
         return json.loads((d / "result.json").read_text())
-    keys = ("S", "L", "polarity", "mirror", "log_scales", "shears", "overlap", "search_rank")
+    keys = ("S", "L", "polarity", "log_scales", "shears", "overlap", "search_rank")
     best = poses[0]
     r = {**head, "T": best["T"], "best": {k: best[k] for k in keys}, "poses": [{k: p[k] for k in keys} for p in poses], **info,
          "seconds": time.time() - t0, "gpu_peak_gb": torch.cuda.max_memory_allocated() / 1e9 if cuda else None,
@@ -209,7 +209,7 @@ def main():
             continue
         T, best = np.array(r["T"]), r["best"]
         to_base = E.pose(T, T_base, pts, cor)
-        table[n] = {**common, "S": best["S"], "L": best["L"], "polarity": best["polarity"], "mirror": best["mirror"],
+        table[n] = {**common, "S": best["S"], "L": best["L"], "polarity": best["polarity"],
                     "scales": np.exp(best["log_scales"]).tolist(), "shears": best["shears"], "overlap": best["overlap"],
                     "search": {k: r["search"].get(k) for k in ("top1", "top2", "n_admissible", "tau", "overlap_floor")},
                     "refine": r["refine"], "pose_to_base": to_base, "within_0.5mm_of_base": to_base["mean_mm"] <= 0.5,

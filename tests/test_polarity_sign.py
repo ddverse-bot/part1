@@ -10,7 +10,9 @@ from scipy.ndimage import gaussian_filter
 from octreg import geometry as G
 from octreg.params import Params
 from octreg.refine import BaseGrid, compose
-from octreg.search import MIRROR, Searcher, search
+from octreg.search import Searcher, search
+
+MIRROR = np.diag([1.0, 1.0, -1.0])          # the score map negates for any orientation, mirrored ones included
 
 TOL = 1e-5
 FAST = dataclasses.replace(Params(), n_rot=16, topk=4)
@@ -55,7 +57,7 @@ def test_search_candidates_flip_polarity(pair):
     assert len(ca) == len(cb) == FAST.topk and abs(ia["top1"] - ib["top1"]) < TOL and ia["n_admissible"] == ib["n_admissible"]
     for x, y in zip(ca, cb):
         assert np.allclose(x["T"], y["T"]) and abs(x["S"] + y["S"]) < TOL and x["polarity"] == -y["polarity"]
-        assert x["S"] * x["polarity"] > 0 and x["mirror"] == y["mirror"]
+        assert x["S"] * x["polarity"] > 0
     assert np.allclose(ca[0]["T"], np.eye(4), atol=1e-6) and ca[0]["polarity"] == 1 and ca[0]["S"] > 0.5
 
 
@@ -71,12 +73,11 @@ def test_forced_polarity(pair):
         search(*pair["mri"], *pair["oct"], FAST, "cpu", polarity=2)
 
 
-@pytest.mark.parametrize("mirror", [False, True])
-def test_refiner_score_negates(pair, mirror):
+def test_refiner_score_negates(pair):
     a, b = BaseGrid(pair["mri"], pair["oct"], "cpu"), BaseGrid(pair["mri"], swap(pair["oct"]), "cpu")
     c = torch.as_tensor(a.c, dtype=torch.float32)
     f = lambda *v: torch.tensor(v, dtype=torch.float32)
-    T = compose(f(0.03, -0.02, 0.04), c + f(0.2, -0.1, 0.3), f(0.02, 0.0, -0.03), f(0.01, 0.0, 0.02), c, mirror)
+    T = compose(f(0.03, -0.02, 0.04), c + f(0.2, -0.1, 0.3), f(0.02, 0.0, -0.03), f(0.01, 0.0, 0.02), c)
     S, S_b, S_neg = a.score(T, 1).item(), b.score(T, 1).item(), a.score(T, -1).item()
     assert abs(S + S_b) < TOL and S_neg == S_b
-    assert mirror or S > 0.5
+    assert S > 0.5

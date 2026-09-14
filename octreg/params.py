@@ -26,7 +26,7 @@ class Params:
     flatten_sigma_mm: float = 10.0            # Gaussian sigma of the local foreground mean used for flattening
     sigmoid_std: float = 0.25                 # p = sigmoid((I - t) / (sigmoid_std * std of foreground values))
     # orientation search (step 4)
-    n_rot: int = 8000                         # uniform rotations, R[0] = identity; each is also searched mirrored
+    n_rot: int = 8000                         # uniform rotations, R[0] = identity (no mirror: handedness from the file frames)
     seed: int = 0                             # rotation set seed
     topk: int = 24                            # poses kept after non-maximum suppression, each one refined
     nms_mm: float = 3.0                       # same pose if centres closer than nms_mm ...
