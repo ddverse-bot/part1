@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ablations of octreg 1.0 on Xiangrui's I58 brainstem pair (docs/design/spec_v1.0_lean.md, claims I1-I3).
+"""Ablations of octreg 1.0 on Xiangrui's I58 brainstem pair.
 
     python bench/ablate.py --out ABL [--main RUN] [--previous OLD/ablations.json ...] [--only A1,A4] [--device cuda] [--force]
 

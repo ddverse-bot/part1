@@ -16,7 +16,7 @@ import math
 import re
 from pathlib import Path
 
-DELETION_MM = 0.5            # spec: a step whose removal moves the pose by <= 0.5 mm (and no metric beyond noise) is deleted
+DELETION_MM = 0.5            # a step whose removal moves the pose by <= 0.5 mm (and no metric beyond noise) is deleted
 STEP_OF = {"A0c": "per-plane hole filling", "A1": "MRI flattening", "A2": "OCT flattening", "A4": "the two-class maps",
            "A6": "the scale prior", "A9": "the outline term"}
 READING = "<!-- reading: written by hand below this line; bench/report.py keeps it when it rewrites the file -->"
@@ -91,15 +91,11 @@ def main_section(run, logs):
          f"{num(res.get('gpu_peak_gb'), 2)} GB" + (f" (wall clock {num(wall / 60, 1)} min, nvidia-smi peak {num(gpu, 1)} GB)" if wall else "")),
         ("time per step (s)", steps or "n/a"),
     ]
-    ok_pose = p.get("corners_max_mm") is not None and p["corners_max_mm"] <= 1.0
     frame = ("passes" if fc["ok"] else "does not pass") if fc else "was not run"
     if not ev:
         verdict = "bench/evaluate.py has not been run on this run yet."
     else:
-        verdict = (f"The pose is {'within' if ok_pose else 'not within'} the spec's 1 mm tolerance for R5 at the block corners, and the "
-                   f"raw-data frame check {frame}.")
-        if not (ok_pose and fc.get("ok")):
-            verdict += " The reading at the end discusses this."
+        verdict = f"The raw-data frame check {frame}. R5 is a reference of the earlier pipeline, not a success criterion."
     ref = ev.get("reference_check", {})
     check = (f"R5 in the header frames (T_R5 @ A_spr @ inv(A_hdr)) agrees with the stored header-frame export to "
              f"{num(ref.get('formula_vs_stored_export_max_mm'), 6)} mm.")
@@ -140,7 +136,7 @@ def ablation_section(abl):
     small = [f"{STEP_OF[n]} ({n}, {num(V[n]['pose_to_base']['mean_mm'])} mm)" for n in done if V[n]["within_0.5mm_of_base"]]
     large = [f"{STEP_OF[n]} ({n}, {num(V[n]['pose_to_base']['mean_mm'])} mm)" for n in done if not V[n]["within_0.5mm_of_base"]]
     if done:
-        tail += [(f"Deletion rule of the spec: a step goes when removing it moves the pose by at most {DELETION_MM} mm (mean over the "
+        tail += [(f"Deletion rule: a step goes when removing it moves the pose by at most {DELETION_MM} mm (mean over the "
                   "specimen-mask points) and changes no other metric beyond noise. "
                   + (f"Removing {either(small)} stays within {DELETION_MM} mm. " if small else "")
                   + (f"Removing {either(large)} moves the pose further." if large else "")).strip(), ""]

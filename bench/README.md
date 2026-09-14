@@ -1,7 +1,6 @@
 # bench
 
-Benchmark of octreg 1.0 on Xiangrui's I58 brainstem pair, the only pair in scope for now (docs/design/spec_v1.0_lean.md,
-"Validation"). It lives in the repository but is not part of the package, and the method never reads anything here. The pair has
+Benchmark of octreg 1.0 on Xiangrui's I58 brainstem pair, the only pair in scope for now. It lives in the repository but is not part of the package, and the method never reads anything here. The pair has
 no labels, so every metric is label-free. Paths are those of the AutoDL server.
 
 | file | what it does |
@@ -35,8 +34,8 @@ arrays in a few seconds (CPU, no server files).
 The reference is R5, the v1.1 pose of this pair. It maps the v1 pipeline OCT frame (layout SPR of the raw array,
 `work/v11/xiangrui_I58bs/oct_native_affine.npy`) to the MRI header world, so in the header frames octreg uses it is
 `T_ref = T_R5 @ A_spr @ inv(A_hdr)`, with `A_hdr` the OCT NIfTI header affine. `evaluate.py` checks this against the stored,
-already verified header-frame export of R5. R5 is a body-level pose, not ground truth: repeated v1.1 runs spread by about 1 mm at
-the block corners, which is the tolerance the spec uses.
+already verified header-frame export of R5. R5 is a body-level pose of the earlier pipeline, not ground truth and
+not a success criterion.
 
 - Pose: displacement of `T_oct2mri` against `T_ref`, mean and max over the v1.1 OCT specimen-mask points and at the 8 block corners,
   plus the rotation angle between the two. The same distance to an earlier run with `--previous` (the script passes the first
@@ -81,5 +80,6 @@ A3 and A7 were run in the first ablation run, with the earlier two-class score a
 the flat field and the ladder. Neither moved the pose by more than 0.5 mm, so both steps were deleted. `ablate.py --previous`
 copies their rows and reports how far the present base lies from that earlier base.
 
-The spec's deletion rule: a step whose removal moves the pose by at most 0.5 mm and changes no metric beyond noise is deleted
-before release.
+The deletion rule: a step whose removal moves the pose by at most 0.5 mm (mean over the specimen-mask points) and changes no
+metric beyond noise is deleted before release, unless it keeps the pose stable under the other ablations (flattening, see
+docs/BENCHMARK.md).

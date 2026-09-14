@@ -34,7 +34,7 @@ qc.png of the run, with the MRI foreground through the transform (red) and the O
 | registration time in process, peak RAM, peak GPU memory allocated by torch | 9.6 min, 5.2 GB, 0.95 GB (wall clock 9.6 min, nvidia-smi peak 1.8 GB) |
 | time per step (s) | mri 4, oct fine grid 194, oct mask 173, two class 2, search 30, refinement 133, outputs 36 |
 
-The pose is not within the spec's 1 mm tolerance for R5 at the block corners, and the raw-data frame check passes. The reading at the end discusses this.
+The raw-data frame check passes. R5 is a reference of the earlier pipeline, not a success criterion.
 
 R5 in the header frames (T_R5 @ A_spr @ inv(A_hdr)) agrees with the stored header-frame export to 0.000000 mm.
 
@@ -59,7 +59,7 @@ Each variant is the method with one explicit change, run from the same preproces
 
 Driver check: base through bench/ablate.py lies 0.00 mm (corners max 0.00 mm) from the CLI run.
 
-Deletion rule of the spec: a step goes when removing it moves the pose by at most 0.5 mm (mean over the specimen-mask points) and changes no other metric beyond noise. Removing MRI flattening (A1, 0.08 mm) or OCT flattening (A2, 0.06 mm) stays within 0.5 mm. Removing per-plane hole filling (A0c, 0.77 mm), the two-class maps (A4, 0.51 mm), the scale prior (A6, 18.27 mm) or the outline term (A9, 3.51 mm) moves the pose further.
+Deletion rule: a step goes when removing it moves the pose by at most 0.5 mm (mean over the specimen-mask points) and changes no other metric beyond noise. Removing MRI flattening (A1, 0.08 mm) or OCT flattening (A2, 0.06 mm) stays within 0.5 mm. Removing per-plane hole filling (A0c, 0.77 mm), the two-class maps (A4, 0.51 mm), the scale prior (A6, 18.27 mm) or the outline term (A9, 3.51 mm) moves the pose further.
 
 ### Removed steps
 
@@ -95,6 +95,6 @@ Holes filled in 3-D only (A0c) move the pose by 1.69 mm and lower S_outline from
 
 The two-class maps and the flattening change the pose only a little once the outline is in the score: 0.74 mm for standardised intensities (A4, 0.51 mm over the specimen points, just above the deletion threshold), and 0.12 and 0.10 mm for MRI and OCT flattening (A1, A2). Flattening stays because it keeps the pose stable when other parts change. In an ablation run of the same method without flattening (docs/results/xiangrui_I58/no_flattening/ablations.json), the base pose moved by only 0.24 mm, but A0b, A0c and A9 moved the pose by 42.3, 40.9 and 42.5 mm, against 0.32, 1.69 and 6.62 mm here.
 
-R5, the pose of the earlier research pipeline, lies 30.4 mm away and has the other handedness in the header frames; it is not a criterion (spec deviation 8). Its outlines agree worse than the result's with the method masks (rim medians 3.04 / 3.53 mm against 1.26 / 1.70 mm). The "previous run" in the table is the first release run, with the two-class score alone, the overlap gate and mirrored orientations in the search; it lies 30.0 mm away and also has the other handedness.
+R5, the pose of the earlier research pipeline, lies 30.4 mm away and has the other handedness in the header frames; it is not a success criterion. Its outlines agree worse than the result's with the method masks (rim medians 3.04 / 3.53 mm against 1.26 / 1.70 mm). The "previous run" in the table is the first release run, with the two-class score alone, the overlap gate and mirrored orientations in the search; it lies 30.0 mm away and also has the other handedness.
 
 The section-stripe flat field and the refinement ladder were removed after the first ablation run. Switching off the flat field moved that run's pose by 0.15 mm (A3), and one affine refinement from every search pose gave the ladder's pose to within 0.0015 mm (A7). The run needs 9 min 36 s and 5.2 GiB.

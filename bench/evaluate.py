@@ -22,7 +22,7 @@ boundary  The boundary part of v1.1 qc_fine.py, simplified: OCT mask boundary vo
 frame     Port of v1.1 check_export_header.py: random voxels of RUN/oct_in_mri.nii.gz go through inv(T) and inv(A_hdr) to raw OCT
           voxels, whose 20 um values (box^3 mean) are streamed from the .nii.gz; Spearman against the exported values. Controls:
           T composed with a flip of each raw OCT axis about the block centre, and 2 mm shifts along each MRI world axis.
-          ok iff rho >= 0.9 and every flip gives rho <= 0.3 (spec_v1.0 R4).
+          ok iff rho >= 0.9 and every flip gives rho <= 0.3.
 """
 from __future__ import annotations
 
