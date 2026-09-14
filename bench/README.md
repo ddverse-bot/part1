@@ -8,8 +8,9 @@ no labels, so every metric is label-free. Paths are those of the AutoDL server.
 |---|---|
 | `run_xiangrui.sh` | runs the steps below from `/root/autodl-tmp/octreg1`, detached-friendly, logs next to the run dir |
 | `evaluate.py` | pose against the reference R5, OCT mask volume and Dice, boundary agreement, raw-data frame check |
-| `ablate.py` | preprocessing once, then the variants base and A0-A6, one JSON table |
+| `ablate.py` | preprocessing once, then the variants base and A0-A9, one JSON table |
 | `report.py` | writes `docs/BENCHMARK.md` and the two figures in `docs/figures/` from the outputs |
+| `compose_pair.py` | two `octreg qc` outputs of one run side by side (`docs/figures/fig_handedness_xiangrui.png`) |
 
 ## Running
 
@@ -59,21 +60,24 @@ Masks come from `ablate.py` (`final/ablate/prep/texture/`), so `evaluate` report
 | base | the method (default Params) through the ablation driver |
 | A0 | OCT intensity foreground (histogram valley) instead of the texture specimen mask |
 | A0b | the v1.1 rim-watershed specimen mask as the OCT mask (also written to `prep/v11_mask.nii.gz` for `--oct-mask`) |
+| A0c | the texture mask with holes filled in 3-D only instead of in every array plane |
 | A1, A2 | MRI flattening off, OCT flattening off (`two_class(..., flatten=False)`) |
 | A4 | standardised intensity channels (z, -z) instead of two-class maps |
-| A5+1, A5-1 | polarity forced to +1 or -1 instead of the sign of the best score (`align(..., polarity=...)`) |
+| A5+1, A5-1 | polarity forced to +1 or -1 instead of the sign of the two-class score (`align(..., polarity=...)`) |
 | A6 | no scale prior: lambda 0 and clamp 1.0 instead of 2 and 0.15 |
+| A8 | the other handedness: the OCT world mirrored (z negated) before search and refinement |
+| A9 | no outline term: the outline weight set to the specimen mask, on which the mask is constant, so S_outline = 0 |
 | A3, A7 | removed steps (section-stripe flat field; rigid, similarity and affine ladder), rows copied from the first ablation run |
 
 `Params` holds method constants only. Each variant is one explicit change passed to the package functions the method itself
 uses (`register.fine_mask`, `preprocess.two_class`, `register.align`), so the method has no ablation switches. The OCT is
-streamed once and each OCT mask source (texture, intensity, v11mask) is computed once and cached under `ablate/prep/`. The
+streamed once and each OCT mask source (texture, texture3d, intensity, v11mask) is computed once and cached under `ablate/prep/`. The
 driver's base run is compared with the CLI run ("driver check", expected at float precision). Pose changes are measured
 against base. The boundary agreement of every variant uses the base masks, so it reflects the pose only. A variant that makes
-the method refuse (for example no admissible pose) is recorded as failed with the message. Finished variants are reused on a
+the method refuse is recorded as failed with the message. Finished variants are reused on a
 rerun unless `--force` is given.
 
-A3 and A7 were run in the first ablation run (`/root/autodl-tmp/bench_runs/xiangrui_I58/ablate`), against a base that still had
+A3 and A7 were run in the first ablation run, with the earlier two-class score and overlap gate, (`/root/autodl-tmp/bench_runs/xiangrui_I58/ablate`), against a base that still had
 the flat field and the ladder. Neither moved the pose by more than 0.5 mm, so both steps were deleted. `ablate.py --previous`
 copies their rows and reports how far the present base lies from that earlier base.
 

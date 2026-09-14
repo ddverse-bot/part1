@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 DELETION_MM = 0.5            # spec: a step whose removal moves the pose by <= 0.5 mm (and no metric beyond noise) is deleted
-STEP_OF = {"A1": "MRI flattening", "A2": "OCT flattening", "A6": "the scale prior"}
+STEP_OF = {"A0c": "per-plane hole filling", "A4": "the two-class maps", "A6": "the scale prior", "A9": "the outline term"}
 READING = "<!-- reading: written by hand below this line; bench/report.py keeps it when it rewrites the file -->"
 
 
@@ -143,14 +143,16 @@ def ablation_section(abl):
                   "specimen-mask points) and changes no other metric beyond noise. "
                   + (f"Removing {either(small)} stays within {DELETION_MM} mm. " if small else "")
                   + (f"Removing {either(large)} moves the pose further." if large else "")).strip(), ""]
-    rm = abl.get("removed_steps")
-    if rm and rm.get("rows"):
-        pb = rm["present_base_vs_previous_base"]
-        tail += ["### Removed steps", "", rm["note"], "", cols, "|---|---|---|---|---|---|---|---|---|---|---|"]
-        tail += [ablation_row(n, r) for n, r in rm["rows"].items()]
+    groups = [g for g in abl.get("removed_steps", []) if g.get("rows")]
+    if groups:
+        tail += ["### Removed steps", ""]
+    for g in groups:
+        pb = g["present_base_vs_previous_base"]
+        tail += [g["note"], "", cols, "|---|---|---|---|---|---|---|---|---|---|---|"]
+        tail += [ablation_row(n, r) for n, r in g["rows"].items()]
         tail += ["", f"The present base lies {num(pb['mean_mm'])} mm (corners mean {num(pb['corners_mean_mm'])} mm, corners max "
-                 f"{num(pb['corners_max_mm'])} mm, rotation "
-                 f"{num(pb['rotation_deg'], 2)} deg) from the base of that run. Source: {rm['source']}.", ""]
+                 f"{num(pb['corners_max_mm'])} mm, rotation {num(pb['rotation_deg'], 2)} deg) from the base of that run. "
+                 f"Source: {g['source']}.", ""]
     return head + rows + tail
 
 
@@ -171,10 +173,10 @@ def runtime_section(abl):
     return out
 
 
-SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A0c": "holes filled in 3-D only", "A8": "other handedness",
-         "A1": "MRI flattening off", "A2": "OCT flattening off",
-         "A3": "destripe off, ladder kept", "A4": "intensity channels", "A5+1": "polarity forced +1", "A5-1": "polarity forced -1",
-         "A6": "no scale prior", "A7": "ladder off, destripe kept"}
+SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A0c": "holes filled in 3-D only", "A1": "MRI flattening off",
+         "A2": "OCT flattening off", "A3": "destripe off, ladder kept", "A4": "intensity channels", "A5+1": "polarity forced +1",
+         "A5-1": "polarity forced -1", "A6": "no scale prior", "A7": "ladder off, destripe kept", "A8": "other handedness",
+         "A9": "no outline term"}
 
 
 def figures(run, abl, out):
@@ -187,7 +189,8 @@ def figures(run, abl, out):
     x0, y0, x1, y1 = ImageOps.invert(qc).getbbox()
     qc.crop((max(x0 - 8, 0), max(y0 - 8, 0), min(x1 + 8, qc.width), min(y1 + 8, qc.height))).save(out / "fig_qc_xiangrui.png", optimize=True)
     rows = [(n, r.get("pose_to_base", {}).get("corners_mean_mm"), r.get("error"), False) for n, r in abl["variants"].items() if n != "base"]
-    rows += [(n, r["pose_to_present_base"]["corners_mean_mm"], None, True) for n, r in abl.get("removed_steps", {}).get("rows", {}).items()]
+    rows += [(n, r["pose_to_present_base"]["corners_mean_mm"], None, True) for g in abl.get("removed_steps", [])
+             for n, r in g["rows"].items()]
     rows.sort(key=lambda r: math.inf if r[1] is None else r[1])
     lo, ink, grey = 1e-3, "#0b0b0b", "#52514e"
     fig = Figure(figsize=(7.6, 0.34 * len(rows) + 1.4))
@@ -205,7 +208,7 @@ def figures(run, abl, out):
     ax.set_xscale("log")
     ax.set_xlim(lo, 400)
     ax.set_ylim(-0.6, len(rows) + 0.2)
-    ax.set_yticks(range(len(rows)), [f"{n}  {SHORT.get(n, n)}" + ("  (first run)" if rm else "") for n, _, _, rm in rows], fontsize=8.5)
+    ax.set_yticks(range(len(rows)), [f"{n}  {SHORT.get(n, n)}" + ("  (removed)" if rm else "") for n, _, _, rm in rows], fontsize=8.5)
     ax.set_xlabel("pose change against the final pose, block-corner mean (mm)", fontsize=9)
     ax.tick_params(axis="x", labelsize=8, colors=grey)
     ax.tick_params(axis="y", length=0)
@@ -213,8 +216,8 @@ def figures(run, abl, out):
     ax.set_axisbelow(True)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
-    fig.text(0.02, 0.02, "Hatched: the two steps removed from the method, as variants of the first ablation run (one step off, the other\n"
-             "still on), measured against the final pose, which has neither.", fontsize=7, color=grey)
+    fig.text(0.02, 0.02, "Hatched: steps removed from the method, as variants of the ablation run that measured them, against the final\n"
+             "pose, which has none of them.", fontsize=7, color=grey)
     fig.savefig(out / "fig_ablation.png", dpi=150)
 
 

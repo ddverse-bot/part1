@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Ablations of octreg 1.0 on Xiangrui's I58 brainstem pair (docs/design/spec_v1.0_lean.md, claims I1-I3).
 
-    python bench/ablate.py --out ABL [--main RUN] [--previous OLD/ablations.json] [--only A1,A4] [--device cuda] [--force]
+    python bench/ablate.py --out ABL [--main RUN] [--previous OLD/ablations.json ...] [--only A4,A6] [--device cuda] [--force]
 
 Params holds method constants only, so every variant is the register steps run here with the package's own functions and one
-explicit change: another OCT mask (A0 the histogram valley of the OCT, A0b the stored v1.1 mask through the --oct-mask path),
-two_class(..., flatten=False) for one modality (A1, A2), standardised intensity channels built in this file (A4),
-align(..., polarity=+1 / -1) (A5), Params lam 0 and clamp 1 (A6), the texture mask with the 3-D hole filling of the first
-release (A0c), the OCT world mirrored so that the search and refinement see the other handedness (A8), or no outline term (A9). 'base' is the method
-through this driver; its distance to the CLI run (--main) is the driver check. The OCT is streamed once, each OCT mask is
-computed once and the MRI is prepared once.
+explicit change: another OCT mask (A0 the histogram valley of the OCT, A0b the stored v1.1 mask through the --oct-mask path,
+A0c the texture mask with the 3-D hole filling of the first release), standardised intensity channels built in this file (A4),
+align(..., polarity=+1 / -1) (A5), Params lam 0 and clamp 1 (A6), the OCT world mirrored so that the search and refinement see
+the other handedness (A8), or no outline term (A9). 'base' is the method through this driver; its distance to the CLI run
+(--main) is the driver check. The OCT is streamed once, each OCT mask is computed once and the MRI is prepared once.
 
-The section-stripe flat field (A3) and the rigid -> similarity -> affine ladder (A7) were removed after the first ablation run.
-Their rows are copied from that run's ablations.json (--previous); they were measured against that run's base, which still had
-both steps, and the pose change from that base to the present base is reported next to them.
+Removed steps (REMOVED) keep their rows from the ablation run that measured them (--previous, one ablations.json per group):
+the section-stripe flat field (A3) and the rigid -> similarity -> affine ladder (A7) from the first run, MRI and OCT flattening
+(A1, A2) from the run with the outline score. Each was measured against the base of its run, which still had the step, and the
+pose change from that base to the present base is reported next to them.
 
 Metrics from bench/evaluate.py: pose to base and to R5, boundary agreement with the base masks for every variant (so it reflects
 the pose only), OCT mask volume and Dice against the v1.1 mask per mask source.
@@ -48,8 +48,6 @@ VARIANTS = {    # name: (what changes, the explicit change: mask source, solve()
     "A0": ("OCT intensity foreground (histogram valley) instead of the texture specimen mask", {"mask": "intensity"}),
     "A0b": ("v1.1 rim-watershed specimen mask given as the OCT mask", {"mask": "v11mask"}),
     "A0c": ("texture specimen mask with holes filled in 3-D only (method: in every array plane)", {"mask": "texture3d"}),
-    "A1": ("MRI flattening off", {"mri_flatten": False}),
-    "A2": ("OCT flattening off", {"oct_flatten": False}),
     "A4": ("standardised intensity channels (z, -z) instead of two-class maps", {"features": "intensity"}),
     "A5+1": ("polarity forced +1", {"polarity": 1}),
     "A5-1": ("polarity forced -1", {"polarity": -1}),
@@ -58,10 +56,16 @@ VARIANTS = {    # name: (what changes, the explicit change: mask source, solve()
     "A9": ("no outline term: the outline weight set to the specimen mask, so S_outline = 0 and S = 2 S_class / 3", {"outline": False}),
 }
 MIRROR = np.diag([1.0, 1.0, -1.0, 1.0])
-REMOVED = {"A3": "section-stripe flat field", "A7": "rigid -> similarity -> affine ladder"}
-REMOVED_NOTE = ("Copied from the first ablation run, whose base still had the section-stripe flat field and the ladder, so pose "
-                "changes in these rows are against that base. Removing either step moved the pose by less than the 0.5 mm deletion "
-                "threshold and both were deleted; the present base has neither.")
+REMOVED = [    # groups of removed steps, each measured in one earlier ablation run
+    {"step": {"A3": "section-stripe flat field", "A7": "rigid -> similarity -> affine ladder"},
+     "note": "Copied from the first ablation run, whose base still had the section-stripe flat field and the ladder (and the "
+             "earlier score, two-class maps under an overlap gate), so pose changes in these rows are against that base. Removing "
+             "either step moved the pose by less than the 0.5 mm deletion threshold and both were deleted."},
+    {"step": {"A1": "MRI flattening", "A2": "OCT flattening"},
+     "note": "Copied from the ablation run of the outline score, whose base still divided both volumes by their local foreground "
+             "mean (Gaussian sigma 10 mm) before the two-class maps, so pose changes in these rows are against that base. Removing "
+             "either moved the pose by less than the 0.5 mm deletion threshold and both were deleted."},
+]
 
 
 def peak_rss_gb():
@@ -129,25 +133,24 @@ def prepare(out, sources):
         print(f"OCT mask '{s}' in {time.time() - t1:.0f} s", flush=True)
 
 
-def standardised(arr, mask, h, P):
-    """A4 map: z = (x - mean) / std over the foreground values clipped at p99.5, x = pp.flattened(arr) blurred with sigma one
-    voxel, i.e. pp.two_class without its Otsu threshold and sigmoid. -> float32 [D, H, W]."""
-    x = ndimage.gaussian_filter(pp.flattened(arr, mask, h, P), 1.0)
+def standardised(arr, mask):
+    """A4 map: z = (x - mean) / std over the foreground values clipped at p99.5, x = arr blurred with sigma one voxel, i.e.
+    pp.two_class without its Otsu threshold and sigmoid. -> float32 [D, H, W]."""
+    x = ndimage.gaussian_filter(np.asarray(arr, np.float32), 1.0)
     vals = np.minimum(x[mask], np.percentile(x[mask], 99.5))
     return ((x - float(vals.mean())) / float(vals.std())).astype(np.float32)
 
 
-def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0, mirror=False, outline=True):
+def solve(o, m, P, device, features="two_class", polarity=0, mirror=False, outline=True):
     """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls.
     mirror: search and refine against the OCT world mirrored by MIRROR, poses returned in the OCT header world (det < 0).
     outline False: the outline weight is the specimen mask itself, on which the mask is constant, so S_outline is 0."""
-    h = P.base_mm
     if features == "intensity":
-        z_o, z_m = standardised(o["arr"], o["mask"], h, P), standardised(m["arr"], m["mask"], h, P)
+        z_o, z_m = standardised(o["arr"], o["mask"]), standardised(m["arr"], m["mask"])
         u, w, v = np.stack([z_o, -z_o]), o["mask"].astype(np.float32), np.stack([z_m, -z_m]) * m["mask"]
     else:
-        u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], h, P, flatten=oct_flatten), o["mask"])
-        v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], h, P, flatten=mri_flatten), m["mask"])
+        u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], P), o["mask"])
+        v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], P), m["mask"])
     F, q = MIRROR if mirror else np.eye(4), o["valid"] if outline else o["mask"]
     poses, info = align((u, w, q, F @ o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
     return [{**p, "T": p["T"] @ F} for p in poses], info
@@ -194,7 +197,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--main", type=Path, default=None, help="CLI run dir (T_oct2mri.txt) for the driver check")
-    ap.add_argument("--previous", type=Path, default=None, help="ablations.json of the first ablation run (rows A3 and A7)")
+    ap.add_argument("--previous", type=Path, nargs="*", default=[], help="ablations.json of the runs that measured the removed steps")
     ap.add_argument("--only", default=None, help=f"comma-separated subset of {','.join(VARIANTS)} (base is always run)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--force", action="store_true", help="recompute variants that already have a result (delete OUT/prep to redo "
@@ -203,7 +206,7 @@ def main():
     names = ["base"] + [n for n in (a.only.split(",") if a.only else VARIANTS) if n != "base"]
     if set(names) - set(VARIANTS):
         ap.error(f"unknown variants {sorted(set(names) - set(VARIANTS))}")
-    for path, need in ((a.main, "T_oct2mri.txt"), (a.previous, "")):
+    for path, need in ((a.main, "T_oct2mri.txt"), *((p, "") for p in a.previous)):
         if path and not (path / need if need else path).exists():
             ap.error(f"{path} has no {need or 'file'}")
     t0 = time.time()
@@ -234,12 +237,17 @@ def main():
     res = {"pair": "Xiangrui I58 brainstem", "oct": E.OCT, "mri": E.MRI, "params_hash": Params().hash(),
            "prep": {s: json.loads((a.out / "prep" / s / "prep.json").read_text()) for s in sources + ["mri"]},
            "variants": table, "seconds": time.time() - t0, "peak_rss_gb": peak_rss_gb()}
-    if a.previous:
-        prev = json.loads(a.previous.read_text())
-        rows = {n: {**prev["variants"][n], "pose_to_present_base": E.pose(np.array(prev["variants"][n]["T_oct2mri"]), T_base, pts, cor)}
-                for n in REMOVED if n in prev["variants"] and "error" not in prev["variants"][n]}
-        res["removed_steps"] = {"source": a.previous, "note": REMOVED_NOTE, "step": REMOVED, "rows": rows,
-                                "present_base_vs_previous_base": E.pose(T_base, np.array(prev["variants"]["base"]["T_oct2mri"]), pts, cor)}
+    res["removed_steps"] = []
+    for path in a.previous:
+        prev = json.loads(path.read_text())
+        for group in REMOVED:
+            rows = {n: {**prev["variants"][n], "pose_to_present_base": E.pose(np.array(prev["variants"][n]["T_oct2mri"]), T_base, pts,
+                                                                              cor)}
+                    for n in group["step"] if n in prev["variants"] and "error" not in prev["variants"][n]}
+            if rows:
+                T_prev = np.array(prev["variants"]["base"]["T_oct2mri"])
+                res["removed_steps"].append({**group, "source": path, "rows": rows,
+                                             "present_base_vs_previous_base": E.pose(T_base, T_prev, pts, cor)})
     if a.main:
         T_main = E.load_T(a.main / "T_oct2mri.txt")
         res["driver_check"] = {"main_run": a.main, "base_vs_main": E.pose(T_base, T_main, pts, cor),

@@ -23,7 +23,6 @@ class Params:
     texture_smooth_mm: float = 1.2            # Gaussian sigma of the log texture field before its two-class (Otsu) threshold
     texture_close_mm: float = 0.48            # closing radius of the specimen mask
     # two-class maps (step 3)
-    flatten_sigma_mm: float = 10.0            # Gaussian sigma of the local foreground mean used for flattening
     sigmoid_std: float = 0.25                 # p = sigmoid((I - t) / (sigmoid_std * std of foreground values))
     # orientation search (step 4)
     n_rot: int = 8000                         # uniform rotations, R[0] = identity (no mirror: handedness from the file frames)

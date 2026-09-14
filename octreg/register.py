@@ -60,8 +60,8 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
     del fine
     lap("oct_mask")
     # step 3: two-class maps (innovation 2)
-    u, w = pp.oct_channels(pp.two_class(oct_h, mask_o, h, P), mask_o)
-    v = pp.mri_channels(pp.two_class(mri_h, mask_m, h, P), mask_m)
+    u, w = pp.oct_channels(pp.two_class(oct_h, mask_o, P), mask_o)
+    v = pp.mri_channels(pp.two_class(mri_h, mask_m, P), mask_m)
     lap("two_class")
     # steps 4-5: orientation search in the crop and affine refinement (innovation 3)
     poses, info = align((u, w, valid_o, A_o), (v, mask_m, A_m), P, device)
