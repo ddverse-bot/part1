@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Ablations of octreg 1.0 on Xiangrui's I58 brainstem pair (docs/design/spec_v1.0_lean.md, claims I1-I3).
 
-    python bench/ablate.py --out ABL [--main RUN] [--previous OLD/ablations.json ...] [--only A4,A6] [--device cuda] [--force]
+    python bench/ablate.py --out ABL [--main RUN] [--previous OLD/ablations.json ...] [--only A1,A4] [--device cuda] [--force]
 
 Params holds method constants only, so every variant is the register steps run here with the package's own functions and one
 explicit change: another OCT mask (A0 the histogram valley of the OCT, A0b the stored v1.1 mask through the --oct-mask path,
-A0c the texture mask with the 3-D hole filling of the first release), standardised intensity channels built in this file (A4),
+A0c the texture mask with the 3-D hole filling of the first release), two_class(..., flatten=False) for one modality (A1, A2),
+standardised intensity channels built in this file (A4),
 align(..., polarity=+1 / -1) (A5), Params lam 0 and clamp 1 (A6), the OCT world mirrored so that the search and refinement see
 the other handedness (A8), or no outline term (A9). 'base' is the method through this driver; its distance to the CLI run
 (--main) is the driver check. The OCT is streamed once, each OCT mask is computed once and the MRI is prepared once.
 
 Removed steps (REMOVED) keep their rows from the ablation run that measured them (--previous, one ablations.json per group):
-the section-stripe flat field (A3) and the rigid -> similarity -> affine ladder (A7) from the first run, MRI and OCT flattening
-(A1, A2) from the run with the outline score. Each was measured against the base of its run, which still had the step, and the
-pose change from that base to the present base is reported next to them.
+the section-stripe flat field (A3) and the rigid -> similarity -> affine ladder (A7) from the first run. Each was measured
+against the base of its run, which still had the step, and the pose change from that base to the present base is reported
+next to them.
 
 Metrics from bench/evaluate.py: pose to base and to R5, boundary agreement with the base masks for every variant (so it reflects
 the pose only), OCT mask volume and Dice against the v1.1 mask per mask source.
@@ -48,6 +49,8 @@ VARIANTS = {    # name: (what changes, the explicit change: mask source, solve()
     "A0": ("OCT intensity foreground (histogram valley) instead of the texture specimen mask", {"mask": "intensity"}),
     "A0b": ("v1.1 rim-watershed specimen mask given as the OCT mask", {"mask": "v11mask"}),
     "A0c": ("texture specimen mask with holes filled in 3-D only (method: in every array plane)", {"mask": "texture3d"}),
+    "A1": ("MRI flattening off", {"mri_flatten": False}),
+    "A2": ("OCT flattening off", {"oct_flatten": False}),
     "A4": ("standardised intensity channels (z, -z) instead of two-class maps", {"features": "intensity"}),
     "A5+1": ("polarity forced +1", {"polarity": 1}),
     "A5-1": ("polarity forced -1", {"polarity": -1}),
@@ -61,10 +64,6 @@ REMOVED = [    # groups of removed steps, each measured in one earlier ablation 
      "note": "Copied from the first ablation run, whose base still had the section-stripe flat field and the ladder (and the "
              "earlier score, two-class maps under an overlap gate), so pose changes in these rows are against that base. Removing "
              "either step moved the pose by less than the 0.5 mm deletion threshold and both were deleted."},
-    {"step": {"A1": "MRI flattening", "A2": "OCT flattening"},
-     "note": "Copied from the ablation run of the outline score, whose base still divided both volumes by their local foreground "
-             "mean (Gaussian sigma 10 mm) before the two-class maps, so pose changes in these rows are against that base. Removing "
-             "either moved the pose by less than the 0.5 mm deletion threshold and both were deleted."},
 ]
 
 
@@ -133,24 +132,25 @@ def prepare(out, sources):
         print(f"OCT mask '{s}' in {time.time() - t1:.0f} s", flush=True)
 
 
-def standardised(arr, mask):
-    """A4 map: z = (x - mean) / std over the foreground values clipped at p99.5, x = arr blurred with sigma one voxel, i.e.
-    pp.two_class without its Otsu threshold and sigmoid. -> float32 [D, H, W]."""
-    x = ndimage.gaussian_filter(np.asarray(arr, np.float32), 1.0)
+def standardised(arr, mask, h, P):
+    """A4 map: z = (x - mean) / std over the foreground values clipped at p99.5, x = pp.flattened(arr) blurred with sigma one
+    voxel, i.e. pp.two_class without its Otsu threshold and sigmoid. -> float32 [D, H, W]."""
+    x = ndimage.gaussian_filter(pp.flattened(arr, mask, h, P), 1.0)
     vals = np.minimum(x[mask], np.percentile(x[mask], 99.5))
     return ((x - float(vals.mean())) / float(vals.std())).astype(np.float32)
 
 
-def solve(o, m, P, device, features="two_class", polarity=0, mirror=False, outline=True):
+def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0, mirror=False, outline=True):
     """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls.
     mirror: search and refine against the OCT world mirrored by MIRROR, poses returned in the OCT header world (det < 0).
     outline False: the outline weight is the specimen mask itself, on which the mask is constant, so S_outline is 0."""
+    h = P.base_mm
     if features == "intensity":
-        z_o, z_m = standardised(o["arr"], o["mask"]), standardised(m["arr"], m["mask"])
+        z_o, z_m = standardised(o["arr"], o["mask"], h, P), standardised(m["arr"], m["mask"], h, P)
         u, w, v = np.stack([z_o, -z_o]), o["mask"].astype(np.float32), np.stack([z_m, -z_m]) * m["mask"]
     else:
-        u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], P), o["mask"])
-        v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], P), m["mask"])
+        u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], h, P, flatten=oct_flatten), o["mask"])
+        v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], h, P, flatten=mri_flatten), m["mask"])
     F, q = MIRROR if mirror else np.eye(4), o["valid"] if outline else o["mask"]
     poses, info = align((u, w, q, F @ o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
     return [{**p, "T": p["T"] @ F} for p in poses], info

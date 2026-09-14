@@ -17,7 +17,8 @@ import re
 from pathlib import Path
 
 DELETION_MM = 0.5            # spec: a step whose removal moves the pose by <= 0.5 mm (and no metric beyond noise) is deleted
-STEP_OF = {"A0c": "per-plane hole filling", "A4": "the two-class maps", "A6": "the scale prior", "A9": "the outline term"}
+STEP_OF = {"A0c": "per-plane hole filling", "A1": "MRI flattening", "A2": "OCT flattening", "A4": "the two-class maps",
+           "A6": "the scale prior", "A9": "the outline term"}
 READING = "<!-- reading: written by hand below this line; bench/report.py keeps it when it rewrites the file -->"
 
 

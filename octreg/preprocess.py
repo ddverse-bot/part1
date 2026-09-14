@@ -156,14 +156,25 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
 
 
 # ----------------------------------------------------------------------------- two-class maps and channels (innovation 2)
-def two_class(arr, mask, params: Params = Params()):
-    """Soft two-class map, one rule for OCT and MRI: x = arr blurred with sigma one voxel; foreground values clipped at p99.5 give
-    the Otsu threshold t and std s; p = sigmoid((x - t) / (sigmoid_std s)), 1 = bright. arr: [D, H, W] positive intensities;
-    mask: bool or fraction [D, H, W] (> 0.5 = foreground). -> float32 [D, H, W] in [0, 1]."""
+def flattened(arr, mask, voxel_mm, params: Params = Params()):
+    """arr / its local foreground mean G(arr M) / G(M), Gaussian sigma flatten_sigma_mm on blocks of ~sigma / 4 voxels, linearly
+    interpolated (removes slow multiplicative intensity changes). arr: [D, H, W]; mask: bool [D, H, W]. -> float32."""
+    x, s = np.asarray(arr, np.float32), params.flatten_sigma_mm / voxel_mm
+    k = max(1, int(s // 4))
+    gn = ndimage.gaussian_filter(_pool(np.where(mask, x, 0).astype(np.float64), k), s / k)
+    gd = ndimage.gaussian_filter(_pool(mask.astype(np.float64), k), s / k)
+    return x / _upsample(np.divide(gn, gd, out=np.ones_like(gn), where=gd > 0), k, x.shape)
+
+
+def two_class(arr, mask, voxel_mm, params: Params = Params(), flatten=True):
+    """Soft two-class map, one rule for OCT and MRI: x = flattened(arr) (arr itself when flatten is False), blurred with sigma
+    one voxel; foreground values clipped at p99.5 give the Otsu threshold t and std s; p = sigmoid((x - t) / (sigmoid_std s)),
+    1 = bright. arr: [D, H, W] positive intensities; mask: bool or fraction [D, H, W] (> 0.5 = foreground); voxel_mm: spacing
+    (mm). -> float32 [D, H, W] in [0, 1]."""
     m = np.asarray(mask) > 0.5
     if not m.any():
         raise ValueError("two_class: empty foreground mask")
-    x = ndimage.gaussian_filter(np.asarray(arr, np.float32), 1.0)
+    x = ndimage.gaussian_filter(flattened(arr, m, voxel_mm, params) if flatten else np.asarray(arr, np.float32), 1.0)
     vals = np.minimum(x[m], np.percentile(x[m], 99.5))
     sd = float(vals.std())
     if not sd > 0:

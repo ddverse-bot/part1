@@ -6,14 +6,14 @@
 #
 # STEPS   in order; default "register evaluate". The whole benchmark is "register ablate evaluate report".
 #           register  python -m octreg register OCT MRI -o OUT
-#           ablate    bench/ablate.py: preprocessing once, variants A0-A9 -> ABL/ablations.json (removed steps copied from PREV)
+#           ablate    bench/ablate.py: preprocessing once, variants A0-A9 -> ABL/ablations.json (removed steps A3, A7 from PREV)
 #           evaluate  bench/evaluate.py OUT: pose to R5 and to PREV_MAIN, boundary with the v1.1 masks, raw-data frame check;
 #                     mask and boundary metrics with the method masks once ABL/prep/texture exists
 #           report    bench/report.py -> docs/BENCHMARK.md, docs/figures/fig_qc_xiangrui.png and fig_ablation.png
 # OUT     run dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/final/main); logs go to ${OUT}_logs next to it
 # ABL     ablation dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/final/ablate); DEVICE cuda | cpu (default cuda)
-# PREV    ablations.json files of the runs that measured the removed steps (space-separated): A3 and A7, A1 and A2
-#         (default BENCH/ablate/ablations.json and BENCH/rel3/ablate/ablations.json; missing files are skipped)
+# PREV    ablations.json files of the runs that measured the removed steps (space-separated): A3 and A7
+#         (default BENCH/ablate/ablations.json; missing files are skipped)
 # PREV_MAIN  an earlier CLI run dir for evaluate's pose distance (default /root/autodl-tmp/bench_runs/xiangrui_I58/main)
 # Every step writes NAME.log, NAME.time (wall time and peak RSS, GNU time wording) and NAME.gpu_mib (nvidia-smi every 5 s);
 # chain.log has one line per step. One heavy job at a time (62 GB container): refuses to start while another registration runs.
@@ -25,7 +25,7 @@ MRI=$DATA/I58_brainstem_MRI_cropped_to_OCT.nii.gz
 BENCH=/root/autodl-tmp/bench_runs/xiangrui_I58
 OUT=${OUT:-$BENCH/final/main}
 ABL=${ABL:-$BENCH/final/ablate}
-PREV=${PREV:-$BENCH/ablate/ablations.json $BENCH/rel3/ablate/ablations.json}
+PREV=${PREV:-$BENCH/ablate/ablations.json}
 PREV_MAIN=${PREV_MAIN:-$BENCH/main}
 LOGS=${OUT}_logs
 STEPS=${STEPS:-register evaluate}

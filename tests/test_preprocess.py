@@ -1,5 +1,5 @@
 """preprocess: histogram-valley status, isotropic-texture specimen mask against the intensity rule (and chunk invariance),
-per-plane hole filling, gain invariance and the channel pairs."""
+flattening, gain invariance and the channel pairs."""
 import dataclasses
 
 import numpy as np
@@ -64,16 +64,25 @@ def _classes(seed, n=96):
     return img.astype(np.float32), truth, _ball(n, (n / 2 - 0.5,) * 3, 0.48 * n)
 
 
-def test_two_class_classes_and_gain_invariance():
-    img, truth, mask = _classes(1, 64)
-    p = pp.two_class(img, mask, P)
-    assert p.dtype == np.float32 and 0 <= p.min() and p.max() <= 1 and ((p > 0.5) == truth)[mask].mean() > 0.9
-    np.testing.assert_allclose(pp.two_class(img * 100, mask, P), p, atol=1e-5)
+def test_flattening_removes_linear_bias():
+    img, truth, mask = _classes(0)
+    biased = img * (1 + 0.6 * (np.arange(96) - 47.5) / 47.5)[None, None, :].astype(np.float32)
+    acc = lambda p: ((p > 0.5) == truth)[mask].mean()
+    flat = acc(pp.two_class(biased, mask, 0.6, P))
+    assert flat > 0.9 and flat > acc(pp.two_class(biased, mask, 0.6, P, flatten=False)) + 0.1
+
+
+@pytest.mark.parametrize("flatten", [True, False])
+def test_gain_invariance(flatten):
+    img, _, mask = _classes(1, 64)
+    p = pp.two_class(img, mask, 0.6, P, flatten)
+    assert p.dtype == np.float32 and 0 <= p.min() and p.max() <= 1
+    np.testing.assert_allclose(pp.two_class(img * 100, mask, 0.6, P, flatten), p, atol=1e-5)
 
 
 def test_channels():
     img, _, mask = _classes(2, 32)
-    p = pp.two_class(img, mask, P)
+    p = pp.two_class(img, mask, 0.6, P)
     u, w = pp.oct_channels(p, mask)
     v = pp.mri_channels(p, mask)
     assert u.shape == v.shape == (2, 32, 32, 32) and u.dtype == v.dtype == w.dtype == np.float32
