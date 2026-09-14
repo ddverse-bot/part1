@@ -41,28 +41,34 @@ flags, boundary agreement of the two foreground outlines when the OCT block has 
 
 | claim | ablation | must show |
 |---|---|---|
-| I1 two-class maps | intensity channels instead (A4); MRI flattening off (A1); OCT flattening off (A2) | two-class needed on >= 2 pairs; each flattening kept only if it matters |
-| I2 polarity as sign | fixed polarity = +1 and = -1 (A5) | sign rule picks the better of the two on every pair in one pass |
-| I3 search + prior ladder | no scale prior (A6); direct affine without ladder (A7); prior centre offset 5 / 10 mm (A8) | prior prevents degenerate scales; ladder needed; crop position need not be precise |
+| I1 two-class maps | intensity channels instead (A4); MRI flattening off (A1); OCT flattening off (A2) | two-class needed; each flattening kept only if it matters |
+| I2 polarity as sign | fixed polarity = +1 and = -1 (A5) | sign rule picks the better of the two in one pass |
+| I3 search + prior ladder | no scale prior (A6); direct affine without ladder (A7) | prior prevents degenerate scales; ladder needed |
 | sectioning normalisation | off (A3) | deleted if no effect on I46, I55 and the brainstem |
 
 A step whose removal changes the pose by <= 0.5 mm and no metric beyond noise is deleted before release.
 
-## Benchmark
+## Validation (current scope: Xiangrui's pair only)
 
-- Pairs: DANDI:000026 I46, I55 (labels), I38, I56, I62 (visually verified v1 poses), I48, I57, I61, I58 (known v1 failures,
-  reported), and Xiangrui's I58 brainstem (MRI delivered cropped; reference R5).
-- DANDI MRIs are cropped by the benchmark (not the method) to the block's bounding sphere + 10 mm around the reference block
-  centre; that is the "prior" regime the method is meant for. The crop files are the method inputs.
-- Metrics: pose distance to the reference (mean over OCT foreground points); I46/I55 Dice on labelled voxels and MRI-vessel
-  distance; brainstem boundary agreement; runtime. Failures stay in the main table.
+User direction 2026-09-14: "要在我们服务器上Xiangrui原本给的数据上去跑成功，先不用跑别的数据". Other datasets come later.
+
+- Pair: Xiangrui's I58 brainstem, the two original files on the server
+  (`data/xiangrui/OCT_to_MRI/I58_Brainstem_mus_Slice_full_20um_corr.nii.gz`, 1457x2013x1595 @ 20 um, and
+  `I58_brainstem_MRI_cropped_to_OCT.nii.gz`, 343x489x495 @ 0.08 mm, a FreeSurfer crop of a whole-brain scan, 27x39x40 mm,
+  i.e. already cropped to the block, so translation needs no global search; only the block orientation is searched).
+- Success: `octreg register` runs end to end from these two files, the pose agrees with the reference R5
+  (`work/runs/v11/xiangrui_I58bs/T_oct2mri.npy`, converted from the v1 pipeline frame to the header frame) to within the known
+  run-to-run spread (about 1 mm at the block corners) or the difference is explained, and the exported transform passes the raw-data
+  frame check (raw 20 um values through the header affine correlate with the exported overlay; axis-flip controls do not).
+- Ablations A1-A7 on this pair decide which steps are kept (A8 does not apply: the crop is given). Label-free metrics only:
+  pose distance to R5, boundary agreement of the foreground outlines, final score, runtime and memory.
 
 ## Code (target <= 1,000 package lines)
 
 ```
 octreg/  params.py  io.py  geometry.py  preprocess.py  search.py  refine.py  register.py  cli.py  __init__.py  __main__.py
-tests/   test_frames.py  test_polarity_sign.py  test_search_synthetic.py  test_end_to_end.py   (CPU, < 3 min)
-bench/   pairs/*.toml  make_crops.py  run.py  evaluate.py  ablate.py  report.py
+tests/   test_frames.py  test_preprocess.py  test_polarity_sign.py  test_search_synthetic.py  test_end_to_end.py   (CPU, < 3 min)
+bench/   run_xiangrui.sh  evaluate.py  ablate.py  report.py   (Xiangrui pair only for now)
 docs/    METHOD.md  BENCHMARK.md
 README.md  pyproject.toml
 ```
