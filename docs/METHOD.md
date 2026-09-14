@@ -31,9 +31,11 @@ flat while tissue is not, and the minimum over axes of a directional texture mea
 The fine OCT is smoothed with a normalised Gaussian (σ 0.08 mm) to suppress speckle. Along each array axis a, the running
 coefficient of variation c_a is computed over a 0.36 mm window, and the texture field is F = min_a c_a, averaged over 0.16 mm
 blocks. Single block estimates are too noisy to classify, so log F is smoothed (σ 1.2 mm) before Otsu's threshold splits it
-into two classes. Closing (radius 0.48 mm), the largest component and hole filling give the mask. On I58 it measures 16.9 cm³,
-with a Dice of 0.910 against the watershed mask of our earlier pipeline (18.05 cm³). An intensity-valley threshold on the same
-OCT gives 29.5 cm³ because it takes in the agarose.
+into two classes. Closing (radius 0.48 mm), the largest component and hole filling give the mask, and voxels without OCT data
+are removed from it. On I58 it measures 16.9 cm³, with a Dice of 0.910 against the watershed mask of our earlier pipeline
+(18.05 cm³). An intensity-valley threshold on the same OCT gives 29.5 cm³ because it takes in the agarose. The mask is not
+perfect. Holes are filled in 3D, so the outline in a single plane can still enclose a few holes where the smoothed texture
+falls below the threshold, as in the I58 QC planes (docs/figures/fig_qc_xiangrui.png).
 
 The MRI foreground comes from that intensity-valley rule. Peaks are found on the square root of the smoothed histogram counts,
 so the narrow background peak of a box-averaged grid cannot hide the tissue peak, and the threshold is the first valley below
@@ -86,7 +88,7 @@ with rotation vector r, three shears h, three log-scales ℓ, the mirror M_m of 
 
 The prior is needed because S alone rewards distorting the block. With λ = 0 and the clamp at 1.0 (ablation A6), S rises from
 0.1455 to 0.2421 while the OCT is squeezed to 0.547 and 0.424 of its length along two axes, and the pose moves by 22.4 mm into
-the other handedness. The voxel sizes are known, so the prior only states that the specimen keeps its size within a few percent.
+the other handedness. Both voxel sizes are known, so the prior only asks the specimen to keep roughly its size and shape.
 The final I58 scales are 1.000, 0.967 and 0.985.
 
 A refined pose can slide off the MRI foreground, so the admissibility rule is applied again. Poses whose overlap falls below τ are
@@ -113,13 +115,15 @@ tracts must continue across the checkerboard squares. Cut faces and detached or 
 be consistently inverted, or consistently not, over the whole specimen. Plausible alternative poses are rendered with
 `octreg qc --T` and compared side by side.
 
-On I58 the final pose puts the MRI brainstem body on the OCT specimen in all three planes, with no cerebellar folia inside the
-body, and the folded side piece matches (docs/figures/fig_qc_xiangrui.png). Along parts of the specimen edge the OCT mask still
-lies on MRI background. R5, the pose of our earlier research pipeline, lies 10.3 mm (block-corner mean) and 25.05° away. Its QC
-panels, like those of the other-handedness pose and a low-overlap competitor, fail at least one of these checks. The outline
-distance does not decide between the final pose and R5. With the method's masks the rim medians (forward / reverse) are
-1.88 / 1.24 mm against 2.80 / 1.37 mm for R5, but with the masks of the earlier pipeline they are 1.83 / 1.14 mm against
-2.02 / 1.05 mm.
+docs/figures/fig_visual_final_vs_R5.png shows I58 in one plane per OCT axis through the specimen centre, for the final pose and
+for R5, the pose of our earlier research pipeline, which lies 10.3 mm (block-corner mean) and 25.05° away. In all three planes
+the final pose puts the MRI over the whole OCT specimen, and the fibre striations, the notch on the right side and the folded
+piece correspond. R5 leaves a large part of the OCT uncovered in the axis-0 plane, puts cerebellar folia inside the OCT body in
+the axis-1 plane and covers only part of the specimen in the axis-2 plane. In the QC images of the run
+(docs/figures/fig_qc_xiangrui.png, fig_qc_montage_xiangrui.png) the OCT mask reaches beyond the MRI foreground along parts of
+the specimen edge. The outline distance does not decide between the final pose and R5. With the method's masks the rim medians
+(forward / reverse) are 1.88 / 1.24 mm against 2.80 / 1.37 mm for R5, but with the masks of the earlier pipeline they are
+1.83 / 1.14 mm against 2.02 / 1.05 mm.
 
 ### Ablations
 
@@ -148,7 +152,7 @@ run, which still had both steps. Against the final pose they lie 0.24 and 0.39 m
 
 result.json flags failures but does not certify a pose. Warning signs are a scale far from 1, an overlap close to τ, or any flag.
 On I58, S is 0.1455 with polarity −1, overlap 0.586 against τ 0.493, and there are no flags. The run took 8 min 42 s, 5.19 GiB of
-peak RAM and 1.6 GB of GPU memory.
+peak RAM and 1.6 GiB of GPU memory.
 
 ## Parameters
 
@@ -183,7 +187,7 @@ All constants are fields of `octreg.params.Params`. The I58 run used the default
 | `lr_ls` | 0.01 | log-scale | Adam learning rate of the log-scales |
 | `lr_sh` | 0.01 | shear | Adam learning rate of the shears |
 
-## What we removed
+## Removed components
 
 A section-stripe flat field (destripe) took 365 of 906 s in the first run and moved the pose by 0.15 mm when switched off. A
 rigid, similarity and affine ladder over three grids gave the same pose as one affine fit per search pose to within 0.0015 mm.

@@ -13,7 +13,8 @@
 >    similarity and affine ladder, which gave the same pose to 0.0015 mm (A7). The grids are a 0.6 mm search grid and a
 >    0.15 mm base grid.
 > 6. Evaluation: visual inspection of the overlays is the primary criterion. Agreement with R5 within 1 mm is no longer a
->    success criterion. The final pose lies 10.3 mm from R5 and passes the visual check, and R5 does not.
+>    success criterion. The final pose lies 10.3 mm from R5 and passes the visual check, and R5 does not
+>    ([fig_visual_final_vs_R5.png](../figures/fig_visual_final_vs_R5.png)).
 
 Supersedes the method parts of `spec_v1.0.md` after the user's direction of 2026-09-14: a few concise, intuitive, effective
 innovations; no redundant content; the MRI is given cropped around the block (no whole-brain global search); handedness is not

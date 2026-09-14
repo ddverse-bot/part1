@@ -4,11 +4,15 @@ octreg 1.0 registered the two original files as given (OCT 1457x2013x1595 at 20 
 
 ## Visual comparison
 
-The final pose and R5 are 10.32 mm apart at the block corners (mean, max 16.47 mm) and rotated by 25.1 deg against each other, far beyond the run-to-run spread of about 1 mm of the earlier pipeline. They are two different poses, and the overlays decide between them. The QC panels of the final pose, of R5, of the pose in the other handedness and of a low-overlap competitor were inspected in all three planes. Only the final pose puts the MRI brainstem body on the OCT specimen, with no cerebellar folia inside the body, and matches the folded side piece. R5 and the other two fail at least one of these checks. Along parts of the specimen edge the OCT mask of the final pose still lies on MRI background, seen as bright MRI squares in the checkerboard below.
+The final pose and R5 are 10.32 mm apart at the block corners (mean, max 16.47 mm) and rotated by 25.05 deg against each other, far beyond the run-to-run spread of about 1 mm of the earlier pipeline. They are two different poses, and the overlays decide between them.
+
+![Final pose and R5](figures/fig_visual_final_vs_R5.png)
+
+Planes through the centroid of the specimen mask, normal to each OCT array axis: the OCT, then for the final pose and for R5 the MRI through the transform (inverted inside its foreground, polarity -1) and a 2 mm checkerboard. In all three planes the final pose puts the MRI over the whole OCT specimen, and the fibre striations, the notch on the right side and the folded piece correspond. R5 leaves a large part of the OCT uncovered in the axis-0 plane, puts cerebellar folia inside the OCT body in the axis-1 plane and covers only part of the specimen in the axis-2 plane.
 
 ![QC of the final pose](figures/fig_qc_xiangrui.png)
 
-qc.png of the final run: planes through the centroid of the specimen mask, normal to each OCT array axis, with the OCT, the MRI through the transform and a 2 mm checkerboard in which the MRI is inverted inside the OCT mask (polarity -1). The current `octreg qc` adds a fourth column with the mask outlines.
+qc.png of the final run, the same planes with a fourth column showing the MRI foreground through the transform (red) and the OCT specimen mask (cyan). The mask outline encloses the specimen but has a few interior holes, and along parts of the specimen edge it reaches beyond the MRI foreground, where the checkerboard shows black MRI squares. qc_montage.png of the run, with four planes per axis, is [fig_qc_montage_xiangrui.png](figures/fig_qc_montage_xiangrui.png).
 
 The outline agreement does not separate the two poses. With the method's masks the rim medians favour the final pose (forward / reverse 1.88 / 1.24 mm against 2.80 / 1.37 mm for R5). With the v1.1 masks the final pose is better forward and worse in reverse (1.83 / 1.14 mm against 2.02 / 1.05 mm).
 
@@ -31,10 +35,10 @@ The outline agreement does not separate the two poses. With the method's masks t
 | rim boundary agreement forward / reverse, method masks | 1.88 / 1.24 mm; R5 2.80 / 1.37; previous 1.88 / 1.23 |
 | the same with the v1.1 masks | 1.83 / 1.14 mm; R5 2.02 / 1.05; previous 1.84 / 1.15 |
 | OCT specimen mask | 16.88 cm3, Dice 0.910 against the v1.1 mask (18.05 cm3) |
-| registration time in process, peak RAM, peak GPU memory allocated by torch | 8.6 min, 5.2 GB, 0.59 GB (wall clock 8.7 min, nvidia-smi peak 1.6 GB) |
+| registration time in process, peak RAM, peak GPU memory allocated by torch | 8.6 min, 5.2 GiB, 0.59 GiB (wall clock 8.7 min, nvidia-smi peak 1.6 GiB) |
 | time per step (s) | mri 5, oct fine grid 196, oct mask 165, two class 2, search 46, refinement 73, outputs 31 |
 
-The raw-data frame check passes, so the exported transform is in the frames of the two files. The pose is not within 1 mm of R5 at the block corners, and the visual comparison above is the reason the final pose is kept.
+The raw-data frame check passes, so the exported transform is in the frames of the two files. The pose lies more than 1 mm from R5 at the block corners, and the visual comparison above shows that the final pose, not R5, matches the anatomy.
 
 R5 in the header frames (T_R5 @ A_spr @ inv(A_hdr)) agrees with the stored header-frame export to 0.000000 mm.
 
@@ -73,7 +77,7 @@ The present base lies 0.18 mm (corners mean 0.39 mm, corners max 0.62 mm, rotati
 
 ## Runtime and memory of the ablation driver
 
-| step | seconds | peak RAM of the process so far (GB) |
+| step | seconds | peak RAM of the process so far (GiB) |
 |---|---|---|
 | OCT fine grid 728x1006x797 (streamed once) | 195 | 3.3 |
 | prep intensity | 67 | 3.8 |
@@ -82,7 +86,7 @@ The present base lies 0.18 mm (corners mean 0.39 mm, corners max 0.62 mm, rotati
 | prep mri | 5 | 0.7 |
 | all variants and preprocessing | 1629 | 5.6 |
 
-Peak GPU memory allocated by torch over the variants: 1.0 GB.
+Peak GPU memory allocated by torch over the variants: 1.0 GiB.
 
 <!-- reading: written by hand below this line; bench/report.py keeps it when it rewrites the file -->
 
@@ -94,4 +98,4 @@ Three variants end in the other handedness, 22 to 31 mm away. A6 gets there by s
 
 MRI flattening stays although removing it moves the pose by only 0.30 mm (A1). The two-class map keeps one definition for both modalities, and without MRI flattening the gap between the two best search scores shrinks from 0.0061 to 0.0016.
 
-The section-stripe flat field and the refinement ladder are removed. Switching off the flat field moved the first run's pose by 0.15 mm (A3), and the step took 365 s of that run's 906 s (docs/results/xiangrui_I58/first_run/result.json). One affine refinement from every search pose gave the ladder's pose to within 0.0015 mm (A7). Near the optimum the loss is flat: the A3 pose of the first run and the final pose have the same loss (L = 0.85763) and lie 0.24 mm apart. The final run needs 519 s and 5.2 GB in process, against 906 s and 8.3 GB for the first run.
+The section-stripe flat field and the refinement ladder are removed. Switching off the flat field moved the first run's pose by 0.15 mm (A3), and the step took 365 s of that run's 906 s (docs/results/xiangrui_I58/first_run/result.json). One affine refinement from every search pose gave the ladder's pose to within 0.0015 mm (A7). Near the optimum the loss is flat: the A3 pose of the first run and the final pose have the same loss (L = 0.85763) and lie 0.24 mm apart. The final run needs 519 s and 5.2 GiB in process, against 906 s and 8.3 GiB for the first run.
