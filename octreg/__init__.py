@@ -5,7 +5,7 @@
 3. FFT orientation search inside the MRI crop, then one affine refinement per search pose under a scale prior and an overlap gate.
 
 Method constants are in octreg.params.Params (numerical guards and fixed rule literals are documented where they are used).
-Python use: `from octreg.register import register, apply`; command line: `octreg register` and `octreg apply`.
+Python use: `from octreg.register import register, apply, qc`; command line: `octreg register`, `octreg apply`, `octreg qc`.
 """
 __version__ = "1.0.0"
 

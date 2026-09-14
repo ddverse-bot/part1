@@ -1,44 +1,136 @@
 # octreg
 
-Label-free affine registration of a serial-sectioning OCT block to an ex-vivo MRI that is already cropped around the block.
+octreg registers a serial-sectioning OCT block to an ex-vivo MRI with one affine transform, without labels or landmarks. It is
+built for data like Xiangrui's I58 brainstem pair. The OCT is a scattering or intensity volume of a tissue block embedded in
+scatterer-doped agarose, with section stripes, tile seams and a contrast that may be inverted relative to the MRI. The MRI has
+already been cropped to a region containing the block. octreg writes the transform between the two input files, overlays in
+both frames and QC images for visual inspection.
 
-The OCT is a scattering or intensity volume of a tissue block embedded in scatterer-doped agarose, with section stripes along one
-array axis and a tile mosaic in the section plane. Its contrast may be inverted relative to the MRI. octreg finds the specimen
-from its isotropic texture (the agarose has the same intensity but only anisotropic artefacts), turns both volumes into one soft
-two-class map so that the contrast polarity comes out as the sign of the best FFT score, searches the block orientation inside
-the MRI crop, and refines every search pose with one affine fit under a scale prior, keeping only poses that stay on the MRI
-foreground. No labels or landmarks are used.
+## Three innovations
+
+**Specimen mask from isotropic texture.** Doped agarose scatters about as strongly as tissue, so an intensity threshold takes
+in the embedding. Tissue texture varies along every direction, while the agarose is uniform apart from section stripes and tile
+seams, each of which varies along a single array axis. octreg measures the local coefficient of variation along each array axis
+and keeps the minimum, which is high only in tissue.
+
+**Two-class maps, polarity from the sign of one score.** Both volumes become the same soft map of bright against dark tissue.
+The OCT enters the score as the channel pair (p, 1 − p) with its mask as a weight. Swapping the two OCT classes negates the
+weighted normalised cross-correlation exactly, so one correlation covers both contrast polarities. Its magnitude ranks the pose
+and its sign tells whether the OCT contrast is inverted.
+
+**Orientation search inside the crop, then a bounded affine fit.** The crop already fixes the position, so octreg searches
+16,000 orientations (8,000 rotations and their mirror images) and scores all translations inside the crop at once with FFTs. The
+24 best distinct poses are each refined by a 12-parameter affine fit with a penalty and a hard bound on scale and shear, since
+both voxel sizes are known. A refined pose is kept only if the OCT specimen still lies on the MRI foreground as much as the
+search required, and the lowest loss wins.
+
+The full description is in [docs/METHOD.md](docs/METHOD.md).
 
 ## Install
 
 ```
-pip install .
+pip install -e .
 ```
 
 Python 3.9 or newer with torch, numpy, scipy, scikit-image, nibabel, tifffile and matplotlib. A CUDA GPU is expected for real
-volumes; `--device cpu` works for small ones.
+volumes. `--device cpu` works for small ones.
 
-## Use
+## Usage
 
 ```
 octreg register OCT MRI -o OUT [--oct-spacing-um Z,Y,X] [--oct-mask F] [--mri-mask F] [--device cuda|cpu] [--params F]
+octreg qc --run OUT --oct OCT --mri MRI [--T T.txt]
 octreg apply --run OUT --moving X --reference Y -o Z [--inverse]
 ```
 
-The OCT can be NIfTI, or TIFF / OME-TIFF / NPY with its voxel spacing (from OME metadata or `--oct-spacing-um`, given along
-the numpy axes). The MRI is NIfTI. The OCT is streamed plane by plane and never held whole in memory.
+`register` runs the method. The OCT can be NIfTI, or TIFF, OME-TIFF or NPY with its voxel spacing (from OME metadata or
+`--oct-spacing-um`, along the numpy axes), and the MRI is NIfTI. The OCT is streamed plane by plane and never held whole in
+memory. `--oct-mask` and `--mri-mask` replace the automatic masks. `qc` renders the QC images again without registering, for
+the run's transform or for another transform between the same files given with `--T` (a 4×4 matrix in mm, as text in the
+format of `T_oct2mri.txt` or as .npy). With `--T` the images are named after the transform file, so several candidate poses
+can be compared in one run directory. `apply` resamples a volume in the OCT frame onto a grid in the MRI frame, or the reverse
+with `--inverse`.
 
-`OUT` gets the transform from the OCT file frame to the MRI file frame as `T_oct2mri.txt` (4x4, mm; `T_mri2oct.txt` is its
-inverse), the same transform for FreeSurfer (`oct2mri.lta`) and ITK / ANTs (`oct2mri_itk.txt`), the two overlays
-`oct_in_mri.nii.gz` and `mri_in_oct.nii.gz`, a `qc.png`, and `result.json` with the score, polarity, search scores, scale per OCT
-axis, overlap, boundary agreement, flags, runtime and memory. The report is descriptive; it is not a pass/fail gate.
+From Python: `from octreg.register import register, apply, qc`. The method constants are in `octreg.params.Params`.
 
-From Python: `from octreg.register import register, apply`. All method constants are in `octreg.params.Params`.
+## Outputs
 
-## Status
+| file | content |
+|---|---|
+| `T_oct2mri.txt`, `T_mri2oct.txt` | 4×4 affine in mm from the OCT file world to the MRI file world, and its inverse |
+| `oct2mri.lta`, `oct2mri_itk.txt` | the same transform for FreeSurfer and for ITK / ANTs |
+| `oct_in_mri.nii.gz` | the OCT resampled onto the MRI grid |
+| `mri_in_oct.nii.gz` | the MRI resampled onto a 0.15 mm grid in the OCT world |
+| `qc.png` | one plane per OCT axis through the specimen centre: OCT, MRI through the transform, checkerboard, mask outlines |
+| `qc_montage.png` | the same for four planes per axis spread across the specimen |
+| `result.json` | transform, score S, polarity, scale per OCT axis, overlap, flags, masks, runtime and memory |
 
-This is the 1.0 release branch. The method is specified in [docs/design/spec_v1.0_lean.md](docs/design/spec_v1.0_lean.md);
-the validation on Xiangrui's I58 brainstem pair and the ablations are run with `bench/` (see [bench/README.md](bench/README.md)).
-The previous research code (v1.1) is kept at the git tag `v1.1-archive`, and its documents are in [docs/archive/](docs/archive/).
+The worlds are the frames of the input files (NIfTI sform or qform, diag(spacing) for TIFF and NPY), so the transform applies
+to the original files as they are.
 
-Tests: `python -m pytest -q tests` (CPU, synthetic data, about a minute).
+## How to evaluate a result
+
+Visual inspection is the evaluation. These pairs have no labels, and the label-free numbers can prefer a wrong pose, so a
+registration is accepted when its overlays show the same anatomy in both scans. Open `qc_montage.png`, then load the overlays in
+freeview (`freeview MRI OUT/oct_in_mri.nii.gz`, or `freeview OCT OUT/mri_in_oct.nii.gz`) and check four things.
+
+1. In every plane of all three axes, not only through the centre, the OCT specimen lies on the same anatomy in the MRI and the
+   two outlines largely agree. The last column draws the MRI foreground in red and the OCT specimen mask in cyan.
+2. Internal structures, such as fibre tracts, continue across the checkerboard squares.
+3. Cut faces and detached or folded pieces of tissue correspond.
+4. The contrast is consistently inverted, or consistently not, over the whole specimen. When the reported polarity is −1 the
+   QC images show the MRI inverted inside its foreground, so tissue should then look alike in both scans.
+
+When more than one pose is plausible, for example the result and an earlier transform, render each with `octreg qc --T` and
+compare them side by side.
+
+The numbers in `result.json` support this judgement. S is the weighted correlation of the two-class maps, the scales per OCT axis
+should stay near 1, the overlap should be clearly above the gate `search.tau`, and any flag deserves a look. They point to
+failures but do not certify a pose. On I58, switching off the scale prior raises S from 0.1455 to 0.2421 while squeezing the OCT
+to 0.55 and 0.42 of its length along two axes.
+
+## Result on Xiangrui's I58 brainstem pair
+
+![QC of the I58 registration](docs/figures/fig_qc_xiangrui.png)
+
+qc.png of the final run, one plane per OCT axis through the specimen centre: OCT, MRI through the transform, and a 2 mm
+checkerboard with the MRI inverted inside the OCT mask. The current `octreg qc` adds a fourth column with the mask outlines.
+
+`octreg register` ran on the two original files (OCT 1457×2013×1595 at 20 µm, MRI crop 343×489×495 at 0.08 mm) in 8 min 42 s
+with 5.19 GiB of peak RAM and 1.6 GB of GPU memory. The final pose puts the MRI brainstem body on the OCT specimen in all three
+planes, with no cerebellar folia inside the body, and the folded side piece matches. Along parts of the specimen edge the OCT
+mask still lies on MRI background, seen as bright MRI squares in the checkerboard. R5, the pose from our earlier research
+pipeline, lies 10.3 mm away at the block corners and is rotated by 25.05°. Its QC panels, like those of the other-handedness
+pose and a low-overlap competitor, fail at least one of these checks.
+
+S is 0.1455 with polarity −1 (inverted OCT contrast), the overlap 0.586, the scales 1.000 / 0.967 / 0.985, and there are no
+flags. Raw OCT values mapped through the file header and the transform correlate with the exported overlay at Spearman 0.990,
+against at most 0.205 for any flipped axis. Replacing the texture mask, the two-class maps, the polarity rule or the scale
+prior, or switching off OCT flattening, moves the pose by 12 to 44 mm. Details and ablations are in
+[docs/BENCHMARK.md](docs/BENCHMARK.md).
+
+## Limitations
+
+- Affine only.
+- Demonstrated on one pair so far.
+- The overlap gate (`overlap_rho`) and the texture smoothing (`texture_smooth_mm`) were set on that pair.
+- Handedness is not analysed. The search includes mirrored orientations and keeps the best pose.
+- Inspect every result visually before using it.
+
+## Layout
+
+```
+octreg/                      the package (method constants in params.py)
+tests/                       synthetic CPU tests: python -m pytest -q tests
+bench/                       I58 benchmark and ablations, run on the server (bench/README.md)
+docs/METHOD.md               method, evaluation protocol and parameters
+docs/BENCHMARK.md            I58 results and ablations
+docs/figures/                figures
+docs/results/xiangrui_I58/   result.json, eval.json and ablations.json of the I58 run
+docs/design/                 specifications
+docs/archive/                documents of the research code (git tag v1.1-archive)
+```
+
+## 中文摘要
+
+octreg 把琼脂包埋的连续切片 OCT 组织块无标签地仿射配准到已裁剪到组织块附近的离体 MRI。三个创新点：用各向同性纹理分割标本（掺杂琼脂强度与组织相近，但它的伪影只沿单一轴变化）；两类结构图，交换 OCT 两类恰好使加权 NCC 变号，所以对比度极性就是一次打分的符号；在 MRI 裁剪范围内做 FFT 朝向搜索，再做带尺度先验、受重叠门限约束的仿射精配准。评估以视觉检查为主：在 qc_montage.png 和 freeview 叠加图中检查标本轮廓、纤维束、切面和折叠碎片是否对应，result.json 的数值只作辅助。I58 上耗时 8 分 42 秒，最终位姿在三个平面上都让 MRI 脑干主体落在 OCT 标本上，主体内没有小脑叶片，折叠侧片也对得上；旧参考位姿 R5 等其他候选位姿至少有一项对不上。

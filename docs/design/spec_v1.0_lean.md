@@ -1,5 +1,20 @@
 # octreg 1.0 (lean) — specification
 
+> **Final description: [docs/METHOD.md](../METHOD.md).** This file is the specification octreg 1.0 was built from. Where the
+> two differ, METHOD.md describes the released method. Deviations adopted during implementation and validation on I58:
+>
+> 1. MRI foreground: histogram peaks are found on the square root of the counts, so the narrow background peak of a
+>    box-averaged grid cannot hide the tissue peak.
+> 2. Texture threshold: Otsu on the log texture field smoothed with a Gaussian of 1.2 mm (`texture_smooth_mm`), instead of a
+>    two-component Gaussian mixture.
+> 3. Overlap gate: `overlap_rho` 0.6 instead of 0.8, and the gate is applied again after refinement.
+> 4. Section-stripe flat field (destripe) removed. Switching it off moved the pose by 0.15 mm (A3, block-corner mean).
+> 5. Single-stage refinement: one affine fit on the 0.15 mm grid from each of the 24 search poses replaces the rigid,
+>    similarity and affine ladder, which gave the same pose to 0.0015 mm (A7). The grids are a 0.6 mm search grid and a
+>    0.15 mm base grid.
+> 6. Evaluation: visual inspection of the overlays is the primary criterion. Agreement with R5 within 1 mm is no longer a
+>    success criterion. The final pose lies 10.3 mm from R5 and passes the visual check, and R5 does not.
+
 Supersedes the method parts of `spec_v1.0.md` after the user's direction of 2026-09-14: a few concise, intuitive, effective
 innovations; no redundant content; the MRI is given cropped around the block (no whole-brain global search); handedness is not
 a topic for now; publication grade; release goes to the GitHub repository `oct-mri-registration`.
@@ -90,7 +105,7 @@ CLI: `octreg register OCT MRI -o OUT [--oct-spacing-um Z,Y,X] [--oct-mask F] [--
 Outputs: `T_oct2mri.txt`, `T_mri2oct.txt`, `oct2mri.lta`, `oct2mri_itk.txt`, `oct_in_mri.nii.gz`, `mri_in_oct.nii.gz`,
 `qc.png`, `result.json`.
 
-## Removed (reachable at tag v1.1-archive, listed with numbers in docs/METHOD.md "What we tried")
+## Removed (reachable at tag v1.1-archive, listed with numbers in docs/METHOD.md "What we removed")
 
 Vascular channel (helps I46 only), fine stage (rejected on the brainstem, harmful on cortex), parser,
 MIND, non-rigid, MI / surface objectives, restarts and MI landscapes as QC, handedness decisions and jackknife, compat

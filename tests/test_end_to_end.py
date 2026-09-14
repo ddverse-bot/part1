@@ -1,19 +1,20 @@
 """End to end through the command line on a small synthetic pair, CPU: an agarose-embedded OCT block (equal mean intensity,
 section offsets, tile seams, a black tile, inverted contrast, LPI-like header) and an MRI crop (RIA-like header) related by
 a known affine. Reduced search and refinement through --params; the pose is recovered to < 0.4 mm (0.16-0.17 mm over seeds 0-2),
-the texture mask finds the specimen where the histogram rule has no valley, every output is written and `octreg apply`
-reproduces oct_in_mri.nii.gz; user masks replace both foregrounds."""
+the texture mask finds the specimen where the histogram rule has no valley, every output is written, `octreg apply`
+reproduces oct_in_mri.nii.gz and `octreg qc` reproduces the visual QC figures; user masks replace both foregrounds."""
 import json
 
 import nibabel as nib
 import numpy as np
 import torch
+from PIL import Image
 from scipy import ndimage
 
 from octreg import geometry as G, io, preprocess as pp
 from octreg.cli import main
 from octreg.params import Params
-from octreg.register import OUTPUTS
+from octreg.register import OUTPUTS, QC_CELL_IN, QC_COLOURS, QC_DPI, QC_HEAD_IN
 
 
 def distance(T1, T2, pts):
@@ -70,6 +71,10 @@ def pair(tmp, seed=0):
     return tmp / "oct.nii.gz", tmp / "mri.nii.gz", T, xo[inside.ravel() & (oct_.ravel() > 0)]
 
 
+def png(path):
+    return np.asarray(Image.open(path).convert("RGB")).astype(int)
+
+
 def _rot(axis, deg):
     a = np.asarray(axis, float) / np.linalg.norm(axis) * np.radians(deg)
     K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
@@ -107,6 +112,17 @@ def test_register_and_apply(tmp_path):
                  str(tmp_path / "back.nii.gz"), "--inverse"]) == 0
     back = nib.load(str(tmp_path / "back.nii.gz"))
     assert back.shape == nib.load(str(oct_path)).shape and np.asarray(back.dataobj).max() > 500
+
+    qc, montage = png(out / "qc.png"), png(out / "qc_montage.png")        # 3 and 12 rows of planes, both outlines drawn
+    assert [round((x.shape[0] / QC_DPI - QC_HEAD_IN) / QC_CELL_IN, 2) for x in (qc, montage)] == [3, 12]
+    assert all((x == list(bytes.fromhex(c[1:]))).all(-1).sum() > 100 for x in (qc, montage) for c in QC_COLOURS)
+    run_qc = ["qc", "--run", str(out), "--oct", str(oct_path), "--mri", str(mri_path)]
+    assert main(run_qc + ["--T", str(out / "T_oct2mri.txt"), "-o", str(tmp_path / "qc" / "again")]) == 0
+    np.testing.assert_array_equal(png(tmp_path / "qc" / "again.png"), qc)
+    np.testing.assert_array_equal(png(tmp_path / "qc" / "again_montage.png"), montage)
+    np.savetxt(tmp_path / "T_true.txt", T_true)
+    assert main(run_qc + ["--T", str(tmp_path / "T_true.txt")]) == 0 and (out / "qc_T_true_montage.png").is_file()
+    assert main(run_qc + ["--T", str(tmp_path / "missing.txt")]) == 2
     assert main(["register", str(tmp_path / "missing.nii.gz"), str(mri_path), "-o", str(out), "--device", "cpu"]) == 2
     assert main(["register", str(oct_path), str(mri_path), "-o", str(out), "--oct-mask", "missing.nii.gz", "--device", "cpu"]) == 2
 
