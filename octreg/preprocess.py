@@ -23,6 +23,17 @@ def _close(m, r):
     return ndimage.binary_closing(np.pad(m, r, mode="edge"), ball)[r:-r, r:-r, r:-r]
 
 
+def _fill_planes(m):
+    """Holes filled in every array plane (union over the three axes): background enclosed by specimen within a plane is specimen,
+    also where the hole reaches a cut face of the block and so is not enclosed in 3-D."""
+    out = m.copy()
+    for ax in range(3):
+        s = np.zeros((3, 3, 3), bool)
+        s[tuple(1 if d == ax else slice(None) for d in range(3))] = ndimage.generate_binary_structure(2, 1)
+        out |= ndimage.binary_fill_holes(m, structure=s)
+    return out
+
+
 def _components(m, min_fraction=None):
     """6-connected components of m -> (mask of the largest component, or of every component holding >= min_fraction of the
     mask voxels; number of components before the rule)."""
@@ -94,9 +105,10 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     running coefficient of variation of b over texture_window_mm (weights m; counted where >= half the window is measured);
     F = minimum over the axes, mean over the measured voxels of blocks of ~texture_grid_mm (blocks >= half measured);
     log F smoothed over those blocks (normalised Gaussian of sigma texture_smooth_mm: single local estimates are too noisy
-    to classify), two-class Otsu threshold; closing (ball texture_close_mm), largest component, holes filled; linear
-    interpolation to the fine grid > 0.5, and m. Chunked along axis 0 (equal to the whole-volume result, ~one fine float32
-    array of temporaries). fine: [D, H, W] OCT intensities; voxel_mm: spacing (mm).
+    to classify), two-class Otsu threshold; closing (ball texture_close_mm), largest component, holes filled in every array
+    plane (_fill_planes: uniform tissue such as white matter has little texture, the specimen is solid); linear interpolation to
+    the fine grid > 0.5, and m. Chunked along axis 0 (equal to the whole-volume result, ~one fine float32 array of temporaries).
+    fine: [D, H, W] OCT intensities; voxel_mm: spacing (mm).
     -> (bool [D, H, W], {threshold (F units), volume_cm3, n_components (before the largest-component rule)})."""
     P, D = params, fine.shape[0]
     sig = P.texture_bandpass_mm / voxel_mm
@@ -134,7 +146,7 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
         raise ValueError("specimen mask: no texture variation in the measured data; supply an OCT mask")
     lt = float(threshold_otsu(L[valid]))
     mc, n_comp = _components(_close(valid & (L > lt), int(round(P.texture_close_mm / (k * voxel_mm)))))
-    mc = ndimage.binary_fill_holes(mc).astype(np.float32)
+    mc = _fill_planes(mc).astype(np.float32)
     out = np.empty(fine.shape, bool)
     for z0 in range(0, D, _CHUNK):
         z1 = min(D, z0 + _CHUNK)

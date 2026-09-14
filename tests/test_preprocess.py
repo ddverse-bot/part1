@@ -89,3 +89,14 @@ def test_channels():
     np.testing.assert_allclose(u.sum(0), 1, atol=1e-6)
     assert np.array_equal(w, mask.astype(np.float32)) and not v[:, ~mask].any()
     np.testing.assert_allclose(v.sum(0), mask, atol=1e-6)
+
+
+def test_fill_planes_fills_holes_open_to_a_face():
+    """A cavity that reaches a cut face is not enclosed in 3-D but is enclosed in the planes across it; outside stays outside."""
+    m = np.zeros((12, 12, 12), bool)
+    m[2:10, 2:10, :] = True
+    m[5:7, 5:7, :] = False                                   # a tunnel through the block along axis 2, open at both faces
+    m[4:8, 4:8, 4:8] &= ~_ball(4, (1.5, 1.5, 1.5), 1.2)      # and an enclosed cavity
+    assert not ndimage.binary_fill_holes(m)[5, 5, 0]
+    f = pp._fill_planes(m)
+    assert f[2:10, 2:10, :].all() and not f[:2].any() and not f[10:].any()

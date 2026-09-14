@@ -64,14 +64,14 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
     v = pp.mri_channels(pp.two_class(mri_h, mask_m, h, P), mask_m)
     lap("two_class")
     # steps 4-5: orientation search in the crop and affine refinement (innovation 3)
-    poses, info = align((u, w, A_o), (v, mask_m, A_m), P, device)
+    poses, info = align((u, w, valid_o, A_o), (v, mask_m, A_m), P, device)
     lap("search_refine")
 
     best = poses[0]
     T = best["T"]
-    pose = {k: best[k] for k in ("S", "L", "polarity", "log_scales", "shears", "overlap", "search_rank")}
+    pose = {k: best[k] for k in ("S", "S_class", "S_outline", "L", "polarity", "log_scales", "shears", "search_rank")}
     pose["scale_per_oct_axis"] = np.linalg.norm(T[:3, :3] @ (vo.affine[:3, :3] / vo.spacing_mm), axis=0).tolist()
-    flags = ["mri_foreground_no_valley"] * (fg_m.get("status") == "no_valley") + ["overlap_floor"] * info["search"]["overlap_floor"]
+    flags = ["mri_foreground_no_valley"] * (fg_m.get("status") == "no_valley")
     flags += ["nondefault_params"] * (P != Params())
     flags += ["clamp_saturated"] * bool(np.abs([*best["log_scales"], *best["shears"]]).max() >= P.clamp * (1 - 1e-3))
     inputs = {"oct": {**vars(vo), "path": _abs(vo.path)}, "mri": {**vars(vm), "path": _abs(vm.path)},
@@ -87,7 +87,7 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
     io.save_nifti(G.resample_to(*overlay, vm.shape, vm.affine, np.linalg.inv(T)), vm.affine, out / "oct_in_mri.nii.gz")
     io.save_nifti(G.resample_to(mri_h, A_m, oct_h.shape, A_o, T), A_o, out / "mri_in_oct.nii.gz")
     qc_figures(out / "qc", (oct_h, mask_o, A_o), (mri_h, mask_m, A_m), T, pose["polarity"], vo.affine,
-               f"S {pose['S']:.4f}   overlap {pose['overlap']:.2f}")
+               f"S {pose['S']:.4f} (class {pose['S_class']:+.4f}, outline {pose['S_outline']:.4f})")
     lap("outputs")
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == "darwin" else 2 ** 20)
     result.update(seconds={**sec, "total": time.time() - t0}, peak_rss_gb=rss,
@@ -128,17 +128,18 @@ def fine_mask(fine, affine, params: Params = Params(), mask=None):
 
 
 def align(oct_base, mri_base, params: Params = Params(), device="cuda", polarity=0):
-    """Steps 4-5 on base-grid channels, oct_base = (u [2, D, H, W], weight, affine) and mri_base = (v [2, D', H', W'], mask,
-    affine): box average to search_mm, search.search there (polarity 0 reads the polarity off the sign of the score, +1 / -1
-    force it), then refine.refine of every search pose on the base grid, gated by the search tau.
-    -> (refined poses lowest L first, {'search': search info, 'refine': {n_poses, n_below_tau, seconds}})."""
+    """Steps 4-5 on base-grid arrays, oct_base = (u [2, D, H, W], specimen mask, measured fraction, affine) and mri_base =
+    (v [2, D', H', W'], mask, affine): box average to search_mm, search.search there (polarity 0 reads the polarity off the sign
+    of the two-class score, +1 / -1 force it), then refine.refine of every search pose on the base grid.
+    -> (refined poses lowest L first, {'search': search info, 'refine': {n_poses, seconds}})."""
     P = params
-    coarse = lambda c, m, A: (G.pool_iso(c, A, P.base_mm, P.search_mm)[0], *G.pool_iso(m, A, P.base_mm, P.search_mm))
-    candidates, info = search(*coarse(*mri_base), *coarse(*oct_base), P, device, polarity)
+    pool = lambda x, A: G.pool_iso(x, A, P.base_mm, P.search_mm)[0]
+    (u, w, q, A_o), (v, m, A_m) = oct_base, mri_base
+    candidates, info = search(pool(v, A_m), *G.pool_iso(m, A_m, P.base_mm, P.search_mm), pool(u, A_o), pool(w, A_o),
+                              *G.pool_iso(q, A_o, P.base_mm, P.search_mm), P, device, polarity)
     t0 = time.time()
-    poses = refine(candidates, mri_base, oct_base, P, device, info["tau"])
-    return poses, {"search": info, "refine": {"n_poses": len(candidates), "n_below_tau": len(candidates) - len(poses),
-                                              "seconds": time.time() - t0}}
+    poses = refine(candidates, mri_base, oct_base, P, device)
+    return poses, {"search": info, "refine": {"n_poses": len(candidates), "seconds": time.time() - t0}}
 
 
 def apply(run_dir, moving, reference, out, inverse=False) -> Path:
@@ -204,7 +205,8 @@ def qc(run_dir, oct_path, mri_path, T=None, prefix=None, oct_spacing_um=None, oc
     Tm = T_run if T is None else np.load(T) if str(T).endswith(".npy") else np.loadtxt(T)
     if Tm.shape != (4, 4):
         raise ValueError(f"{T}: expected a 4x4 matrix")
-    label = f"S {pose['S']:.4f}   overlap {pose['overlap']:.2f}" if np.array_equal(Tm, T_run) else f"T {Path(T).name}"
+    label = (f"S {pose['S']:.4f} (class {pose['S_class']:+.4f}, outline {pose['S_outline']:.4f})" if np.array_equal(Tm, T_run)
+             else f"T {Path(T).name}")
     mri_grid = prepare_mri(vm, P, mm)[0]
     oct_grid = prepare_oct(*G.resample_iso(vo, P.fine_mm), P, mo)[0]
     prefix = prefix or run / ("qc" if T is None else f"qc_{Path(T).stem}")

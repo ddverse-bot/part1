@@ -6,8 +6,10 @@
 Params holds method constants only, so every variant is the register steps run here with the package's own functions and one
 explicit change: another OCT mask (A0 the histogram valley of the OCT, A0b the stored v1.1 mask through the --oct-mask path),
 two_class(..., flatten=False) for one modality (A1, A2), standardised intensity channels built in this file (A4),
-align(..., polarity=+1 / -1) (A5), or Params lam 0 and clamp 1 (A6). 'base' is the method through this driver; its distance to
-the CLI run (--main) is the driver check. The OCT is streamed once, each OCT mask is computed once and the MRI is prepared once.
+align(..., polarity=+1 / -1) (A5), Params lam 0 and clamp 1 (A6), the texture mask with the 3-D hole filling of the first
+release (A0c), the OCT world mirrored so that the search and refinement see the other handedness (A8), or no outline term (A9). 'base' is the method
+through this driver; its distance to the CLI run (--main) is the driver check. The OCT is streamed once, each OCT mask is
+computed once and the MRI is prepared once.
 
 The section-stripe flat field (A3) and the rigid -> similarity -> affine ladder (A7) were removed after the first ablation run.
 Their rows are copied from that run's ablations.json (--previous); they were measured against that run's base, which still had
@@ -45,13 +47,17 @@ VARIANTS = {    # name: (what changes, the explicit change: mask source, solve()
     "base": ("the method", {}),
     "A0": ("OCT intensity foreground (histogram valley) instead of the texture specimen mask", {"mask": "intensity"}),
     "A0b": ("v1.1 rim-watershed specimen mask given as the OCT mask", {"mask": "v11mask"}),
+    "A0c": ("texture specimen mask with holes filled in 3-D only (method: in every array plane)", {"mask": "texture3d"}),
     "A1": ("MRI flattening off", {"mri_flatten": False}),
     "A2": ("OCT flattening off", {"oct_flatten": False}),
     "A4": ("standardised intensity channels (z, -z) instead of two-class maps", {"features": "intensity"}),
     "A5+1": ("polarity forced +1", {"polarity": 1}),
     "A5-1": ("polarity forced -1", {"polarity": -1}),
     "A6": ("no scale prior: lam 0 and clamp 1.0 (method: 2 and 0.15)", {"params": {"lam": 0.0, "clamp": 1.0}}),
+    "A8": ("the other handedness: OCT world mirrored (z negated) before the search", {"mirror": True}),
+    "A9": ("no outline term: the outline weight set to the specimen mask, so S_outline = 0 and S = 2 S_class / 3", {"outline": False}),
 }
+MIRROR = np.diag([1.0, 1.0, -1.0, 1.0])
 REMOVED = {"A3": "section-stripe flat field", "A7": "rigid -> similarity -> affine ladder"}
 REMOVED_NOTE = ("Copied from the first ablation run, whose base still had the section-stripe flat field and the ladder, so pose "
                 "changes in these rows are against that base. Removing either step moved the pose by less than the 0.5 mm deletion "
@@ -95,6 +101,12 @@ def prepare(out, sources):
         t1 = time.time()
         if s == "texture":                                                     # the method
             m, info = fine_mask(fine, A_f, P)
+        elif s == "texture3d":                                                 # A0c: the 3-D hole filling of the first release
+            fill_planes, pp._fill_planes = pp._fill_planes, ndimage.binary_fill_holes
+            try:
+                m, info = fine_mask(fine, A_f, P)
+            finally:
+                pp._fill_planes = fill_planes
         elif s == "v11mask":                                                   # A0b, through the CLI --oct-mask path
             ref = E.reference(E.OCT, E.V11, E.R5)
             io.save_nifti(ref["mask"].astype(np.uint8), ref["A_mask"], root / "v11_mask.nii.gz")
@@ -125,8 +137,10 @@ def standardised(arr, mask, h, P):
     return ((x - float(vals.mean())) / float(vals.std())).astype(np.float32)
 
 
-def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0):
-    """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls."""
+def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0, mirror=False, outline=True):
+    """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls.
+    mirror: search and refine against the OCT world mirrored by MIRROR, poses returned in the OCT header world (det < 0).
+    outline False: the outline weight is the specimen mask itself, on which the mask is constant, so S_outline is 0."""
     h = P.base_mm
     if features == "intensity":
         z_o, z_m = standardised(o["arr"], o["mask"], h, P), standardised(m["arr"], m["mask"], h, P)
@@ -134,7 +148,9 @@ def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_cla
     else:
         u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], h, P, flatten=oct_flatten), o["mask"])
         v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], h, P, flatten=mri_flatten), m["mask"])
-    return align((u, w, o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
+    F, q = MIRROR if mirror else np.eye(4), o["valid"] if outline else o["mask"]
+    poses, info = align((u, w, q, F @ o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
+    return [{**p, "T": p["T"] @ F} for p in poses], info
 
 
 def run_variant(name, out, device, force):
@@ -155,13 +171,13 @@ def run_variant(name, out, device, force):
     head = {"name": name, "change": change, "prep": src, "spec": spec, "params_hash": P.hash()}
     try:
         poses, info = solve(o, m, P, device, **kw)
-    except ValueError as e:                     # a variant may break the method (e.g. no admissible pose): recorded, not hidden
+    except ValueError as e:                     # a variant may break the method: recorded, not hidden
         if name == "base":
             raise
         io.write_json({**head, "error": f"{type(e).__name__}: {e}", "seconds": time.time() - t0}, d / "result.json")
         print(f"{name}: failed: {e}", flush=True)
         return json.loads((d / "result.json").read_text())
-    keys = ("S", "L", "polarity", "log_scales", "shears", "overlap", "search_rank")
+    keys = ("S", "S_class", "S_outline", "L", "polarity", "log_scales", "shears", "search_rank")
     best = poses[0]
     r = {**head, "T": best["T"], "best": {k: best[k] for k in keys}, "poses": [{k: p[k] for k in keys} for p in poses], **info,
          "seconds": time.time() - t0, "gpu_peak_gb": torch.cuda.max_memory_allocated() / 1e9 if cuda else None,
@@ -209,9 +225,9 @@ def main():
             continue
         T, best = np.array(r["T"]), r["best"]
         to_base = E.pose(T, T_base, pts, cor)
-        table[n] = {**common, "S": best["S"], "L": best["L"], "polarity": best["polarity"],
-                    "scales": np.exp(best["log_scales"]).tolist(), "shears": best["shears"], "overlap": best["overlap"],
-                    "search": {k: r["search"].get(k) for k in ("top1", "top2", "n_admissible", "tau", "overlap_floor")},
+        table[n] = {**common, "S": best["S"], "S_class": best["S_class"], "S_outline": best["S_outline"], "L": best["L"],
+                    "polarity": best["polarity"], "scales": np.exp(best["log_scales"]).tolist(), "shears": best["shears"],
+                    "search": {k: r["search"].get(k) for k in ("top1", "top2", "n_orientations")},
                     "refine": r["refine"], "pose_to_base": to_base, "within_0.5mm_of_base": to_base["mean_mm"] <= 0.5,
                     "pose_to_R5": E.pose(T, ref["T_ref"], pts, cor), "boundary": bnd(T), "search_seconds": r["search"]["seconds"],
                     "refine_seconds": r["refine"]["seconds"], "gpu_peak_gb": r["gpu_peak_gb"], "T_oct2mri": r["T"]}

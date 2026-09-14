@@ -1,10 +1,11 @@
-"""Affine refinement (method step 5): every search pose is fitted on the base grid with its polarity fixed, poses that leave
-the MRI foreground are dropped, and the lowest loss wins.
+"""Affine refinement (method step 5): every search pose is fitted on the base grid with its polarity fixed, and the lowest loss
+wins.
 
 Model x_mri = R(r) Sh(sh) diag(exp(ls)) (x_oct - c) + t, c = OCT grid box centre (mm); no mirror (handedness from the file frames).
-S = mean over the two channel pairs of the OCT-weighted NCC between the OCT channels at the OCT voxels with weight > 0 (swapped
-for polarity -1) and the MRI channels sampled through the pose. L = 1 - S + lam (sum ls^2 + sum sh^2); after every Adam step
-(cosine schedule) |ls|, |sh| <= clamp (absolute).
+S = (2 S_class + S_outline) / 3 as in the search: S_class the mean over the two channel pairs of the NCC between the OCT channels
+at the specimen voxels (swapped for polarity -1) and the MRI channels sampled through the pose; S_outline the NCC between the
+specimen mask at the measured OCT voxels and the MRI foreground sampled through the pose. L = 1 - S + lam (sum ls^2 + sum sh^2);
+after every Adam step (cosine schedule) |ls|, |sh| <= clamp (absolute).
 """
 from __future__ import annotations
 
@@ -53,36 +54,36 @@ def masked_ncc(a, b, w):
 
 
 class BaseGrid:
-    """The base grid on the device: OCT voxels with weight > 0 (world points, weights, channels) and the MRI channels and mask."""
+    """The base grid on the device: the measured OCT voxels (world points, measured fraction, specimen mask, channels) and the
+    MRI channels and foreground."""
 
     def __init__(self, mri, oct, device="cuda"):
-        """mri = (v [2, D, H, W], mask [D, H, W], affine); oct = (u [2, d, h, w], w [d, h, w], affine); numpy or torch."""
-        (v, m, self.A_M), (u, w, A_O) = mri, oct
-        w = to_torch(w, device)
-        idx = torch.nonzero(w > 0)
-        if not len(idx):
-            raise ValueError("OCT weight is empty on the base grid")
+        """mri = (v [2, D, H, W], mask [D, H, W], affine); oct = (u [2, d, h, w], w [d, h, w] specimen mask, measured fraction
+        [d, h, w], affine); numpy or torch."""
+        (v, m, self.A_M), (u, w, q, A_O) = mri, oct
+        w, q = to_torch(w, device), to_torch(q, device)
+        idx = torch.nonzero(q > 0)
+        if not float(w.sum()) > 0:
+            raise ValueError("OCT specimen mask is empty on the base grid")
         self.c = box(A_O, w.shape)[0]
         self.pts = G.apply_affine(np.asarray(A_O, float), idx.to(torch.float32))
-        self.w = w[tuple(idx.T)]
+        self.q, self.w = q[tuple(idx.T)], w[tuple(idx.T)]
         self.u = to_torch(u, device)[(slice(None),) + tuple(idx.T)]
-        self.v, self.m = to_torch(v, device), to_torch(m, device)[None]
+        self.spec = self.w > 0
+        self.v = torch.cat([to_torch(v, device), to_torch(m, device)[None]])
 
     def score(self, T, polarity):
-        """S of pose T (torch 4x4) with the OCT channels swapped for polarity -1."""
-        a = self.u if polarity == 1 else self.u.flip(0)
-        return masked_ncc(G.sample_world(self.v, self.A_M, G.apply_affine(T, self.pts)), a, self.w)
-
-    @torch.no_grad()
-    def overlap(self, T):
-        """sum(w M(T x)) / sum(w) of pose T (numpy 4x4): fraction of the OCT weight on MRI foreground."""
-        T = torch.as_tensor(np.asarray(T, float), dtype=torch.float32, device=self.w.device)
-        return float((G.sample_world(self.m, self.A_M, G.apply_affine(T, self.pts))[0] * self.w).sum() / self.w.sum())
+        """(S, S_class signed, S_outline) of pose T (torch 4x4); S = (2 polarity S_class + S_outline) / 3."""
+        s = G.sample_world(self.v, self.A_M, G.apply_affine(T, self.pts))
+        S_class = masked_ncc(s[:2, self.spec], self.u[:, self.spec], self.w[self.spec])
+        S_outline = masked_ncc(s[2:], self.w[None], self.q)
+        return (2 * polarity * S_class + S_outline) / 3, S_class, S_outline
 
 
 def fit(grid, T0, polarity, params: Params = Params()):
     """Adam (lr_rot rad, lr_t mm, lr_ls, lr_sh) with a cosine schedule over params.iters steps from pose T0 (numpy 4x4), all
-    twelve affine parameters (r, t, 3 log-scales, 3 shears). -> (T numpy 4x4, S, L) of the iterate with the lowest L."""
+    twelve affine parameters (r, t, 3 log-scales, 3 shears). -> (T numpy 4x4, S, S_class, S_outline, L) of the iterate with the
+    lowest L."""
     P, dev = params, grid.w.device
     f = lambda x: torch.tensor(np.asarray(x, float), dtype=torch.float32, device=dev, requires_grad=True)
     r, t, ls, sh = (f(x) for x in decompose(T0, grid.c))
@@ -90,11 +91,11 @@ def fit(grid, T0, polarity, params: Params = Params()):
     opt = torch.optim.Adam([{"params": [r], "lr": P.lr_rot}, {"params": [t], "lr": P.lr_t}, {"params": [ls], "lr": P.lr_ls},
                             {"params": [sh], "lr": P.lr_sh}])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=P.iters, eta_min=0.0)
-    best = (math.inf, None, None)
+    best = (math.inf,)
     for _ in range(P.iters):
         opt.zero_grad(set_to_none=True)
         T = compose(r, t, ls, sh, c)
-        S = grid.score(T, polarity)
+        S, S_class, S_outline = grid.score(T, polarity)
         L = 1.0 - S + P.lam * ((ls ** 2).sum() + (sh ** 2).sum())
         L.backward()
         opt.step()
@@ -102,27 +103,22 @@ def fit(grid, T0, polarity, params: Params = Params()):
         with torch.no_grad():
             ls.clamp_(-P.clamp, P.clamp)
             sh.clamp_(-P.clamp, P.clamp)
-        l, s = torch.stack([L.detach(), S.detach()]).tolist()
+        l, *s = torch.stack([L.detach(), S.detach(), S_class.detach(), S_outline.detach()]).tolist()
         if l < best[0]:
-            best = (l, T.detach().cpu().double().numpy(), s)
-    return best[1], best[2], best[0]
+            best = (l, T.detach().cpu().double().numpy(), *s)
+    return (*best[1:], best[0])
 
 
-def refine(candidates, mri, oct, params: Params = Params(), device="cuda", tau=0.0):
-    """Fit every search pose (fit, its polarity fixed) on the base grid, drop the poses whose overlap (BaseGrid.overlap) is below
-    tau (the search's admissibility rule also holds after refinement) and sort by L. candidates: search output (T, polarity);
-    mri = (v [2, D, H, W], mask, affine), oct = (u [2, d, h, w], w, affine) on the base grid; tau: the search's overlap threshold.
-    -> [{T, S, L, polarity, log_scales, shears, overlap, search_rank}] lowest L first.
-    Raises ValueError when no pose keeps overlap >= tau."""
+def refine(candidates, mri, oct, params: Params = Params(), device="cuda"):
+    """Fit every search pose (fit, its polarity fixed) on the base grid and sort by L. candidates: search output (T, polarity);
+    mri = (v [2, D, H, W], mask, affine), oct = (u [2, d, h, w], w, measured fraction, affine) on the base grid.
+    -> [{T, S, S_class, S_outline, L, polarity, log_scales, shears, search_rank}] lowest L first."""
     if not candidates or any(c["polarity"] not in (1, -1) for c in candidates):
         raise ValueError("refine needs candidates with polarity +1 or -1")
     grid, poses = BaseGrid(mri, oct, device), []
     for i, c in enumerate(candidates):
-        T, S, L = fit(grid, np.asarray(c["T"], float), int(c["polarity"]), params)
+        T, S, S_class, S_outline, L = fit(grid, np.asarray(c["T"], float), int(c["polarity"]), params)
         _, _, ls, sh = decompose(T, grid.c)
-        poses.append(dict(T=T, S=S, L=L, polarity=int(c["polarity"]), log_scales=ls.tolist(), shears=sh.tolist(),
-                          overlap=grid.overlap(T), search_rank=i))
-    poses = sorted((p for p in poses if p["overlap"] >= tau), key=lambda p: p["L"])
-    if not poses:
-        raise ValueError(f"no refined pose keeps overlap >= tau = {tau:.3f}")
-    return poses
+        poses.append(dict(T=T, S=S, S_class=S_class, S_outline=S_outline, L=L, polarity=int(c["polarity"]),
+                          log_scales=ls.tolist(), shears=sh.tolist(), search_rank=i))
+    return sorted(poses, key=lambda p: p["L"])

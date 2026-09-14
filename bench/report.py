@@ -73,12 +73,10 @@ def main_section(run, logs):
         ("raw-data frame check (Spearman)", f"{num(fc.get('spearman_export'), 3)} at the pose; axis flips <= "
                                             f"{num(fc.get('max_flip_spearman'), 3)}; 2 mm shifts <= {num(shift_max, 3)}; "
                                             f"{('pass' if fc['ok'] else 'fail') if fc else 'n/a'}"),
-        ("final score S, polarity", f"{num(pose.get('S'), 4)}, {pose.get('polarity', 'n/a')}"),
+        ("score S = (2 polarity S_class + S_outline) / 3; S_class, S_outline; polarity",
+         f"{num(pose.get('S'), 4)}; {num(pose.get('S_class'), 4)}, {num(pose.get('S_outline'), 4)}; {pose.get('polarity', 'n/a')}"),
         ("search top-1 / top-2", f"{num(srch.get('top1'), 4)} / {num(srch.get('top2'), 4)}"),
-        ("refined poses below the overlap gate",
-         f"{res['refine']['n_below_tau']} of {res['refine']['n_poses']}" if "refine" in res else "n/a"),
         ("scale per OCT array axis", " / ".join(f"{v:.3f}" for v in pose["scale_per_oct_axis"]) if pose else "n/a"),
-        ("overlap", num(pose.get("overlap"), 3)),
         ("flags", "n/a" if "flags" not in res else ", ".join(res["flags"]) or "none"),
         ("pose vs the previous run, mean / corners mean / corners max",
          f"{num(pv.get('mean_mm'))} / {num(pv.get('corners_mean_mm'))} / {num(pv.get('corners_max_mm'))} mm" if pv else "n/a"),
@@ -109,12 +107,12 @@ def main_section(run, logs):
 
 def ablation_row(n, r):
     if "error" in r:
-        return (f"| {n} | {r['change']} | failed: {r['error']} | | | | | | {num(r['mask']['volume_cm3'])} "
+        return (f"| {n} | {r['change']} | failed: {r['error']} | | | | | | | {num(r['mask']['volume_cm3'])} "
                 f"({num(r['mask']['dice'], 3)}) | {num(r['seconds'], 0)} |")
     rim = r["boundary"]["rim_median_mm"]
     d = r["pose_to_base"]
     return (f"| {n} | {r['change']} | {num(d['mean_mm'])} / {num(d['corners_mean_mm'])} / {num(d['corners_max_mm'])} | "
-            f"{num(r['pose_to_R5']['corners_max_mm'])} | {num(r['S'], 4)} | {r['polarity']} | "
+            f"{num(r['pose_to_R5']['corners_max_mm'])} | {num(r['S'], 4)} | {num(r.get('L'), 4)} | {r['polarity']} | "
             f"{' / '.join(f'{s:.3f}' for s in r['scales'])} | {num(rim[0])} / {num(rim[1])} | "
             f"{num(r['mask']['volume_cm3'])} ({num(r['mask']['dice'], 3)}) | {num(r['seconds'], 0)} |")
 
@@ -123,14 +121,14 @@ def ablation_section(abl):
     if not abl:
         return ["## Ablations", "", "Not run yet (bench/ablate.py).", ""]
     V = abl["variants"]
-    cols = ("| variant | change | pose change: mean / corners mean / corners max (mm) | vs R5 corners max (mm) | S | polarity | scale "
+    cols = ("| variant | change | pose change: mean / corners mean / corners max (mm) | vs R5 corners max (mm) | S | L | polarity | scale "
             "| rim fwd / rev (mm) | OCT mask cm3 (Dice) | time (s) |")
     head = ["## Ablations", "",
             "Each variant is the method with one explicit change, run from the same preprocessed grids (one per OCT mask source). "
             "Pose change is against base (the method through the same driver), as the mean over the v1.1 specimen-mask points and "
             "the mean and max over the 8 corners of the OCT array. The boundary agreement uses the base masks for every variant, "
             "so it reflects the pose only.", "",
-            cols, "|---|---|---|---|---|---|---|---|---|---|"]
+            cols, "|---|---|---|---|---|---|---|---|---|---|---|"]
     rows = [ablation_row(n, r) for n, r in V.items()]
     tail = [""]
     dc = abl.get("driver_check")
@@ -148,7 +146,7 @@ def ablation_section(abl):
     rm = abl.get("removed_steps")
     if rm and rm.get("rows"):
         pb = rm["present_base_vs_previous_base"]
-        tail += ["### Removed steps", "", rm["note"], "", cols, "|---|---|---|---|---|---|---|---|---|---|"]
+        tail += ["### Removed steps", "", rm["note"], "", cols, "|---|---|---|---|---|---|---|---|---|---|---|"]
         tail += [ablation_row(n, r) for n, r in rm["rows"].items()]
         tail += ["", f"The present base lies {num(pb['mean_mm'])} mm (corners mean {num(pb['corners_mean_mm'])} mm, corners max "
                  f"{num(pb['corners_max_mm'])} mm, rotation "
@@ -173,7 +171,8 @@ def runtime_section(abl):
     return out
 
 
-SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A1": "MRI flattening off", "A2": "OCT flattening off",
+SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A0c": "holes filled in 3-D only", "A8": "other handedness",
+         "A1": "MRI flattening off", "A2": "OCT flattening off",
          "A3": "destripe off, ladder kept", "A4": "intensity channels", "A5+1": "polarity forced +1", "A5-1": "polarity forced -1",
          "A6": "no scale prior", "A7": "ladder off, destripe kept"}
 

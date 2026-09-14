@@ -31,8 +31,6 @@ class Params:
     topk: int = 24                            # poses kept after non-maximum suppression, each one refined
     nms_mm: float = 3.0                       # same pose if centres closer than nms_mm ...
     nms_deg: float = 10.0                     # ... and rotations closer than nms_deg
-    overlap_rho: float = 0.6                  # tau = overlap_rho min(1, V_MRI / V_OCT) for all poses (set on the validation pair)
-    overlap_floor: float = 0.15               # tau never below this (flagged)
     # affine refinement (step 5)
     iters: int = 200                          # Adam iterations per pose
     lam: float = 2.0                          # L = 1 - S + lam (sum log_scale^2 + sum shear^2)

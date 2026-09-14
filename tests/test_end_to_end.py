@@ -101,7 +101,7 @@ def test_register_and_apply(tmp_path):
     scale = res["pose"]["scale_per_oct_axis"]                   # true 1.03 / 1 / 1; the mask margin biases it low (0.91-0.97)
     assert 0 < res["boundary_mm"] < 0.4 and 0.85 < min(scale) and max(scale) < 1.1
     assert res["params"]["n_rot"] == FAST["n_rot"] and set(res["seconds"]) >= {"oct_mask", "search_refine", "total"}
-    assert res["refine"]["n_poses"] == FAST["topk"] and res["search"]["tau"] > 0
+    assert res["refine"]["n_poses"] == FAST["topk"] and res["search"]["n_orientations"] == FAST["n_rot"]
 
     ref = nib.load(str(out / "oct_in_mri.nii.gz"))
     assert ref.shape == nib.load(str(mri_path)).shape and np.allclose(ref.affine, nib.load(str(mri_path)).affine, atol=1e-6)
