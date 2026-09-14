@@ -55,14 +55,13 @@ def stack(vol):
 # ---------------------------------------------------------------------------------------------------------------- params
 def test_params_defaults_dict_and_hash():
     p = Params()
-    assert (p.levels, p.fine_mm, p.n_rot, p.topk, p.keep, p.iters, p.lam, p.clamp) == \
-        ((0.6, 0.3, 0.15), 0.04, 8000, 24, (8, 3, 1), (120, 200, 200), 2.0, 0.15)
-    assert not any(k.startswith("section") for k in p.to_dict()) and "base_mm" not in p.to_dict()
-    q = Params.from_dict(json.loads(json.dumps(dataclasses.replace(p, keep=(4, 2, 1), polarity="-1").to_dict())))
-    assert q == dataclasses.replace(p, keep=(4, 2, 1), polarity="-1") and q.hash() != p.hash() and len(p.hash()) == 16
-    assert Params.from_dict({"lam": 1, "oct_foreground": "intensity"}) == dataclasses.replace(p, lam=1.0, oct_foreground="intensity")
-    for bad in ({"rho": 0.8}, {"topk": 12.5}, {"topk": True}, {"polarity": "+2"}, {"features": "mind"}, {"keep": [8, 3]},
-                {"levels": [0.3, 0.6, 0.15]}, {"fine_mm": 0.2}, {"levels": [0.6, 0.15], "keep": [8, 1], "iters": [120, 200]}):
+    assert (p.search_mm, p.base_mm, p.fine_mm, p.n_rot, p.topk, p.iters, p.lam, p.clamp) == (0.6, 0.15, 0.04, 8000, 24, 200, 2.0, 0.15)
+    assert all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in p.to_dict().values())       # constants, no switches
+    q = Params.from_dict(json.loads(json.dumps(dataclasses.replace(p, topk=12, lam=0.0).to_dict())))
+    assert q == dataclasses.replace(p, topk=12, lam=0.0) and q.hash() != p.hash() and len(p.hash()) == 16
+    assert Params.from_dict({"lam": 1, "clamp": 1}) == dataclasses.replace(p, lam=1.0, clamp=1.0)
+    for bad in ({"rho": 0.8}, {"topk": 12.5}, {"topk": True}, {"polarity": "+1"}, {"destripe": False}, {"levels": [0.6, 0.15]},
+                {"fine_mm": 0.2}, {"search_mm": 0.1}, {"search_mm": 0.55}):
         with pytest.raises(ValueError):
             Params.from_dict(bad)
     env = dict(os.environ, PYTHONHASHSEED="4242", PYTHONPATH=str(ROOT))
@@ -204,10 +203,6 @@ def test_sampling_primitives():
     assert (out != 0).mean() > 0.3 and (out == 0).mean() > 0.05 and np.allclose(out, ref, atol=1e-5)
     m = x > 0.5
     assert np.array_equal(g.resample_to(m, A, shape, A, np.eye(4), order=0), m)
-    assert g.pose_distance(T, T, ijk) == 0.0
-    S = np.eye(4)
-    S[:3, 3] = (0.0, 2.0, 0.0)
-    assert np.isclose(g.pose_distance(S @ T, T, ijk), 2.0)
 
 
 def test_rotation_set():
@@ -249,7 +244,7 @@ def test_transform_txt_lta_itk_roundtrip(tmp_path):
         assert np.allclose(np.stack([num("xras"), num("yras"), num("zras")]), hdr["Mdc"], atol=1e-6)
     io.write_json({"T": T, "p": Params(), "nan": float("nan"), "f": np.float32(1.5), "path": tmp_path}, tmp_path / "r.json")
     back = json.loads((tmp_path / "r.json").read_text())
-    assert np.array_equal(back["T"], T) and back["p"]["levels"] == [0.6, 0.3, 0.15] and back["nan"] is None and back["f"] == 1.5
+    assert np.array_equal(back["T"], T) and back["p"]["search_mm"] == 0.6 and back["nan"] is None and back["f"] == 1.5
     sitk = pytest.importorskip("SimpleITK")                   # ITK file: dst voxel -> dst physical -> transform -> src voxel
     np.save(tmp_path / "a.npy", np.zeros((14, 12, 10), np.float32))                  # numpy (z, y, x): volume (10, 12, 14)
     arr = io.load_volume(tmp_path / "a.npy", spacing_um=(40, 30, 20))

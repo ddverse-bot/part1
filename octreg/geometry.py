@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy import ndimage
+from scipy.spatial.transform import Rotation
 
 from . import io
 
@@ -19,16 +20,10 @@ def _np(A) -> np.ndarray:
 
 
 def rotations(n, seed) -> np.ndarray:
-    """n rotations uniform on SO(3) from normalised Gaussian quaternions of numpy default_rng(seed); R[0] = identity.
+    """n rotations uniform on SO(3) from normalised Gaussian quaternions (w, x, y, z) of numpy default_rng(seed); R[0] = identity.
     -> [n, 3, 3] float64."""
-    rng = np.random.default_rng(seed)
-    q = rng.normal(size=(n, 4))
-    q /= np.linalg.norm(q, axis=1, keepdims=True)
-    w, x, y, z = q.T
-    R = np.stack([
-        1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
-        2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
-        2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=-1).reshape(n, 3, 3)
+    q = np.random.default_rng(seed).normal(size=(n, 4))
+    R = Rotation.from_quat(q[:, [1, 2, 3, 0]]).as_matrix()
     R[0] = np.eye(3)
     return R
 
@@ -42,25 +37,19 @@ def apply_affine(T, pts):
     return np.asarray(pts) @ T[:3, :3].T + T[:3, 3]
 
 
-def pose_distance(T1, T2, pts) -> float:
-    """Mean displacement |T1 x - T2 x| (mm) over pts [N, 3] (world mm)."""
-    return float(np.linalg.norm(apply_affine(T1, pts) - apply_affine(T2, pts), axis=-1).mean())
-
-
 def resample_iso(vol: io.Volume, level_mm, binary=False):
-    """Isotropic grid of spacing level_mm aligned with the volume axes, streamed plane by plane (memory: the output plus two
-    planes). Per axis box average over k = max(1, round(level_mm / spacing)) voxels (trailing remainder dropped), then
-    trilinear onto floor(pooled extent / level_mm) voxels starting at the first pooled voxel centre; beyond the last pooled
-    centre the trilinear blends with 0. k and the grid size use the spacing to 6 significant digits (a 20 um header stored
-    as float32 gives k = 2 and an exact 2^3 mean at 0.04 mm). binary: average the indicator voxel > 0 (a mask file), not the
-    values. -> (float32 [d, h, w], affine)."""
+    """Isotropic grid of spacing level_mm (mm) aligned with the volume axes, streamed plane by plane (memory: the output plus two
+    planes). Per axis box average over k = max(1, round(level_mm / spacing)) voxels (trailing remainder dropped), then trilinear
+    onto floor(pooled extent / level_mm) voxels from the first pooled voxel centre, blending with 0 beyond the last. k and the
+    grid size use the spacing to 6 significant digits (a float32 20 um header gives an exact 2^3 mean at 0.04 mm). binary:
+    average the indicator voxel > 0 (a mask file). -> (float32 [d, h, w], affine)."""
     planes = ((k, p > 0) for k, p in io.iter_planes(vol)) if binary else io.iter_planes(vol)
     return _iso(planes, vol.shape, vol.affine, level_mm)
 
 
 def pool_iso(arr, affine, voxel_mm, level_mm):
-    """resample_iso for an in-memory array [D, H, W] or [C, D, H, W] (e.g. the fine grid -> the pyramid) of voxel edge
-    voxel_mm (mm, scalar or per axis, must equal the affine column norms). -> (float32 array, affine)."""
+    """resample_iso for an in-memory array [D, H, W] or [C, D, H, W] of voxel edge voxel_mm (mm, scalar or per axis, equal to
+    the affine column norms). -> (float32 array, affine)."""
     arr = np.asarray(arr)
     if arr.ndim == 4:
         outs = [pool_iso(a, affine, voxel_mm, level_mm) for a in arr]

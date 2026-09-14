@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Label-free evaluation of an octreg run on Xiangrui's I58 brainstem pair (bench only; the method never sees any of this).
 
-    python bench/evaluate.py RUN [--masks DIR] [--no-frame-check] [-o RUN/eval.json]
+    python bench/evaluate.py RUN [--masks DIR] [--previous OLD_RUN] [--no-frame-check] [-o RUN/eval.json]
     python bench/evaluate.py --selftest                     # synthetic, CPU, a few seconds
 
 T = RUN/T_oct2mri.txt maps the OCT header world to the MRI header world (mm).
@@ -9,12 +9,16 @@ pose      Distance to the v1.1 reference pose R5. R5 maps the v1 pipeline OCT fr
           MRI header world, so in the OCT header frame it is T_ref = T_R5 @ A_spr @ inv(A_hdr), with A_hdr the OCT NIfTI header
           affine of the same raw array. Mean and max displacement over the v1.1 OCT specimen-mask points, the same at the 8 block
           corners, and the rotation angle of inv(T_ref) @ T. T_ref is also compared with the stored header-frame export of R5.
+          With --previous, the same distance to OLD_RUN/T_oct2mri.txt.
 mask      Volume of the run's OCT specimen mask (DIR/oct_mask.nii.gz) and its Dice against the stored v1.1 mask (18.05 cm3),
           counted on the v1.1 grid through the header affines.
 boundary  The boundary part of v1.1 qc_fine.py, simplified: OCT mask boundary voxels (>= 3 voxels from the grid faces, on non-zero
           OCT data, DIR/oct_valid.nii.gz) through T -> distance to the MRI foreground boundary (DIR/mri_mask.nii.gz; points within
           1 mm of the MRI grid faces are dropped), and MRI boundary voxels through inv(T) -> distance to the OCT boundary. Medians
           per outward-normal class along the raw OCT array axes; 'rim' leaves out the deep end a0+, which has no specimen rim.
+          Computed twice: with the run's masks (DIR) and with the stored v1.1 masks (oct150_mask.npy on oct150.npy > 0, and
+          mri_tissue.npy cleaned as in qc_fine.py), which reproduce qc_fine.py's R5 value. Each also holds the rim medians of R5
+          and of OLD_RUN under the same masks.
 frame     Port of v1.1 check_export_header.py: random voxels of RUN/oct_in_mri.nii.gz go through inv(T) and inv(A_hdr) to raw OCT
           voxels, whose 20 um values (box^3 mean) are streamed from the .nii.gz; Spearman against the exported values. Controls:
           T composed with a flip of each raw OCT axis about the block centre, and 2 mm shifts along each MRI world axis.
@@ -236,7 +240,23 @@ def frame_check(T, oct_in_mri, oct_path=OCT, n=40_000, box=7, seed=0):
             "variants": res, "box": box, "n_points": int(len(P))}
 
 
-def evaluate(run, masks=None, frame=True):
+def v11_masks(v11=V11):
+    """What qc_fine.py adds to the v1.1 OCT mask of reference(): (OCT valid on the v1.1 grid, MRI tissue cleaned, MRI affine).
+    Cleaning: closing with a radius-2 ball, fill holes, components >= 1 mm3."""
+    tissue, A_m = np.load(Path(v11) / "mri_tissue.npy").astype(bool), np.load(Path(v11) / "mri_affine.npy").astype(float)
+    z, y, x = np.ogrid[-2:3, -2:3, -2:3]
+    c = ndimage.binary_fill_holes(ndimage.binary_closing(tissue, structure=(z * z + y * y + x * x) <= 4))
+    lab, _ = ndimage.label(c)
+    keep = np.flatnonzero(np.bincount(lab.ravel()) * abs(np.linalg.det(A_m[:3, :3])) / 1000.0 >= 1e-3)
+    return np.load(Path(v11) / "oct150.npy") > 0, np.isin(lab, keep[keep > 0]), A_m
+
+
+def outline(bnd, T, others):
+    """Boundary agreement at T plus the rim medians of the other poses {name: T} under the same masks."""
+    return {**bnd(T), "rim_median_mm_of": {n: bnd(T2)["rim_median_mm"] for n, T2 in others.items()}}
+
+
+def evaluate(run, masks=None, frame=True, previous=None):
     run = Path(run)
     masks = Path(masks) if masks else run
     T = load_T(run / "T_oct2mri.txt")
@@ -245,6 +265,13 @@ def evaluate(run, masks=None, frame=True):
     out = {"run": str(run), "T_oct2mri": T.tolist(), "T_ref": ref["T_ref"].tolist(), "pose_to_R5": pose(T, ref["T_ref"], pts, cor),
            "reference_check": {"frames_signed_permutation": ref["signed_permutation"],
                                "formula_vs_stored_export_max_mm": pose(load_T(R5_EXPORT), ref["T_ref"], pts, cor)["max_mm"]}}
+    others = {"R5": ref["T_ref"]}
+    if previous:
+        others["previous"] = load_T(Path(previous) / "T_oct2mri.txt")
+        out["pose_to_previous"] = {"run": str(previous), **pose(T, others["previous"], pts, cor)}
+    valid, tissue, A_t = v11_masks(V11)
+    out["boundary_v11_masks"] = outline(Boundary(ref["mask"], ref["A_mask"], valid, tissue, A_t, ref["A_hdr"]), T, others)
+    del valid, tissue
     missing = [f for f in ("oct_mask.nii.gz", "oct_valid.nii.gz", "mri_mask.nii.gz") if not (masks / f).exists()]
     if not missing:
         om, A_o = load_mask(masks / "oct_mask.nii.gz")
@@ -253,7 +280,7 @@ def evaluate(run, masks=None, frame=True):
         if not np.allclose(A_v, A_o):
             raise ValueError("oct_valid.nii.gz and oct_mask.nii.gz are not on the same grid")
         out["mask"] = mask_agreement(om, A_o, ref["mask"], ref["A_mask"])
-        out["boundary"] = Boundary(om, A_o, valid, mm, A_m, ref["A_hdr"])(T)
+        out["boundary"] = outline(Boundary(om, A_o, valid, mm, A_m, ref["A_hdr"]), T, others)
     else:
         out["mask"] = out["boundary"] = {"available": False, "reason": f"missing in {masks}: {', '.join(missing)}"}
     if frame:
@@ -333,6 +360,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run", nargs="?", type=Path)
     ap.add_argument("--masks", type=Path, default=None, help="dir with oct_mask / oct_valid / mri_mask .nii.gz (default: RUN)")
+    ap.add_argument("--previous", type=Path, default=None, help="an earlier run dir (T_oct2mri.txt) to measure the pose against")
     ap.add_argument("--no-frame-check", action="store_true")
     ap.add_argument("-o", "--out", type=Path, default=None, help="default RUN/eval.json")
     ap.add_argument("--selftest", action="store_true")
@@ -341,9 +369,9 @@ def main():
         return selftest()
     if a.run is None:
         ap.error("RUN is required")
-    out = evaluate(a.run, a.masks, frame=not a.no_frame_check)
+    out = evaluate(a.run, a.masks, frame=not a.no_frame_check, previous=a.previous)
     (a.out or a.run / "eval.json").write_text(json.dumps(out, indent=1))
-    print(json.dumps({k: out[k] for k in ("pose_to_R5", "reference_check")}, indent=1))
+    print(json.dumps({k: out[k] for k in ("pose_to_R5", "pose_to_previous", "reference_check") if k in out}, indent=1))
 
 
 if __name__ == "__main__":

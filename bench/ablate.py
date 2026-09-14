@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Ablations of octreg 1.0 on Xiangrui's I58 brainstem pair (docs/design/spec_v1.0_lean.md: claims I1-I3 and the destripe).
+"""Ablations of octreg 1.0 on Xiangrui's I58 brainstem pair (docs/design/spec_v1.0_lean.md, claims I1-I3).
 
-    python bench/ablate.py --out /root/autodl-tmp/bench_runs/xiangrui_I58/ablate [--main RUN] [--only A1,A3] [--device cuda]
+    python bench/ablate.py --out ABL [--main RUN] [--previous OLD/ablations.json] [--only A1,A4] [--device cuda] [--force]
 
-The OCT is streamed once, each OCT foreground source (texture, intensity, the stored v1.1 mask) is computed once, and each
-preprocessing key (source x destripe on/off) is written once; the MRI is prepared once. Variants that change only the two-class
-maps, the search or the ladder reuse a key. The driver runs the register steps with the package's own functions: fine grid ->
-register.fine_mask -> destripe -> finest level (levels[-1]); register.pyramids; search at the coarsest level; ladder. 'base' is
-the default Params through this driver; its distance to the CLI run (--main) is reported as the driver check. Metrics from
-bench/evaluate.py: pose to base and to R5, boundary agreement with the base masks for every variant (so it reflects the pose
-only), OCT mask volume and Dice against the v1.1 mask per key.
+Params holds method constants only, so every variant is the register steps run here with the package's own functions and one
+explicit change: another OCT mask (A0 the histogram valley of the OCT, A0b the stored v1.1 mask through the --oct-mask path),
+two_class(..., flatten=False) for one modality (A1, A2), standardised intensity channels built in this file (A4),
+align(..., polarity=+1 / -1) (A5), or Params lam 0 and clamp 1 (A6). 'base' is the method through this driver; its distance to
+the CLI run (--main) is the driver check. The OCT is streamed once, each OCT mask is computed once and the MRI is prepared once.
 
-OUT/prep/<key>/  oct_h.npz, oct_mask / oct_valid / mri_mask .nii.gz (evaluate.py --masks), prep.json; prep/v11_mask.nii.gz is
-                 A0b's mask in the OCT header frame (the same variant through the CLI: --oct-mask prep/v11_mask.nii.gz)
+The section-stripe flat field (A3) and the rigid -> similarity -> affine ladder (A7) were removed after the first ablation run.
+Their rows are copied from that run's ablations.json (--previous); they were measured against that run's base, which still had
+both steps, and the pose change from that base to the present base is reported next to them.
+
+Metrics from bench/evaluate.py: pose to base and to R5, boundary agreement with the base masks for every variant (so it reflects
+the pose only), OCT mask volume and Dice against the v1.1 mask per mask source.
+
+OUT/prep/<mask>/  oct_h.npz, oct_mask / oct_valid / mri_mask .nii.gz (evaluate.py --masks), prep.json; prep/v11_mask.nii.gz is
+                  A0b's mask in the OCT header frame (the same variant through the CLI: --oct-mask prep/v11_mask.nii.gz)
 OUT/variants/<name>/  T_oct2mri.txt, result.json (reused unless --force)
 OUT/ablations.json    the table read by bench/report.py
 """
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import resource
 import shutil
@@ -29,49 +33,44 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import evaluate as E                                                    # noqa: E402  (bench/evaluate.py)
 from octreg import geometry as G, io, preprocess as pp                  # noqa: E402
 from octreg.params import Params                                        # noqa: E402
-from octreg.refine import refine                                        # noqa: E402
-from octreg.register import fine_mask, pyramids                         # noqa: E402
-from octreg.search import search                                        # noqa: E402
+from octreg.register import align, fine_mask                            # noqa: E402
 
-VARIANTS = {    # name: (what changes, Params changes, OCT mask = the stored v1.1 mask)
-    "base": ("the method", {}, False),
-    "A0": ("OCT intensity foreground (histogram valley) instead of the texture specimen mask", {"oct_foreground": "intensity"}, False),
-    "A0b": ("v1.1 rim-watershed specimen mask given as the OCT mask", {}, True),
-    "A1": ("MRI flattening off", {"mri_flatten": False}, False),
-    "A2": ("OCT flattening off", {"oct_flatten": False}, False),
-    "A3": ("section-stripe flat field off", {"destripe": False}, False),
-    "A4": ("intensity channels instead of two-class maps", {"features": "intensity"}, False),
-    "A5+1": ("polarity forced +1", {"polarity": "+1"}, False),
-    "A5-1": ("polarity forced -1", {"polarity": "-1"}, False),
-    "A6": ("no scale prior: lam 0 and clamp 1.0 (method: 2 and 0.15)", {"lam": 0.0, "clamp": 1.0}, False),
-    "A7": ("affine directly at the finest level from every search pose, no ladder", {"ladder": False}, False),
+VARIANTS = {    # name: (what changes, the explicit change: mask source, solve() keywords, Params overrides)
+    "base": ("the method", {}),
+    "A0": ("OCT intensity foreground (histogram valley) instead of the texture specimen mask", {"mask": "intensity"}),
+    "A0b": ("v1.1 rim-watershed specimen mask given as the OCT mask", {"mask": "v11mask"}),
+    "A1": ("MRI flattening off", {"mri_flatten": False}),
+    "A2": ("OCT flattening off", {"oct_flatten": False}),
+    "A4": ("standardised intensity channels (z, -z) instead of two-class maps", {"features": "intensity"}),
+    "A5+1": ("polarity forced +1", {"polarity": 1}),
+    "A5-1": ("polarity forced -1", {"polarity": -1}),
+    "A6": ("no scale prior: lam 0 and clamp 1.0 (method: 2 and 0.15)", {"params": {"lam": 0.0, "clamp": 1.0}}),
 }
-BASE = {}       # Params changes shared by every variant and the preprocessing (empty for the benchmark; synthetic smoke tests only)
-
-
-def params(name):
-    return Params.from_dict({**BASE, **VARIANTS[name][1]})
-
-
-def prep_key(name):
-    P = params(name)
-    return ("v11mask" if VARIANTS[name][2] else P.oct_foreground) + ("" if P.destripe else "_nodestripe")
+REMOVED = {"A3": "section-stripe flat field", "A7": "rigid -> similarity -> affine ladder"}
+REMOVED_NOTE = ("Copied from the first ablation run, whose base still had the section-stripe flat field and the ladder, so pose "
+                "changes in these rows are against that base. Removing either step moved the pose by less than the 0.5 mm deletion "
+                "threshold and both were deleted; the present base has neither.")
 
 
 def peak_rss_gb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 ** 3 if sys.platform == "darwin" else 1024 ** 2)   # bytes | kB
 
 
-def prepare(out, keys):
-    """Write prep/mri and every prep/<key> not on disk yet (the OCT fine grid is streamed at most once)."""
-    P, root = Params.from_dict(BASE), out / "prep"
-    h, mdir = P.levels[-1], root / "mri"
-    for d in [mdir] + [root / k for k in keys]:
+def mask_source(name):
+    return VARIANTS[name][1].get("mask", "texture")
+
+
+def prepare(out, sources):
+    """Write prep/mri and every prep/<source> not on disk yet (the OCT fine grid is streamed at most once)."""
+    P, root = Params(), out / "prep"
+    h, mdir = P.base_mm, root / "mri"
+    for d in [mdir] + [root / s for s in sources]:
         if (d / "prep.json").exists() and json.loads((d / "prep.json").read_text()).get("params_hash") != P.hash():
             raise ValueError(f"{d} was prepared with other Params: delete {root} to prepare again")
     if not (mdir / "mri_h.npz").exists():
@@ -83,82 +82,90 @@ def prepare(out, keys):
         io.save_nifti(mask.astype(np.uint8), A, mdir / "mri_mask.nii.gz")
         io.write_json({"foreground": info, "shape": arr.shape, "seconds": time.time() - t0, "peak_rss_gb": peak_rss_gb(),
                        "params_hash": P.hash()}, mdir / "prep.json")
-    todo = [k for k in keys if not (root / k / "oct_h.npz").exists()]
+    todo = [s for s in sources if not (root / s / "oct_h.npz").exists()]
     if not todo:
         return
     t0 = time.time()
     fine, A_f = G.resample_iso(io.load_volume(E.OCT), P.fine_mm)
-    raw_h, A_h = G.pool_iso(fine, A_f, P.fine_mm, h)
-    valid_h = G.pool_iso((fine > 0).astype(np.float32), A_f, P.fine_mm, h)[0] > 0.5
+    arr_h, A_h = G.pool_iso(fine, A_f, P.fine_mm, h)
+    valid_h = G.pool_iso(fine > 0, A_f, P.fine_mm, h)[0] > 0.5
     grid = {"fine_shape": fine.shape, "seconds": time.time() - t0, "peak_rss_gb": peak_rss_gb()}
     print(f"OCT fine grid {fine.shape} in {grid['seconds']:.0f} s", flush=True)
-    masks = {}
-    for src in sorted({k.split("_")[0] for k in todo}):
+    for s in todo:
         t1 = time.time()
-        if src == "v11mask":
+        if s == "texture":                                                     # the method
+            m, info = fine_mask(fine, A_f, P)
+        elif s == "v11mask":                                                   # A0b, through the CLI --oct-mask path
             ref = E.reference(E.OCT, E.V11, E.R5)
             io.save_nifti(ref["mask"].astype(np.uint8), ref["A_mask"], root / "v11_mask.nii.gz")
-            m, info = fine_mask(fine, A_f, P, io.load_volume(root / "v11_mask.nii.gz"))    # the CLI --oct-mask path
-        else:
-            m, info = fine_mask(fine, A_f, dataclasses.replace(P, oct_foreground=src))
-        masks[src] = (m, info, time.time() - t1)
-        print(f"OCT mask '{src}' in {time.time() - t1:.0f} s", flush=True)
-    for k in todo:
-        t1, (m, minfo, t_mask) = time.time(), masks[k.split("_")[0]]
-        if k.endswith("_nodestripe"):
-            arr_h, dinfo = raw_h, {"applied": False, "reason": "off"}
-        else:
-            f, dinfo = pp.destripe(fine, m, P.fine_mm, P)                      # a new array; fine stays raw
-            arr_h = G.pool_iso(f, A_f, P.fine_mm, h)[0]
-            del f
+            m, info = fine_mask(fine, A_f, P, io.load_volume(root / "v11_mask.nii.gz"))
+        else:                                                                  # A0: histogram valley of the OCT on the base grid
+            m_h, info = pp.foreground(arr_h, h, P)
+            m = G.resample_to(m_h, A_h, fine.shape, A_f, np.eye(4), order=0)
+            np.logical_and(m, fine > 0, out=m)
+            info["source"] = "intensity"
         mask_h = G.pool_iso(m, A_f, P.fine_mm, h)[0] > 0.5
-        d = root / k
+        del m
+        d = root / s
         d.mkdir(parents=True, exist_ok=True)
         np.savez(d / "oct_h.npz", arr=arr_h, mask=mask_h, valid=valid_h, affine=A_h)
         io.save_nifti(mask_h.astype(np.uint8), A_h, d / "oct_mask.nii.gz")
         io.save_nifti(valid_h.astype(np.uint8), A_h, d / "oct_valid.nii.gz")
         shutil.copy(mdir / "mri_mask.nii.gz", d / "mri_mask.nii.gz")
-        io.write_json({"key": k, "grid": grid, "mask": minfo, "mask_seconds": t_mask, "destripe": dinfo,
-                       "seconds": time.time() - t1, "peak_rss_gb": peak_rss_gb(), "params_hash": P.hash()}, d / "prep.json")
-        print(f"prep {k}: destripe {dinfo.get('reason')} in {time.time() - t1:.0f} s", flush=True)
+        io.write_json({"source": s, "grid": grid, "mask": info, "mask_seconds": time.time() - t1, "peak_rss_gb": peak_rss_gb(),
+                       "params_hash": P.hash()}, d / "prep.json")
+        print(f"OCT mask '{s}' in {time.time() - t1:.0f} s", flush=True)
 
 
-def solve(P, o, m, device):
-    """Register steps 3-5 on prepared finest-level arrays: register.pyramids, search, ladder."""
-    oct_pyr, mri_pyr = pyramids(o["arr"], o["mask"], o["affine"], m["arr"], m["mask"], m["affine"], P)
-    t0 = time.time()
-    cands, sinfo = search(*mri_pyr[P.levels[0]], *oct_pyr[P.levels[0]], P, device)
-    t1 = time.time()
-    best, finalists = refine(cands, mri_pyr, oct_pyr, P, device, sinfo["tau"])
-    return best, finalists, cands, sinfo, {"search_seconds": t1 - t0, "refine_seconds": time.time() - t1}
+def standardised(arr, mask, h, P):
+    """A4 map: z = (x - mean) / std over the foreground values clipped at p99.5, x = pp.flattened(arr) blurred with sigma one
+    voxel, i.e. pp.two_class without its Otsu threshold and sigmoid. -> float32 [D, H, W]."""
+    x = ndimage.gaussian_filter(pp.flattened(arr, mask, h, P), 1.0)
+    vals = np.minimum(x[mask], np.percentile(x[mask], 99.5))
+    return ((x - float(vals.mean())) / float(vals.std())).astype(np.float32)
+
+
+def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0):
+    """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls."""
+    h = P.base_mm
+    if features == "intensity":
+        z_o, z_m = standardised(o["arr"], o["mask"], h, P), standardised(m["arr"], m["mask"], h, P)
+        u, w, v = np.stack([z_o, -z_o]), o["mask"].astype(np.float32), np.stack([z_m, -z_m]) * m["mask"]
+    else:
+        u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], h, P, flatten=oct_flatten), o["mask"])
+        v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], h, P, flatten=mri_flatten), m["mask"])
+    return align((u, w, o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
 
 
 def run_variant(name, out, device, force):
-    d, P, key = out / "variants" / name, params(name), prep_key(name)
+    change, spec = VARIANTS[name]
+    d, src = out / "variants" / name, mask_source(name)
+    P = Params.from_dict(spec.get("params", {}))
+    kw = {k: v for k, v in spec.items() if k not in ("mask", "params")}
     old = json.loads((d / "result.json").read_text()) if (d / "result.json").exists() else {}
-    if not force and "error" not in old and old.get("params_hash") == P.hash():
+    if not force and "error" not in old and old.get("params_hash") == P.hash() and old.get("spec") == spec:
         return old
     d.mkdir(parents=True, exist_ok=True)
-    with np.load(out / "prep" / key / "oct_h.npz") as z, np.load(out / "prep" / "mri" / "mri_h.npz") as y:
+    with np.load(out / "prep" / src / "oct_h.npz") as z, np.load(out / "prep" / "mri" / "mri_h.npz") as y:
         o, m = {k: z[k] for k in z.files}, {k: y[k] for k in y.files}
     cuda = str(device).startswith("cuda")
     if cuda:
         torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
+    head = {"name": name, "change": change, "prep": src, "spec": spec, "params_hash": P.hash()}
     try:
-        best, finalists, cands, sinfo, times = solve(P, o, m, device)
+        poses, info = solve(o, m, P, device, **kw)
     except ValueError as e:                     # a variant may break the method (e.g. no admissible pose): recorded, not hidden
         if name == "base":
             raise
-        io.write_json({"name": name, "change": VARIANTS[name][0], "prep": key, "params": P.to_dict(), "error": f"{type(e).__name__}: {e}",
-                       "seconds": time.time() - t0}, d / "result.json")
+        io.write_json({**head, "error": f"{type(e).__name__}: {e}", "seconds": time.time() - t0}, d / "result.json")
         print(f"{name}: failed: {e}", flush=True)
         return json.loads((d / "result.json").read_text())
     keys = ("S", "L", "polarity", "mirror", "log_scales", "shears", "overlap", "search_rank")
-    r = {"name": name, "change": VARIANTS[name][0], "prep": key, "params": P.to_dict(), "params_hash": P.hash(), "T": best["T"],
-         "best": {k: best[k] for k in keys}, "finalists": [{k: f[k] for k in keys} for f in finalists], "search": sinfo,
-         "candidates": [{k: c[k] for k in ("S", "polarity", "mirror", "overlap")} for c in cands], "seconds": time.time() - t0,
-         **times, "gpu_peak_gb": torch.cuda.max_memory_allocated() / 1e9 if cuda else None, "peak_rss_gb": peak_rss_gb()}
+    best = poses[0]
+    r = {**head, "T": best["T"], "best": {k: best[k] for k in keys}, "poses": [{k: p[k] for k in keys} for p in poses], **info,
+         "seconds": time.time() - t0, "gpu_peak_gb": torch.cuda.max_memory_allocated() / 1e9 if cuda else None,
+         "peak_rss_gb": peak_rss_gb()}
     io.write_transform_txt(best["T"], d / "T_oct2mri.txt")
     io.write_json(r, d / "result.json")
     if cuda:
@@ -171,6 +178,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--main", type=Path, default=None, help="CLI run dir (T_oct2mri.txt) for the driver check")
+    ap.add_argument("--previous", type=Path, default=None, help="ablations.json of the first ablation run (rows A3 and A7)")
     ap.add_argument("--only", default=None, help=f"comma-separated subset of {','.join(VARIANTS)} (base is always run)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--force", action="store_true", help="recompute variants that already have a result (delete OUT/prep to redo "
@@ -179,38 +187,43 @@ def main():
     names = ["base"] + [n for n in (a.only.split(",") if a.only else VARIANTS) if n != "base"]
     if set(names) - set(VARIANTS):
         ap.error(f"unknown variants {sorted(set(names) - set(VARIANTS))}")
-    if a.main and not (a.main / "T_oct2mri.txt").exists():
-        ap.error(f"--main {a.main} has no T_oct2mri.txt")
+    for path, need in ((a.main, "T_oct2mri.txt"), (a.previous, "")):
+        if path and not (path / need if need else path).exists():
+            ap.error(f"{path} has no {need or 'file'}")
     t0 = time.time()
-    keys = sorted({prep_key(n) for n in names})
-    prepare(a.out, keys)
+    sources = sorted({mask_source(n) for n in names})
+    prepare(a.out, sources)
     ref = E.reference(E.OCT, E.V11, E.R5)
     pts, cor = E.grid_points(ref["mask"], ref["A_mask"]), E.corners(ref["shape"], ref["A_hdr"])
-    b = a.out / "prep" / prep_key("base")
+    b = a.out / "prep" / "texture"
     bnd = E.Boundary(*E.load_mask(b / "oct_mask.nii.gz"), E.load_mask(b / "oct_valid.nii.gz")[0], *E.load_mask(b / "mri_mask.nii.gz"),
                      ref["A_hdr"])
-    masks = {k: E.mask_agreement(*E.load_mask(a.out / "prep" / k / "oct_mask.nii.gz"), ref["mask"], ref["A_mask"]) for k in keys}
+    masks = {s: E.mask_agreement(*E.load_mask(a.out / "prep" / s / "oct_mask.nii.gz"), ref["mask"], ref["A_mask"]) for s in sources}
     rows = {n: run_variant(n, a.out, a.device, a.force) for n in names}
     T_base = np.array(rows["base"]["T"])
     table = {}
     for n, r in rows.items():
+        common = {"change": r["change"], "prep": r["prep"], "spec": r["spec"], "mask": masks[r["prep"]], "seconds": r["seconds"]}
         if "error" in r:
-            table[n] = {"change": r["change"], "prep": r["prep"], "params_changed": VARIANTS[n][1], "error": r["error"],
-                        "mask": masks[r["prep"]], "seconds": r["seconds"]}
+            table[n] = {**common, "error": r["error"]}
             continue
-        T = np.array(r["T"])
+        T, best = np.array(r["T"]), r["best"]
         to_base = E.pose(T, T_base, pts, cor)
-        table[n] = {"change": r["change"], "prep": r["prep"], "params_changed": VARIANTS[n][1], "S": r["best"]["S"], "L": r["best"]["L"],
-                    "polarity": r["best"]["polarity"], "mirror": r["best"]["mirror"], "scales": np.exp(r["best"]["log_scales"]).tolist(),
-                    "shears": r["best"]["shears"], "overlap": r["best"]["overlap"],
+        table[n] = {**common, "S": best["S"], "L": best["L"], "polarity": best["polarity"], "mirror": best["mirror"],
+                    "scales": np.exp(best["log_scales"]).tolist(), "shears": best["shears"], "overlap": best["overlap"],
                     "search": {k: r["search"].get(k) for k in ("top1", "top2", "n_admissible", "tau", "overlap_floor")},
-                    "pose_to_base": to_base, "within_0.5mm_of_base": to_base["mean_mm"] <= 0.5,
-                    "pose_to_R5": E.pose(T, ref["T_ref"], pts, cor),
-                    "boundary": bnd(T), "mask": masks[r["prep"]], "seconds": r["seconds"], "search_seconds": r["search_seconds"],
-                    "refine_seconds": r["refine_seconds"], "gpu_peak_gb": r["gpu_peak_gb"], "T_oct2mri": r["T"]}
-    res = {"pair": "Xiangrui I58 brainstem", "oct": E.OCT, "mri": E.MRI, "params_hash": Params.from_dict(BASE).hash(),
-           "prep": {k: json.loads((a.out / "prep" / k / "prep.json").read_text()) for k in keys + ["mri"]},
+                    "refine": r["refine"], "pose_to_base": to_base, "within_0.5mm_of_base": to_base["mean_mm"] <= 0.5,
+                    "pose_to_R5": E.pose(T, ref["T_ref"], pts, cor), "boundary": bnd(T), "search_seconds": r["search"]["seconds"],
+                    "refine_seconds": r["refine"]["seconds"], "gpu_peak_gb": r["gpu_peak_gb"], "T_oct2mri": r["T"]}
+    res = {"pair": "Xiangrui I58 brainstem", "oct": E.OCT, "mri": E.MRI, "params_hash": Params().hash(),
+           "prep": {s: json.loads((a.out / "prep" / s / "prep.json").read_text()) for s in sources + ["mri"]},
            "variants": table, "seconds": time.time() - t0, "peak_rss_gb": peak_rss_gb()}
+    if a.previous:
+        prev = json.loads(a.previous.read_text())
+        rows = {n: {**prev["variants"][n], "pose_to_present_base": E.pose(np.array(prev["variants"][n]["T_oct2mri"]), T_base, pts, cor)}
+                for n in REMOVED if n in prev["variants"] and "error" not in prev["variants"][n]}
+        res["removed_steps"] = {"source": a.previous, "note": REMOVED_NOTE, "step": REMOVED, "rows": rows,
+                                "present_base_vs_previous_base": E.pose(T_base, np.array(prev["variants"]["base"]["T_oct2mri"]), pts, cor)}
     if a.main:
         T_main = E.load_T(a.main / "T_oct2mri.txt")
         res["driver_check"] = {"main_run": a.main, "base_vs_main": E.pose(T_base, T_main, pts, cor),

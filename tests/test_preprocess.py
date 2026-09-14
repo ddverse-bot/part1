@@ -1,5 +1,5 @@
-"""preprocess: histogram-valley status, isotropic-texture specimen mask against the intensity rule, stripe detection and
-flat field (each axis, no-op, zeros, chunk invariance), flattening, gain invariance and the channel pairs."""
+"""preprocess: histogram-valley status, isotropic-texture specimen mask against the intensity rule (and chunk invariance),
+flattening, gain invariance and the channel pairs."""
 import dataclasses
 
 import numpy as np
@@ -57,51 +57,6 @@ def test_specimen_mask_texture_not_intensity(monkeypatch, voxel_mm, min_dice):
     assert np.array_equal(pp.specimen_mask(vol, voxel_mm, Q)[0], m)      # chunked == unchunked
 
 
-def _striped(seed, axis, n=80):
-    """Isotropic texture; with an axis: texture independent between planes along it plus a sawtooth of plane offsets with
-    random dropouts (period 7.5 planes); a black tile column."""
-    rng = np.random.default_rng(seed)
-    tex = ndimage.gaussian_filter(rng.standard_normal((n,) * 3), 1.5)
-    vol = 1000 + 100 * tex / tex.std()
-    if axis is not None:
-        sig = [1.5, 1.5, 1.5]
-        sig[axis] = 0
-        planar = ndimage.gaussian_filter(rng.standard_normal((n,) * 3), sig)
-        prof = 60 * ((np.arange(n) + rng.uniform(0, 7.5)) % 7.5 / 7.5 - 0.5) + rng.normal(0, 20, n)
-        vol = vol + 100 * planar / planar.std() + prof.reshape([-1 if d == axis else 1 for d in range(3)])
-    vol = vol.astype(np.float32)
-    vol[:16, :16] = 0
-    return vol
-
-
-def _profile_residual(vol, axis):
-    v = np.moveaxis(vol, axis, 0)
-    prof = v.sum((1, 2)) / (v > 0).sum((1, 2))
-    return float((prof - ndimage.uniform_filter1d(prof, 15, mode="nearest")).std())
-
-
-@pytest.mark.parametrize("axis", [0, 1, 2])
-def test_destripe_axis(axis, monkeypatch):
-    vol = _striped(10 + axis, axis)
-    orig = vol.copy()
-    out, info = pp.destripe(vol, orig > 0, 0.04, P)
-    assert out is not vol and np.array_equal(vol, orig)                  # a new array; the input is not modified
-    assert info["applied"] and info["axis"] == axis and info["ratio"] < P.destripe_ncc_ratio
-    assert _profile_residual(out, axis) < 0.2 * _profile_residual(orig, axis)
-    assert (out[orig == 0] == 0).all() and (out[orig > 0] > 0).all()
-    monkeypatch.setattr(pp, "_CHUNK", 12)                                # padding (48 planes) spans several chunks
-    assert np.array_equal(pp.destripe(orig.copy(), None, 0.04, P)[0], out)
-
-
-def test_destripe_noop():
-    vol = _striped(2, None)
-    orig = vol.copy()
-    out, info = pp.destripe(vol, None, 0.04, P)
-    assert info["reason"] == "not_decisive" and not info["applied"] and np.array_equal(out, orig)
-    out, info = pp.destripe(_striped(3, 1), None, 0.04, dataclasses.replace(P, destripe=False))
-    assert info["reason"] == "off" and info["ncc_by_axis"] is None
-
-
 def _classes(seed, n=96):
     rng = np.random.default_rng(seed)
     truth = ndimage.gaussian_filter(rng.standard_normal((n,) * 3), 4.0) > 0
@@ -134,8 +89,3 @@ def test_channels():
     np.testing.assert_allclose(u.sum(0), 1, atol=1e-6)
     assert np.array_equal(w, mask.astype(np.float32)) and not v[:, ~mask].any()
     np.testing.assert_allclose(v.sum(0), mask, atol=1e-6)
-    z = pp.two_class(img, mask, 0.6, dataclasses.replace(P, features="intensity"))
-    assert abs(z[mask].mean()) < 0.05 and abs(z[mask].std() - 1) < 0.05
-    u, _ = pp.oct_channels(z, mask, "intensity")
-    v = pp.mri_channels(z, mask, "intensity")
-    assert np.array_equal(u[1], -u[0]) and np.array_equal(v[1], -v[0]) and np.array_equal(v[0], z * mask)

@@ -1,4 +1,4 @@
-"""Orientation search (method step 4) on the coarsest pyramid level.
+"""Orientation search (method step 4) on the search grid (Params.search_mm).
 
 For every rotation of a fixed uniform set, and each rotation mirrored, the OCT two-class template is correlated with the MRI
 crop over all translations by FFT (weighted NCC with a Padfield-style mask).
@@ -38,9 +38,7 @@ def box(affine, shape):
 def angle_deg(R1, R2):
     """Rotation angle (deg) between two orthogonal 3x3 matrices; 180 when their handedness differs."""
     R = np.asarray(R1, float) @ np.asarray(R2, float).T
-    if np.linalg.det(R) < 0:
-        return 180.0
-    return math.degrees(math.acos(np.clip((np.trace(R) - 1) / 2, -1.0, 1.0)))
+    return 180.0 if np.linalg.det(R) < 0 else math.degrees(math.acos(np.clip((np.trace(R) - 1) / 2, -1.0, 1.0)))
 
 
 class Searcher:
@@ -86,12 +84,11 @@ class Searcher:
         self.overlap_floor = bool(tau < params.overlap_floor)
         self.tau = max(tau, params.overlap_floor)
 
-    def _corr(self, x, FX):
-        """Cross-correlation over all translations of a template x [..., n, n, n] (placed at the grid origin) with FFT'd FX."""
-        n = self.n
+    def _ft(self, x):
+        """Conjugate FFT of a template x [..., n, n, n] placed at the grid origin (correlation over all translations)."""
         xp = x.new_zeros(x.shape[:-3] + self.shape)
-        xp[..., :n, :n, :n] = x
-        return torch.fft.irfftn(torch.fft.rfftn(xp, dim=DIMS).conj() * FX, s=self.shape, dim=DIMS)
+        xp[..., :self.n, :self.n, :self.n] = x
+        return torch.fft.rfftn(xp, dim=DIMS).conj()
 
     @torch.no_grad()
     def score(self, R):
@@ -101,18 +98,13 @@ class Searcher:
         pts = self.c_t + self.tgrid @ torch.as_tensor(np.asarray(R), dtype=torch.float32, device=self.dev)   # x_o = c_o + R^T y
         vals = G.sample_world(self.src, self.A_src, pts)
         T, w = vals[:2].reshape(2, n, n, n), vals[2].reshape(n, n, n)
-        N = w.sum() + EPS
-        Fw = w.new_zeros(self.shape)
-        Fw[:n, :n, :n] = w
-        Fw = torch.fft.rfftn(Fw).conj()
-        SI = torch.fft.irfftn(Fw * self.FI, s=self.shape, dim=DIMS)
-        SII = torch.fft.irfftn(Fw * self.FI2, s=self.shape, dim=DIMS)
-        overlap = torch.fft.irfftn(Fw * self.Ftis, s=self.shape) / N
-        wT = w * T
+        N, Fw, wT = w.sum() + EPS, self._ft(w), w * T
+        SI, SII, SIT, tis = (torch.fft.irfftn(a * b, s=self.shape, dim=DIMS)
+                             for a, b in ((Fw, self.FI), (Fw, self.FI2), (self._ft(wT), self.FI), (Fw, self.Ftis)))
         ST, STT = wT.sum(DIMS).reshape(2, 1, 1, 1), (wT * T).sum(DIMS).reshape(2, 1, 1, 1)
-        cov = self._corr(wT, self.FI) - ST * SI / N
         varI = torch.maximum(SII - SI * SI / N, self.var_floor * N)
-        S = (cov / torch.sqrt(((STT - ST * ST / N) * varI).clamp(min=EPS))).mean(0)
+        S = ((SIT - ST * SI / N) / torch.sqrt(((STT - ST * ST / N) * varI).clamp(min=EPS))).mean(0)
+        overlap = tis / N
         return S, overlap, self.valid & (overlap >= self.tau)
 
     def pose(self, R, index):
@@ -124,27 +116,27 @@ class Searcher:
         return T
 
 
-def search(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, params: Params = Params(), device="cuda"):
-    """Orientation search at one grid (arguments as Searcher). Rotations: geometry.rotations(n_rot, seed), plus each composed with
-    diag(1, 1, -1) if params.mirror. Per orientation the admissible argmax of |S| (polarity 'sign'; the sign is the polarity) or of
-    polarity x S (polarity '+1' / '-1' forced). Greedy NMS on polarity x S: a pose duplicates a kept one iff centres are closer
-    than nms_mm and rotations (same handedness) closer than nms_deg; the best topk are kept.
+def search(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, params: Params = Params(), device="cuda", polarity=0):
+    """Orientation search at one grid (arguments as Searcher). Rotations: geometry.rotations(n_rot, seed), each also composed with
+    diag(1, 1, -1) (both handednesses). Per orientation the admissible argmax of |S|, whose sign is the polarity (polarity 0, the
+    method), or of polarity x S (polarity +1 / -1 forced). Greedy NMS on polarity x S: a pose duplicates a kept one iff centres
+    are closer than nms_mm and rotations (same handedness) closer than nms_deg; the best topk are kept.
     -> (candidates [{T 4x4, S signed, polarity +1|-1, mirror bool, overlap}] best first,
         info {top1, top2 (polarity x S of the first two), n_admissible orientations, tau, overlap_floor flag, n_orientations, seconds})."""
     P, t0 = params, time.time()
-    forced = {"sign": 0, "+1": 1, "-1": -1}[P.polarity]
+    if polarity not in (0, 1, -1):
+        raise ValueError(f"polarity must be 0 (sign of the score), +1 or -1, got {polarity!r}")
     s = Searcher(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, P, device)
     Rs = G.rotations(P.n_rot, P.seed)
-    if P.mirror:
-        Rs = np.concatenate([Rs, Rs @ MIRROR])
+    Rs = np.concatenate([Rs, Rs @ MIRROR])
     found = []
     for i, R in enumerate(Rs):
         S, overlap, adm = s.score(R)
-        X = (S.abs() if forced == 0 else forced * S).masked_fill(~adm, float("-inf")).reshape(-1)
+        X = (S.abs() if polarity == 0 else polarity * S).masked_fill(~adm, float("-inf")).reshape(-1)
         j = torch.argmax(X)
         x, Sj, ov, j = torch.stack([X[j].double(), S.reshape(-1)[j].double(), overlap.reshape(-1)[j].double(), j.double()]).tolist()
         if x > float("-inf"):
-            found.append((x, i, int(j), Sj, forced or (1 if Sj >= 0 else -1), ov))
+            found.append((x, i, int(j), Sj, polarity or (1 if Sj >= 0 else -1), ov))
     if not found:
         raise ValueError(f"no admissible pose: no orientation reaches overlap tau = {s.tau:.3f}")
     kept = []

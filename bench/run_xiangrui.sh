@@ -6,11 +6,15 @@
 #
 # STEPS   in order; default "register evaluate". The whole benchmark is "register ablate evaluate report".
 #           register  python -m octreg register OCT MRI -o OUT
-#           ablate    bench/ablate.py: preprocessing once, variants A0-A7 -> ABL/ablations.json
-#           evaluate  bench/evaluate.py OUT: pose to R5, raw-data frame check; mask and boundary metrics once ABL/prep/texture exists
-#           report    bench/report.py -> docs/BENCHMARK.md
-# OUT     run dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/main); logs go to ${OUT}_logs next to it
-# ABL     ablation dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/ablate); DEVICE cuda | cpu (default cuda)
+#           ablate    bench/ablate.py: preprocessing once, variants A0-A6 -> ABL/ablations.json (A3, A7 copied from PREV)
+#           evaluate  bench/evaluate.py OUT: pose to R5 and to PREV_MAIN, boundary with the v1.1 masks, raw-data frame check;
+#                     mask and boundary metrics with the method masks once ABL/prep/texture exists
+#           report    bench/report.py -> docs/BENCHMARK.md, docs/figures/fig_qc_xiangrui.png and fig_ablation.png
+# OUT     run dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/final/main); logs go to ${OUT}_logs next to it
+# ABL     ablation dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/final/ablate); DEVICE cuda | cpu (default cuda)
+# PREV    ablations.json of the first ablation run, source of the removed-step rows A3 and A7
+#         (default /root/autodl-tmp/bench_runs/xiangrui_I58/ablate/ablations.json; skipped if missing)
+# PREV_MAIN  an earlier CLI run dir for evaluate's pose distance (default /root/autodl-tmp/bench_runs/xiangrui_I58/main)
 # Every step writes NAME.log, NAME.time (wall time and peak RSS, GNU time wording) and NAME.gpu_mib (nvidia-smi every 5 s);
 # chain.log has one line per step. One heavy job at a time (62 GB container): refuses to start while another registration runs.
 set -u
@@ -19,8 +23,10 @@ DATA=/root/autodl-tmp/oct-mri-registration/data/xiangrui/OCT_to_MRI
 OCT=$DATA/I58_Brainstem_mus_Slice_full_20um_corr.nii.gz
 MRI=$DATA/I58_brainstem_MRI_cropped_to_OCT.nii.gz
 BENCH=/root/autodl-tmp/bench_runs/xiangrui_I58
-OUT=${OUT:-$BENCH/main}
-ABL=${ABL:-$BENCH/ablate}
+OUT=${OUT:-$BENCH/final/main}
+ABL=${ABL:-$BENCH/final/ablate}
+PREV=${PREV:-$BENCH/ablate/ablations.json}
+PREV_MAIN=${PREV_MAIN:-$BENCH/main}
 LOGS=${OUT}_logs
 STEPS=${STEPS:-register evaluate}
 DEVICE=${DEVICE:-cuda}
@@ -63,11 +69,13 @@ for s in $STEPS; do
   case $s in
     register) step register python -m octreg register "$OCT" "$MRI" -o "$OUT" --device "$DEVICE" || exit 1 ;;
     ablate)   MAIN=(); [ -f "$OUT/T_oct2mri.txt" ] && MAIN=(--main "$OUT")
+              [ -f "$PREV" ] && MAIN+=(--previous "$PREV")
               step ablate python bench/ablate.py --out "$ABL" ${MAIN[@]+"${MAIN[@]}"} --device "$DEVICE" || exit 1 ;;
-    evaluate) MASKS=(); [ -f "$ABL/prep/texture/oct_mask.nii.gz" ] && MASKS=(--masks "$ABL/prep/texture")
-              [ ${#MASKS[@]} -eq 0 ] && say "evaluate: no $ABL/prep/texture yet, so no mask and boundary metrics (run the ablate step first)"
-              step evaluate python bench/evaluate.py "$OUT" ${MASKS[@]+"${MASKS[@]}"} || exit 1 ;;
-    report)   step report python bench/report.py --main "$OUT" --ablate "$ABL" --logs "$LOGS" -o docs/BENCHMARK.md || exit 1 ;;
+    evaluate) ARGS=(); [ -f "$PREV_MAIN/T_oct2mri.txt" ] && ARGS=(--previous "$PREV_MAIN")
+              if [ -f "$ABL/prep/texture/oct_mask.nii.gz" ]; then ARGS+=(--masks "$ABL/prep/texture")
+              else say "evaluate: no $ABL/prep/texture yet, so no metrics with the method masks (run the ablate step first)"; fi
+              step evaluate python bench/evaluate.py "$OUT" ${ARGS[@]+"${ARGS[@]}"} || exit 1 ;;
+    report)   step report python bench/report.py --main "$OUT" --ablate "$ABL" --logs "$LOGS" -o docs/BENCHMARK.md --figures docs/figures || exit 1 ;;
     *)        say "unknown step '$s' (register | ablate | evaluate | report)"; exit 1 ;;
   esac
 done

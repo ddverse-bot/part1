@@ -1,6 +1,6 @@
 """End to end through the command line on a small synthetic pair, CPU: an agarose-embedded OCT block (equal mean intensity,
 section offsets, tile seams, a black tile, inverted contrast, LPI-like header) and an MRI crop (RIA-like header) related by
-a known affine. Reduced search and ladder through --params; the pose is recovered to < 0.4 mm (0.16-0.21 mm over seeds 0-3),
+a known affine. Reduced search and refinement through --params; the pose is recovered to < 0.4 mm (0.16-0.17 mm over seeds 0-2),
 the texture mask finds the specimen where the histogram rule has no valley, every output is written and `octreg apply`
 reproduces oct_in_mri.nii.gz; user masks replace both foregrounds."""
 import json
@@ -15,7 +15,12 @@ from octreg.cli import main
 from octreg.params import Params
 from octreg.register import OUTPUTS
 
-FAST = {"fine_mm": 0.08, "n_rot": 24, "topk": 6, "keep": [3, 2, 1], "iters": [60, 80, 80],
+
+def distance(T1, T2, pts):
+    return np.linalg.norm(G.apply_affine(T1, pts) - G.apply_affine(T2, pts), axis=1).mean()
+
+
+FAST = {"fine_mm": 0.08, "n_rot": 24, "topk": 6, "iters": 120,
         "texture_smooth_mm": 0.32}                  # the synthetic block is a few mm across (the default 1.2 mm suits real blocks)
 
 
@@ -80,7 +85,7 @@ def test_register_and_apply(tmp_path):
     assert all((out / f).is_file() for f in OUTPUTS)
     res = json.loads((out / "result.json").read_text())
     T = np.loadtxt(out / "T_oct2mri.txt")
-    assert G.pose_distance(T, T_true, pts) < 0.4                                          # 0.16 mm when written
+    assert distance(T, T_true, pts) < 0.4
     assert res["pose"]["polarity"] == -1 and not res["pose"]["mirror"] and "nondefault_params" in res["flags"]
     assert np.allclose(np.loadtxt(out / "T_mri2oct.txt") @ T, np.eye(4), atol=1e-9) and np.allclose(res["T_oct2mri"], T)
     assert res["foreground"]["oct"]["source"] == "texture" and res["foreground"]["mri"]["status"] == "ok"
@@ -90,7 +95,8 @@ def test_register_and_apply(tmp_path):
     assert 0.9 < res["foreground"]["oct"]["volume_cm3"] / (len(pts) * 0.08 ** 3 / 1e3) < 1.3          # 1.10-1.12 over seeds
     scale = res["pose"]["scale_per_oct_axis"]                   # true 1.03 / 1 / 1; the mask margin biases it low (0.91-0.97)
     assert 0 < res["boundary_mm"] < 0.4 and 0.85 < min(scale) and max(scale) < 1.1
-    assert res["params"]["n_rot"] == FAST["n_rot"] and set(res["seconds"]) >= {"search", "refine", "total"}
+    assert res["params"]["n_rot"] == FAST["n_rot"] and set(res["seconds"]) >= {"oct_mask", "search_refine", "total"}
+    assert res["refine"]["n_poses"] == FAST["topk"] and res["search"]["tau"] > 0
 
     ref = nib.load(str(out / "oct_in_mri.nii.gz"))
     assert ref.shape == nib.load(str(mri_path)).shape and np.allclose(ref.affine, nib.load(str(mri_path)).affine, atol=1e-6)
@@ -121,4 +127,4 @@ def test_user_masks(tmp_path):
                  "--mri-mask", str(tmp_path / "mri_mask.nii.gz"), "--device", "cpu", "--params", str(tmp_path / "params.json")]) == 0
     res = json.loads((out / "result.json").read_text())
     assert res["foreground"]["oct"]["source"].endswith("oct_mask.nii.gz") and res["foreground"]["mri"]["source"].endswith("mri_mask.nii.gz")
-    assert G.pose_distance(np.loadtxt(out / "T_oct2mri.txt"), T_true, pts) < 0.4 and res["pose"]["polarity"] == -1
+    assert distance(np.loadtxt(out / "T_oct2mri.txt"), T_true, pts) < 0.4 and res["pose"]["polarity"] == -1

@@ -13,7 +13,6 @@ import gzip
 import json
 import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +20,7 @@ import numpy as np
 UNIT_MM = {"nm": 1e-6, "um": 1e-3, "µm": 1e-3, "μm": 1e-3, "micron": 1e-3, "mm": 1.0, "cm": 10.0, "m": 1e3, "meter": 1e3}
 
 
-@dataclass(eq=False)
+@dataclasses.dataclass(eq=False)
 class Volume:
     """A 3-D image on disk (header only; voxels are read with iter_planes). shape: voxels along (i, j, k); affine: 4x4
     voxel -> world mm; spacing_mm: voxel edges along (i, j, k), the affine column norms; frame: 'header' | 'array'."""
@@ -113,21 +112,16 @@ def _ome_spacing(xml):
 
 def iter_planes(vol: Volume):
     """Yield (k, plane float32 [shape_i, shape_j]) for every plane along the last axis, one plane in memory at a time, in
-    file order (.nii.gz: the gzip stream; TIFF: pages or memmap; .nii / NPY: memmap). NIfTI scl_slope / scl_inter are applied;
+    file order (NIfTI: the (gzip) byte stream; TIFF: pages or memmap; NPY: memmap). NIfTI scl_slope / scl_inter are applied;
     non-finite voxels are yielded as 0."""
     kind, (ni, nj, nk) = _kind(vol.path), vol.shape
     if kind == "nii":
         import nibabel as nib
         img = nib.load(vol.path)
         dt, off, slope, inter = img.header.get_data_dtype(), int(img.dataobj.offset), float(img.dataobj.slope), float(img.dataobj.inter)
-        if not vol.path.lower().endswith(".gz"):
-            arr = np.memmap(vol.path, dt, "r", off, (ni, nj, nk), order="F")
-            for k in range(nk):
-                yield k, _finish(arr[:, :, k], slope, inter)
-            return
         nbytes = ni * nj * dt.itemsize
-        with gzip.open(vol.path, "rb") as f:                   # nibabel resets vox_offset to 0 in .gz headers: use dataobj.offset
-            f.read(off)
+        with (gzip.open if vol.path.lower().endswith(".gz") else open)(vol.path, "rb") as f:
+            f.read(off)                                        # nibabel resets vox_offset to 0 in .gz headers: use dataobj.offset
             for k in range(nk):
                 buf = f.read(nbytes)
                 if len(buf) != nbytes:
@@ -204,7 +198,7 @@ def write_itk(T, src: Volume, dst: Volume, path) -> None:
 
 
 def write_json(obj, path) -> None:
-    """JSON (indent 1) of dicts, lists, dataclasses, numpy / torch arrays and scalars, Paths; NaN and inf become null."""
+    """JSON (indent 1) of dicts, lists, dataclasses, numpy arrays and scalars, Paths; NaN and inf become null."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(_plain(obj), indent=1, allow_nan=False))
 
@@ -216,8 +210,6 @@ def _plain(o):
         return [_plain(v) for v in o]
     if dataclasses.is_dataclass(o) and not isinstance(o, type):
         return _plain(dataclasses.asdict(o))
-    if hasattr(o, "detach"):
-        o = o.detach().cpu().numpy()
     if isinstance(o, (np.ndarray, np.generic)):
         return _plain(o.tolist())
     if isinstance(o, Path):

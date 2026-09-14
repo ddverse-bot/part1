@@ -1,5 +1,5 @@
 """Swapping the OCT classes negates S exactly, in the FFT search and in the refiner, so the contrast polarity is the sign of one
-score (method steps 4-5); a forced polarity keeps its sign."""
+score (method steps 4-5); a forced polarity (search argument, an ablation) keeps its sign."""
 import dataclasses
 
 import numpy as np
@@ -9,7 +9,7 @@ from scipy.ndimage import gaussian_filter
 
 from octreg import geometry as G
 from octreg.params import Params
-from octreg.refine import Level, compose
+from octreg.refine import BaseGrid, compose
 from octreg.search import MIRROR, Searcher, search
 
 TOL = 1e-5
@@ -61,17 +61,19 @@ def test_search_candidates_flip_polarity(pair):
 
 def test_forced_polarity(pair):
     top = {}
-    for pol in ("sign", "+1", "-1"):
-        c, info = search(*pair["mri"], *swap(pair["oct"]), dataclasses.replace(FAST, polarity=pol), "cpu")
+    for pol in (0, 1, -1):
+        c, info = search(*pair["mri"], *swap(pair["oct"]), FAST, "cpu", polarity=pol)
         top[pol] = info["top1"]
-        if pol != "sign":
-            assert all(x["polarity"] == int(pol) for x in c) and abs(c[0]["S"] * int(pol) - info["top1"]) < 1e-12
-    assert top["sign"] == max(top["+1"], top["-1"]) and top["-1"] > 0.5 > top["+1"]
+        if pol:
+            assert all(x["polarity"] == pol for x in c) and abs(c[0]["S"] * pol - info["top1"]) < 1e-12
+    assert top[0] == max(top[1], top[-1]) and top[-1] > 0.5 > top[1]
+    with pytest.raises(ValueError, match="polarity"):
+        search(*pair["mri"], *pair["oct"], FAST, "cpu", polarity=2)
 
 
 @pytest.mark.parametrize("mirror", [False, True])
 def test_refiner_score_negates(pair, mirror):
-    a, b = Level(pair["mri"], pair["oct"], "cpu"), Level(pair["mri"], swap(pair["oct"]), "cpu")
+    a, b = BaseGrid(pair["mri"], pair["oct"], "cpu"), BaseGrid(pair["mri"], swap(pair["oct"]), "cpu")
     c = torch.as_tensor(a.c, dtype=torch.float32)
     f = lambda *v: torch.tensor(v, dtype=torch.float32)
     T = compose(f(0.03, -0.02, 0.04), c + f(0.2, -0.1, 0.3), f(0.02, 0.0, -0.03), f(0.01, 0.0, 0.02), c, mirror)

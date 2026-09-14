@@ -6,7 +6,8 @@ The OCT is a scattering or intensity volume of a tissue block embedded in scatte
 array axis and a tile mosaic in the section plane. Its contrast may be inverted relative to the MRI. octreg finds the specimen
 from its isotropic texture (the agarose has the same intensity but only anisotropic artefacts), turns both volumes into one soft
 two-class map so that the contrast polarity comes out as the sign of the best FFT score, searches the block orientation inside
-the MRI crop, and refines the pose with a rigid, similarity and affine ladder under a scale prior. No labels or landmarks are used.
+the MRI crop, and refines every search pose with one affine fit under a scale prior, keeping only poses that stay on the MRI
+foreground. No labels or landmarks are used.
 
 ## Install
 
