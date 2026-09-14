@@ -13,16 +13,17 @@ in the embedding. Tissue texture varies along every direction, while the agarose
 seams, each of which varies along a single array axis. octreg measures the local coefficient of variation along each array axis
 and keeps the minimum, which is high only in tissue.
 
-**Two-class maps, polarity from the sign of one score.** Both volumes become the same soft map of bright against dark tissue.
-The OCT enters the score as the channel pair (p, 1 − p) with its mask as a weight. Swapping the two OCT classes negates the
-weighted normalised cross-correlation exactly, so one correlation covers both contrast polarities. Its magnitude ranks the pose
-and its sign tells whether the OCT contrast is inverted.
+**One score for structure and outline, polarity from a sign.** Both volumes become the same soft map of bright against dark
+tissue. The score is the mean correlation over three channel pairs: the two classes, with the OCT entering as (p, 1 − p) under
+its specimen mask, and the specimen outline, the OCT mask against the MRI foreground. Swapping the two OCT classes negates the
+class correlation exactly and leaves the outline unchanged, so one correlation covers both contrast polarities and the sign
+tells whether the OCT contrast is inverted.
 
 **Orientation search inside the crop, then a bounded affine fit.** The crop already fixes the position, so octreg searches
-16,000 orientations (8,000 rotations and their mirror images) and scores all translations inside the crop at once with FFTs. The
-24 best distinct poses are each refined by a 12-parameter affine fit with a penalty and a hard bound on scale and shear, since
-both voxel sizes are known. A refined pose is kept only if the OCT specimen still lies on the MRI foreground as much as the
-search required, and the lowest loss wins.
+8,000 rotations and scores all translations inside the crop at once with FFTs. Mirror images are not searched: the handedness
+comes from the file headers, because a nearly symmetric specimen can score better mirrored. The 24 best distinct poses are each
+refined by a 12-parameter affine fit with a penalty and a hard bound on scale and shear, since both voxel sizes are known, and
+the lowest loss wins.
 
 The full description is in [docs/METHOD.md](docs/METHOD.md).
 
@@ -53,6 +54,9 @@ With `--T` the images are named after the transform file, so several candidate p
 
 From Python: `from octreg.register import register, apply, qc`. The method constants are in `octreg.params.Params`.
 
+Both headers must have the right handedness. If the OCT stack is mirrored, for example with its section order reversed, fix the
+header first.
+
 ## Outputs
 
 | file | content |
@@ -63,7 +67,7 @@ From Python: `from octreg.register import register, apply, qc`. The method const
 | `mri_in_oct.nii.gz` | the MRI resampled onto a 0.15 mm grid in the OCT world |
 | `qc.png` | one plane per OCT axis through the specimen centre: OCT, MRI through the transform, checkerboard, mask outlines |
 | `qc_montage.png` | the same for four planes per axis spread across the specimen |
-| `result.json` | transform, score S, polarity, scale per OCT axis, overlap, flags, masks, runtime and memory |
+| `result.json` | transform, score S with S_class and S_outline, polarity, scale per OCT axis, flags, masks, runtime and memory |
 
 The worlds are the frames of the input files (NIfTI sform or qform, diag(spacing) for TIFF and NPY), so the transform applies
 to the original files as they are.
@@ -77,46 +81,44 @@ freeview (`freeview MRI OUT/oct_in_mri.nii.gz`, or `freeview OCT OUT/mri_in_oct.
 1. In every plane of all three axes, not only through the centre, the OCT specimen lies on the same anatomy in the MRI and the
    two outlines largely agree. The last column draws the MRI foreground in red and the OCT specimen mask in cyan.
 2. Internal structures, such as fibre tracts, continue across the checkerboard squares.
-3. Cut faces and detached or folded pieces of tissue correspond.
+3. Cut faces and detached or folded pieces of tissue correspond, and lie on the same side in both scans.
 4. The contrast is consistently inverted, or consistently not, over the whole specimen. When the reported polarity is −1 the
    QC images show the MRI inverted inside its foreground, so tissue should then look alike in both scans.
 
 When more than one pose is plausible, for example the result and an earlier transform, render each with `octreg qc --T` and
 compare them side by side.
 
-The numbers in `result.json` support this judgement. S is the weighted correlation of the two-class maps, the scales per OCT axis
-should stay near 1, the overlap should be clearly above the gate `search.tau`, and any flag deserves a look. They point to
-failures but do not certify a pose. On I58, switching off the scale prior raises S from 0.1455 to 0.2421 while squeezing the OCT
-to 0.55 and 0.42 of its length along two axes.
+The numbers in `result.json` support this judgement. S_outline tells how well the specimen outlines agree, the scales per OCT
+axis should stay near 1, and any flag deserves a look. They point to failures but do not certify a pose. On I58, switching off
+the scale prior raises S from 0.2747 to 0.3610 with a distorted block, and the mirrored pose scores better than the result
+while its anatomy is on the wrong side.
 
 ## Result on Xiangrui's I58 brainstem pair
 
-![Final pose and R5 on I58](docs/figures/fig_visual_final_vs_R5.png)
+![Result and the best pose of the other handedness on I58](docs/figures/fig_handedness_xiangrui.png)
 
-One plane per OCT axis through the specimen centre: the OCT, then for the octreg pose and for R5, the pose of our earlier
-research pipeline, the MRI through the transform (inverted inside its foreground, polarity −1) and a 2 mm checkerboard.
+One plane per OCT axis through the specimen centre: the OCT, then for the octreg result and for the best pose of the other
+handedness, the MRI through the transform (inverted inside its foreground, polarity −1) and a 2 mm checkerboard.
 
-In all three planes the final pose puts the MRI over the whole OCT specimen, and the fibre striations, the notch on the right
-side and the folded piece correspond. R5 leaves a large part of the OCT uncovered in the axis-0 plane, puts cerebellar folia
-inside the OCT body in the axis-1 plane and covers only part of the specimen in the axis-2 plane. The two poses lie 10.3 mm
-apart at the block corners (mean) and 25.05° apart in rotation. The QC images of the run, with the mask outlines, are
-[fig_qc_xiangrui.png](docs/figures/fig_qc_xiangrui.png) and
-[fig_qc_montage_xiangrui.png](docs/figures/fig_qc_montage_xiangrui.png).
+In all three planes the MRI outline of the result follows the OCT specimen, and the cerebellar folia of the MRI lie on the
+folded folia pieces of the OCT: at the lower right of the axis-1 plane and at the upper right of the axis-2 plane, where the
+round nucleus at the top of the specimen also corresponds. The best pose of the other handedness fits the outline almost as
+well, but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane. In
+the montage of the run the outlines agree in every plane apart from the torn pieces, and the folia also correspond in the
+axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm. The QC images of the run are
+[fig_qc_xiangrui.png](docs/figures/fig_qc_xiangrui.png) and [fig_qc_montage_xiangrui.png](docs/figures/fig_qc_montage_xiangrui.png).
 
-`octreg register` ran on the two original files (OCT 1457×2013×1595 at 20 µm, MRI crop 343×489×495 at 0.08 mm) in 8 min 42 s
-with 5.19 GiB of peak RAM and 1.6 GiB of GPU memory. S is 0.1455 with polarity −1 (inverted OCT contrast), the overlap 0.586,
-the scales 1.000 / 0.967 / 0.985, and there are no flags. Raw OCT values mapped through the file header and the transform
-correlate with the exported overlay at Spearman 0.990, against at most 0.205 for any flipped axis. Replacing the texture mask,
-the two-class maps, the polarity rule or the scale prior, or switching off OCT flattening, moves the pose by 12 to 44 mm.
-Details and ablations are in [docs/BENCHMARK.md](docs/BENCHMARK.md).
+`octreg register` ran on the two original files (OCT 1457×2013×1595 at 20 µm, MRI crop 343×489×495 at 0.08 mm) in 9 min 36 s
+with 5.19 GiB of peak RAM and 1.8 GiB of GPU memory. S is 0.2747 (S_class −0.1175, S_outline 0.5891) with polarity −1
+(inverted OCT contrast), the scales are 1.007 / 0.971 / 0.970, and there are no flags. Raw OCT values mapped through the file
+header and the transform correlate with the exported overlay at Spearman 0.991, against at most 0.270 for any
+flipped axis. Forcing the other polarity, dropping the scale prior, thresholding the OCT by intensity or mirroring it moves the pose by 30 to 48 mm, and dropping the outline term moves it by 6.6 mm. Details and ablations are in [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Limitations
 
-- Affine only.
-- Demonstrated on one pair so far.
-- The overlap gate (`overlap_rho`) and the texture smoothing (`texture_smooth_mm`) were set on that pair.
-- Handedness is not analysed. The search includes mirrored orientations and keeps the best pose.
-- The texture mask can keep interior holes where the smoothed texture is weak. A few are visible in the I58 QC planes.
+- Affine only. Torn or folded pieces that moved during embedding or sectioning cannot be matched.
+- Demonstrated on one pair so far, and the texture smoothing (`texture_smooth_mm`) was set on that pair.
+- The handedness is taken from the file headers and cannot be checked by the score.
 
 ## Layout
 
@@ -134,4 +136,4 @@ docs/archive/                documents of the research code (git tag v1.1-archiv
 
 ## 中文摘要
 
-octreg 把琼脂包埋的连续切片 OCT 组织块无标签地仿射配准到已裁剪到组织块附近的离体 MRI。三个创新点：用各向同性纹理分割标本（掺杂琼脂强度与组织相近，但它的伪影只沿单一轴变化）；两类结构图，交换 OCT 两类恰好使加权 NCC 变号，所以对比度极性就是一次打分的符号；在 MRI 裁剪范围内做 FFT 朝向搜索，再做带尺度先验、受重叠门限约束的仿射精配准。评估以视觉检查为主：在 qc_montage.png 和 freeview 叠加图中检查标本轮廓、纤维束、切面和折叠碎片是否对应，result.json 的数值只作辅助。I58 上耗时 8 分 42 秒，最终位姿在三个平面上都让 MRI 覆盖整个 OCT 标本，纤维条纹、右侧缺口和折叠碎片都对得上；旧参考位姿 R5 在轴 0 平面留下大片 OCT 未覆盖，在轴 1 平面把小脑叶片放进 OCT 主体，在轴 2 平面只盖住部分标本。
+octreg 把琼脂包埋的连续切片 OCT 组织块无标签地仿射配准到已裁剪到组织块附近的离体 MRI。三个创新点：用各向同性纹理分割标本（掺杂琼脂强度与组织相近，但它的伪影只沿单一轴变化）；一个打分同时比较两类结构图和标本轮廓，交换 OCT 两类恰好使结构相关变号而轮廓项不变，所以对比度极性就是结构相关的符号；在 MRI 裁剪范围内做 FFT 朝向搜索（只搜旋转，手性以文件头为准），再做带尺度先验的仿射精配准。评估以视觉检查为主：在 qc_montage.png 和 freeview 叠加图中检查标本轮廓、纤维束、切面和折叠碎片是否对应并位于同一侧，result.json 的数值只作辅助。I58 上从两份原始文件一条命令跑完，耗时 9 分 36 秒；三个方向的所有切面里 MRI 标本轮廓都贴合 OCT 标本，小脑叶片碎片和圆形核团落在对应位置。另一手性的最佳位姿打分反而更高，但解剖结构位于错误的一侧，所以手性以文件头为准而不交给打分。

@@ -7,14 +7,18 @@
 >    box-averaged grid cannot hide the tissue peak.
 > 2. Texture threshold: Otsu on the log texture field smoothed with a Gaussian of 1.2 mm (`texture_smooth_mm`), instead of a
 >    two-component Gaussian mixture.
-> 3. Overlap gate: `overlap_rho` 0.6 instead of 0.8, and the gate is applied again after refinement.
-> 4. Section-stripe flat field (destripe) removed. Switching it off moved the pose by 0.15 mm (A3, block-corner mean).
-> 5. Single-stage refinement: one affine fit on the 0.15 mm grid from each of the 24 search poses replaces the rigid,
->    similarity and affine ladder, which gave the same pose to 0.0015 mm (A7). The grids are a 0.6 mm search grid and a
->    0.15 mm base grid.
-> 6. Evaluation: visual inspection of the overlays is the primary criterion. Agreement with R5 within 1 mm is no longer a
->    success criterion. The final pose lies 10.3 mm from R5 and passes the visual check, and R5 does not
->    ([fig_visual_final_vs_R5.png](../figures/fig_visual_final_vs_R5.png)).
+> 3. Score: the two-class correlation is combined with the specimen outline (OCT mask against MRI foreground over the measured
+>    OCT voxels), S = (2 |S_class| + S_outline) / 3. The polarity is still the sign of S_class. The overlap gate of this spec
+>    is removed; the outline term replaces it.
+> 4. Specimen mask holes are filled in every array plane, not only in 3-D.
+> 5. Handedness: rotations only; the handedness is that of the file headers. The best mirrored pose scores better on I58 but
+>    has its anatomy on the wrong side (ablation A8).
+> 6. Section-stripe flat field (destripe) removed. Switching it off moved the pose by 0.15 mm in the first run (A3).
+> 7. Single-stage refinement: one affine fit on the 0.15 mm grid from each of the 24 search poses replaces the rigid,
+>    similarity and affine ladder, which gave the same pose to 0.0015 mm in the first run (A7). The grids are a 0.6 mm search
+>    grid and a 0.15 mm base grid.
+> 8. Evaluation: visual inspection of the overlays is the primary criterion. Agreement with R5 within 1 mm is no longer a
+>    success criterion.
 
 Supersedes the method parts of `spec_v1.0.md` after the user's direction of 2026-09-14: a few concise, intuitive, effective
 innovations; no redundant content; the MRI is given cropped around the block (no whole-brain global search); handedness is not
