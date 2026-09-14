@@ -20,9 +20,10 @@ STEPS="ablate evaluate report" setsid nohup bash bench/run_xiangrui.sh > /dev/nu
 ```
 
 `register` is `python -m octreg register OCT MRI -o OUT` on the two original files. Outputs go to
-`/root/autodl-tmp/bench_runs/xiangrui_I58/final/{main,main_logs,ablate}` (override with `OUT`, `ABL`, `PREV`, `DEVICE`). Every step writes
-`NAME.log`, `NAME.time` (wall time, peak RSS) and `NAME.gpu_mib` (nvidia-smi samples) into `main_logs`, and one line per step to
-`chain.log`. The script registers its process group in `/root/autodl-tmp/v11_dev/killable/octreg1_xiangrui.pgid` while it runs
+`/root/autodl-tmp/bench_runs/xiangrui_I58/rel3/{main,main_logs,ablate}`, the run in docs/results/xiangrui_I58 (override with
+`OUT`, `ABL`, `PREV`, `PREV_MAIN`, `DEVICE`, `CODE`). Every step writes
+`NAME.log`, `NAME.time` (wall time, peak RSS) and `NAME.gpu_mib` (nvidia-smi samples) into `main_logs`, and a start and a done
+line per step (and the last 5 log lines on failure) to `chain.log`. The script registers its process group in `/root/autodl-tmp/v11_dev/killable/octreg1_xiangrui.pgid` while it runs
 and refuses to start when another registration job is running. The v1.1 run of this pair peaked at 32 GB of RAM in a 62 GB
 container, so run nothing else heavy at the same time.
 
@@ -38,8 +39,8 @@ already verified header-frame export of R5. R5 is a body-level pose of the earli
 not a success criterion.
 
 - Pose: displacement of `T_oct2mri` against `T_ref`, mean and max over the v1.1 OCT specimen-mask points and at the 8 block corners,
-  plus the rotation angle between the two. The same distance to an earlier run with `--previous` (the script passes the first
-  main run).
+  plus the rotation angle between the two. The same distance to an earlier run with `--previous` (the script passes `PREV_MAIN`,
+  by default `final/main`, the release run with the two-class score alone, the overlap gate and the mirror search).
 - OCT specimen mask: volume and Dice against the stored v1.1 mask (`oct150_mask.npy`, 18.05 cm3), compared through the header
   affines.
 - Boundary agreement: OCT mask outline through the pose to the MRI foreground outline and back, median per face; "rim" leaves out
@@ -50,7 +51,7 @@ not a success criterion.
   `oct_in_mri.nii.gz` (Spearman, 7^3 voxel boxes). Controls flip each raw OCT axis or shift the pose by 2 mm. It passes when the pose
   gives at least 0.9 and every flip at most 0.3.
 
-Masks come from `ablate.py` (`final/ablate/prep/texture/`), so `evaluate` reports mask and boundary metrics only after the ablate step.
+Masks come from `ablate.py` (`rel3/ablate/prep/texture/`), so `evaluate` reports mask and boundary metrics only after the ablate step.
 
 ## Ablations
 
@@ -65,18 +66,21 @@ Masks come from `ablate.py` (`final/ablate/prep/texture/`), so `evaluate` report
 | A5+1, A5-1 | polarity forced to +1 or -1 instead of the sign of the two-class score (`align(..., polarity=...)`) |
 | A6 | no scale prior: lambda 0 and clamp 1.0 instead of 2 and 0.15 |
 | A8 | the other handedness: the OCT world mirrored (z negated) before search and refinement |
-| A9 | no outline term: the outline weight set to the specimen mask, on which the mask is constant, so S_outline = 0 |
+| A9 | no outline term: S = 2 S_class / 3 in the search (patched `search.combined`) and in the refinement (outline weight = the specimen mask, so S_outline = 0) |
 | A3, A7 | removed steps (section-stripe flat field; rigid, similarity and affine ladder), rows copied from the first ablation run |
 
-`Params` holds method constants only. Each variant is one explicit change passed to the package functions the method itself
-uses (`register.fine_mask`, `preprocess.two_class`, `register.align`), so the method has no ablation switches. The OCT is
+`Params` holds method constants only. Each variant is one explicit change made in the driver around the package functions the
+method itself uses: an argument of `register.fine_mask`, `preprocess.two_class` or `register.align`, or a Params override (A6).
+A0 takes its OCT mask from `preprocess.foreground`, A4 builds its channels in `ablate.py`, and A0c and A9 temporarily replace
+`preprocess._fill_planes` (with the 3-D `ndimage.binary_fill_holes`) and `search.combined`. The method has no ablation switches. The OCT is
 streamed once and each OCT mask source (texture, texture3d, intensity, v11mask) is computed once and cached under `ablate/prep/`. The
 driver's base run is compared with the CLI run ("driver check", expected at float precision). Pose changes are measured
 against base. The boundary agreement of every variant uses the base masks, so it reflects the pose only. A variant that makes
 the method refuse is recorded as failed with the message. Finished variants are reused on a
 rerun unless `--force` is given.
 
-A3 and A7 were run in the first ablation run, with the earlier two-class score and overlap gate, (`/root/autodl-tmp/bench_runs/xiangrui_I58/ablate`), against a base that still had
+A3 and A7 were run in the first ablation run, with the earlier two-class score, the overlap gate and mirrored orientations in
+the search, (`/root/autodl-tmp/bench_runs/xiangrui_I58/ablate`), against a base that still had
 the flat field and the ladder. Neither moved the pose by more than 0.5 mm, so both steps were deleted. `ablate.py --previous`
 copies their rows and reports how far the present base lies from that earlier base.
 

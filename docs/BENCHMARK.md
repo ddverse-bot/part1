@@ -8,11 +8,11 @@ The result is judged by visual inspection of the overlays (docs/METHOD.md, "Eval
 
 ![Result and the best pose of the other handedness](figures/fig_handedness_xiangrui.png)
 
-Planes through the centroid of the specimen mask, normal to each OCT array axis: the OCT, then for the result and for the best pose of the other handedness (ablation A8) the MRI through the transform (inverted inside its foreground, polarity -1) and a 2 mm checkerboard. The MRI outline of the result follows the OCT specimen in all three planes, and the cerebellar folia of the MRI lie on the folded folia pieces of the OCT, at the lower right of the axis-1 plane and at the upper right of the axis-2 plane. The mirrored pose fits the outline almost as well and even has the lower loss (L 0.7133 against 0.7296), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
+Planes through the centroid of the specimen mask, normal to each OCT array axis: the OCT, then for the result and for the best pose of the other handedness (ablation A8) the MRI through the transform (inverted inside its foreground, polarity -1) and a 2 mm checkerboard. The MRI outline of the result follows the OCT specimen in all three planes, and the cerebellar folia of the MRI lie on the folded folia pieces of the OCT, at the lower right of the axis-1 plane and at the upper right of the axis-2 plane. The mirrored pose fits the outline as well, with the higher S_outline (0.6438 against 0.5891) and the lower loss (L 0.7133 against 0.7296), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
 
 ![QC of the result](figures/fig_qc_xiangrui.png)
 
-qc.png of the run, with the MRI foreground through the transform (red) and the OCT specimen mask (cyan) in the fourth column. qc_montage.png, with four planes per axis, is [fig_qc_montage_xiangrui.png](figures/fig_qc_montage_xiangrui.png). In every plane the two outlines agree apart from the torn and folded cerebellar pieces, and the folia also correspond in the axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm.
+qc.png of the run, with the MRI foreground through the transform (red) and the OCT specimen mask (cyan) in the fourth column. qc_montage.png, with four planes per axis, is [fig_qc_montage_xiangrui.png](figures/fig_qc_montage_xiangrui.png). In every plane the MRI outline follows the OCT specimen apart from the torn and folded cerebellar pieces, although the OCT mask outline takes in a margin of agarose in some planes (most in axis 1 at 8.32 mm and axis 2 at 6.37 mm). The folia also correspond in the axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm.
 
 ## Main result
 
@@ -31,7 +31,7 @@ qc.png of the run, with the MRI foreground through the transform (red) and the O
 | rim boundary agreement forward / reverse, method masks | 1.26 / 1.70 mm; R5 3.04 / 3.53; previous 1.58 / 1.89 |
 | the same with the v1.1 masks | 1.80 / 1.38 mm; R5 2.02 / 1.05; previous 1.83 / 1.14 |
 | OCT specimen mask | 19.24 cm3, Dice 0.919 against the v1.1 mask (18.05 cm3) |
-| registration time in process, peak RAM, peak GPU memory allocated by torch | 9.6 min, 5.2 GB, 0.95 GB (wall clock 9.6 min, nvidia-smi peak 1.8 GB) |
+| registration time in process, peak RAM, peak GPU memory allocated by torch | 9.6 min, 5.2 GiB, 0.95 GiB (wall clock 9.6 min, nvidia-smi peak 1.8 GiB) |
 | time per step (s) | mri 4, oct fine grid 194, oct mask 173, two class 2, search 30, refinement 133, outputs 36 |
 
 The raw-data frame check passes. R5 is a reference of the earlier pipeline, not a success criterion.
@@ -55,11 +55,11 @@ Each variant is the method with one explicit change, run from the same preproces
 | A5-1 | polarity forced -1 | 0.00 / 0.00 / 0.00 | 45.02 | 0.2747 | 0.7296 | -1 | 1.007 / 0.970 / 0.970 | 1.26 / 1.70 | 19.24 (0.919) | 165 |
 | A6 | no scale prior: lam 0 and clamp 1.0 (method: 2 and 0.15) | 18.27 / 44.49 / 54.28 | 63.48 | 0.3610 | 0.6390 | -1 | 0.913 / 0.825 / 0.428 | 1.37 / 1.13 | 19.24 (0.919) | 164 |
 | A8 | the other handedness: OCT world mirrored (z negated) before the search | 15.47 / 29.84 / 43.69 | 58.69 | 0.2955 | 0.7133 | -1 | 0.963 / 0.952 / 0.980 | 1.46 / 1.67 | 19.24 (0.919) | 162 |
-| A9 | no outline term: the outline weight set to the specimen mask, so S_outline = 0 and S = 2 S_class / 3 | 3.51 / 6.62 / 9.07 | 47.24 | 0.0835 | 0.9181 | -1 | 1.022 / 0.993 / 0.992 | 1.44 / 1.77 | 19.24 (0.919) | 144 |
+| A9 | no outline term: S = 2 S_class / 3 in the search and the refinement | 19.59 / 41.82 / 62.72 | 47.42 | 0.0977 | 0.9032 | -1 | 0.990 / 0.991 / 0.987 | 1.91 / 2.19 | 19.24 (0.919) | 143 |
 
 Driver check: base through bench/ablate.py lies 0.00 mm (corners max 0.00 mm) from the CLI run.
 
-Deletion rule: a step goes when removing it moves the pose by at most 0.5 mm (mean over the specimen-mask points) and changes no other metric beyond noise. Removing MRI flattening (A1, 0.08 mm) or OCT flattening (A2, 0.06 mm) stays within 0.5 mm. Removing per-plane hole filling (A0c, 0.77 mm), the two-class maps (A4, 0.51 mm), the scale prior (A6, 18.27 mm) or the outline term (A9, 3.51 mm) moves the pose further.
+Deletion rule: a step goes when removing it moves the pose by at most 0.5 mm (mean over the specimen-mask points) and changes no other metric beyond noise. Removing MRI flattening (A1, 0.08 mm) or OCT flattening (A2, 0.06 mm) stays within 0.5 mm. Removing per-plane hole filling (A0c, 0.77 mm), the two-class maps (A4, 0.51 mm), the scale prior (A6, 18.27 mm) or the outline term (A9, 19.59 mm) moves the pose further.
 
 ### Removed steps
 
@@ -74,7 +74,7 @@ The present base lies 12.24 mm (corners mean 30.09 mm, corners max 45.88 mm, rot
 
 ## Runtime and memory of the ablation driver
 
-| step | seconds | peak RAM of the process so far (GB) |
+| step | seconds | peak RAM (GiB) |
 |---|---|---|
 | OCT fine grid 728x1006x797 (streamed once) | 197 | 3.3 |
 | prep intensity | 68 | 3.8 |
@@ -82,19 +82,20 @@ The present base lies 12.24 mm (corners mean 30.09 mm, corners max 45.88 mm, rot
 | prep texture3d | 158 | 5.0 |
 | prep v11mask | 88 | 5.5 |
 | prep mri | 5 | 0.7 |
-| all variants and preprocessing | 2662 | 5.5 |
+| all variants and preprocessing | 2645 | 5.5 |
 
-Peak GPU memory allocated by torch over the variants: 1.2 GB. The table was assembled a second time from the cached variants (13 s) after the report format changed; the total above is that of the run that computed them.
+Peak GPU memory allocated by torch over the variants: 1.1 GiB.
+
 <!-- reading: written by hand below this line; bench/report.py keeps it when it rewrites the file -->
 
 ## Reading
 
-The outline term and the file-header handedness decide this pair. Without the outline term (A9) the pose moves by 6.6 mm and turns by 15 degrees. The mirrored OCT (A8) gives a pose 29.8 mm away with a lower loss, whose anatomy the overlays show on the wrong side, so handedness is taken from the headers and not from the score. Forcing the polarity to +1 (A5+1), dropping the scale prior (A6) or thresholding the OCT by intensity (A0, 29.5 cm3 against 19.2 cm3) turns the pose over, 42 to 48 mm away. Without the scale prior S rises to 0.3610 while the OCT is scaled to 0.43 of its length along one axis. All distances are block-corner means.
+The outline term and the file-header handedness decide this pair. Without the outline term (A9, S = 2 S_class / 3 in the search and the refinement) the pose turns over by 164 degrees and lies 41.8 mm away. The mirrored OCT (A8) gives a pose 29.8 mm away with a lower loss, whose anatomy the overlays show on the wrong side, so handedness is taken from the headers and not from the score. Forcing the polarity to +1 (A5+1), dropping the scale prior (A6) or thresholding the OCT by intensity (A0, 29.5 cm3 against 19.2 cm3) also turns the pose over, 42 to 48 mm away. Without the scale prior S rises to 0.3610 while the OCT is scaled to 0.43 of its length along one axis. All distances are block-corner means.
 
 Holes filled in 3-D only (A0c) move the pose by 1.69 mm and lower S_outline from 0.5891 to 0.3986, since holes that reach a cut face then count as embedding. The watershed mask of the earlier pipeline (A0b) gives the same pose to 0.32 mm.
 
-The two-class maps and the flattening change the pose only a little once the outline is in the score: 0.74 mm for standardised intensities (A4, 0.51 mm over the specimen points, just above the deletion threshold), and 0.12 and 0.10 mm for MRI and OCT flattening (A1, A2). Flattening stays because it keeps the pose stable when other parts change. In an ablation run of the same method without flattening (docs/results/xiangrui_I58/no_flattening/ablations.json), the base pose moved by only 0.24 mm, but A0b, A0c and A9 moved the pose by 42.3, 40.9 and 42.5 mm, against 0.32, 1.69 and 6.62 mm here.
+The two-class maps and the flattening change the pose only a little once the outline is in the score: 0.74 mm for standardised intensities (A4, 0.51 mm over the specimen points, just above the deletion threshold), and 0.12 and 0.10 mm for MRI and OCT flattening (A1, A2). Flattening stays because it keeps the pose stable when other parts change. In an ablation run of the same method without flattening (docs/results/xiangrui_I58/no_flattening/ablations.json), the base pose moved by only 0.24 mm, but A0b and A0c moved the pose by 42.3 and 40.9 mm, against 0.32 and 1.69 mm here.
 
-R5, the pose of the earlier research pipeline, lies 30.4 mm away and has the other handedness in the header frames; it is not a success criterion. Its outlines agree worse than the result's with the method masks (rim medians 3.04 / 3.53 mm against 1.26 / 1.70 mm). The "previous run" in the table is the first release run, with the two-class score alone, the overlap gate and mirrored orientations in the search; it lies 30.0 mm away and also has the other handedness.
+R5, the pose of the earlier research pipeline, lies 30.4 mm away and has the other handedness in the header frames; it is not a success criterion. Its outlines agree worse than the result's with the method masks (rim medians 3.04 / 3.53 mm against 1.26 / 1.70 mm). The "previous run" in the table is the release run before the outline term, after the flat field and the ladder were removed, with the two-class score alone, the overlap gate and mirrored orientations in the search; it lies 30.0 mm away and also has the other handedness.
 
 The section-stripe flat field and the refinement ladder were removed after the first ablation run. Switching off the flat field moved that run's pose by 0.15 mm (A3), and one affine refinement from every search pose gave the ladder's pose to within 0.0015 mm (A7). The run needs 9 min 36 s and 5.2 GiB.

@@ -40,7 +40,7 @@ from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import evaluate as E                                                    # noqa: E402  (bench/evaluate.py)
-from octreg import geometry as G, io, preprocess as pp                  # noqa: E402
+from octreg import geometry as G, io, preprocess as pp, search as S     # noqa: E402
 from octreg.params import Params                                        # noqa: E402
 from octreg.register import align, fine_mask                            # noqa: E402
 
@@ -56,7 +56,7 @@ VARIANTS = {    # name: (what changes, the explicit change: mask source, solve()
     "A5-1": ("polarity forced -1", {"polarity": -1}),
     "A6": ("no scale prior: lam 0 and clamp 1.0 (method: 2 and 0.15)", {"params": {"lam": 0.0, "clamp": 1.0}}),
     "A8": ("the other handedness: OCT world mirrored (z negated) before the search", {"mirror": True}),
-    "A9": ("no outline term: the outline weight set to the specimen mask, so S_outline = 0 and S = 2 S_class / 3", {"outline": False}),
+    "A9": ("no outline term: S = 2 S_class / 3 in the search and the refinement", {"outline": False}),
 }
 MIRROR = np.diag([1.0, 1.0, -1.0, 1.0])
 REMOVED = [    # groups of removed steps, each measured in one earlier ablation run
@@ -143,7 +143,9 @@ def standardised(arr, mask, h, P):
 def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0, mirror=False, outline=True):
     """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls.
     mirror: search and refine against the OCT world mirrored by MIRROR, poses returned in the OCT header world (det < 0).
-    outline False: the outline weight is the specimen mask itself, on which the mask is constant, so S_outline is 0."""
+    outline False: S = 2 S_class / 3. The search's combined score is patched to leave S_outline out (on the pooled search grid
+    the mask edge is fractional, so a zero outline weight alone would not remove it); in the refinement the outline weight is
+    the specimen mask itself, on which the mask is constant, so S_outline is 0."""
     h = P.base_mm
     if features == "intensity":
         z_o, z_m = standardised(o["arr"], o["mask"], h, P), standardised(m["arr"], m["mask"], h, P)
@@ -152,7 +154,13 @@ def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_cla
         u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], h, P, flatten=oct_flatten), o["mask"])
         v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], h, P, flatten=mri_flatten), m["mask"])
     F, q = MIRROR if mirror else np.eye(4), o["valid"] if outline else o["mask"]
-    poses, info = align((u, w, q, F @ o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
+    combined = S.combined
+    if not outline:
+        S.combined = lambda S_class, S_outline, pol: combined(S_class, torch.zeros_like(S_outline), pol)
+    try:
+        poses, info = align((u, w, q, F @ o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
+    finally:
+        S.combined = combined
     return [{**p, "T": p["T"] @ F} for p in poses], info
 
 
@@ -183,7 +191,7 @@ def run_variant(name, out, device, force):
     keys = ("S", "S_class", "S_outline", "L", "polarity", "log_scales", "shears", "search_rank")
     best = poses[0]
     r = {**head, "T": best["T"], "best": {k: best[k] for k in keys}, "poses": [{k: p[k] for k in keys} for p in poses], **info,
-         "seconds": time.time() - t0, "gpu_peak_gb": torch.cuda.max_memory_allocated() / 1e9 if cuda else None,
+         "seconds": time.time() - t0, "gpu_peak_gb": torch.cuda.max_memory_allocated() / 2 ** 30 if cuda else None,
          "peak_rss_gb": peak_rss_gb()}
     io.write_transform_txt(best["T"], d / "T_oct2mri.txt")
     io.write_json(r, d / "result.json")
@@ -197,7 +205,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--main", type=Path, default=None, help="CLI run dir (T_oct2mri.txt) for the driver check")
-    ap.add_argument("--previous", type=Path, nargs="*", default=[], help="ablations.json of the runs that measured the removed steps")
+    ap.add_argument("--previous", type=Path, nargs="*", action="extend", default=[],
+                    help="ablations.json of the runs that measured the removed steps (repeatable)")
     ap.add_argument("--only", default=None, help=f"comma-separated subset of {','.join(VARIANTS)} (base is always run)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--force", action="store_true", help="recompute variants that already have a result (delete OUT/prep to redo "
@@ -234,9 +243,13 @@ def main():
                     "refine": r["refine"], "pose_to_base": to_base, "within_0.5mm_of_base": to_base["mean_mm"] <= 0.5,
                     "pose_to_R5": E.pose(T, ref["T_ref"], pts, cor), "boundary": bnd(T), "search_seconds": r["search"]["seconds"],
                     "refine_seconds": r["refine"]["seconds"], "gpu_peak_gb": r["gpu_peak_gb"], "T_oct2mri": r["T"]}
-    res = {"pair": "Xiangrui I58 brainstem", "oct": E.OCT, "mri": E.MRI, "params_hash": Params().hash(),
-           "prep": {s: json.loads((a.out / "prep" / s / "prep.json").read_text()) for s in sources + ["mri"]},
-           "variants": table, "seconds": time.time() - t0, "peak_rss_gb": peak_rss_gb()}
+    prep = {s: json.loads((a.out / "prep" / s / "prep.json").read_text()) for s in sources + ["mri"]}
+    grid = next((p["grid"] for p in prep.values() if "grid" in p), {})
+    work = [grid.get("seconds", 0)] + [p.get("mask_seconds", p.get("seconds", 0)) for p in prep.values()] + [r["seconds"] for r in rows.values()]
+    res = {"pair": "Xiangrui I58 brainstem", "oct": E.OCT, "mri": E.MRI, "params_hash": Params().hash(), "prep": prep,
+           "variants": table, "seconds": sum(work),          # the computation in the table, also when variants come from the cache
+           "peak_rss_gb": max([p.get("peak_rss_gb") or 0 for p in prep.values()] + [r.get("peak_rss_gb") or 0 for r in rows.values()]),
+           "driver_seconds": time.time() - t0}
     res["removed_steps"] = []
     for path in a.previous:
         prev = json.loads(path.read_text())

@@ -96,7 +96,8 @@ def test_fill_planes_fills_holes_open_to_a_face():
     m = np.zeros((12, 12, 12), bool)
     m[2:10, 2:10, :] = True
     m[5:7, 5:7, :] = False                                   # a tunnel through the block along axis 2, open at both faces
-    m[4:8, 4:8, 4:8] &= ~_ball(4, (1.5, 1.5, 1.5), 1.2)      # and an enclosed cavity
-    assert not ndimage.binary_fill_holes(m)[5, 5, 0]
+    m[2:6, 2:6, 4:8] &= ~_ball(4, (1.5, 1.5, 1.5), 1.2)      # and an enclosed cavity, m[3:5, 3:5, 5:7], off the tunnel
+    filled = ndimage.binary_fill_holes(m)
+    assert not filled[5, 5, 0] and filled[3, 3, 5] and not m[3, 3, 5]
     f = pp._fill_planes(m)
     assert f[2:10, 2:10, :].all() and not f[:2].any() and not f[10:].any()

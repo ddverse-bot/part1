@@ -102,17 +102,18 @@ handedness, the MRI through the transform (inverted inside its foreground, polar
 
 In all three planes the MRI outline of the result follows the OCT specimen, and the cerebellar folia of the MRI lie on the
 folded folia pieces of the OCT: at the lower right of the axis-1 plane and at the upper right of the axis-2 plane, where the
-round nucleus at the top of the specimen also corresponds. The best pose of the other handedness fits the outline almost as
-well, but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane. In
-the montage of the run the outlines agree in every plane apart from the torn pieces, and the folia also correspond in the
-axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm. The QC images of the run are
+round nucleus at the top of the specimen also corresponds. The best pose of the other handedness fits the outline as well (S_outline
+0.6438 against 0.5891), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the
+axis-2 plane. In the montage of the run the MRI outline follows the OCT specimen in every plane apart from the torn pieces,
+although the OCT mask outline takes in a margin of agarose in some planes (most in axis 1 at 8.32 mm and axis 2 at 6.37 mm).
+The folia also correspond in the axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm. The QC images of the run are
 [fig_qc_xiangrui.png](docs/figures/fig_qc_xiangrui.png) and [fig_qc_montage_xiangrui.png](docs/figures/fig_qc_montage_xiangrui.png).
 
 `octreg register` ran on the two original files (OCT 1457×2013×1595 at 20 µm, MRI crop 343×489×495 at 0.08 mm) in 9 min 36 s
 with 5.19 GiB of peak RAM and 1.8 GiB of GPU memory. S is 0.2747 (S_class −0.1175, S_outline 0.5891) with polarity −1
 (inverted OCT contrast), the scales are 1.007 / 0.971 / 0.970, and there are no flags. Raw OCT values mapped through the file
 header and the transform correlate with the exported overlay at Spearman 0.991, against at most 0.270 for any
-flipped axis. Forcing the other polarity, dropping the scale prior, thresholding the OCT by intensity or mirroring it moves the pose by 30 to 48 mm, and dropping the outline term moves it by 6.6 mm. Details and ablations are in [docs/BENCHMARK.md](docs/BENCHMARK.md).
+flipped axis. Forcing the other polarity, dropping the scale prior or the outline term, thresholding the OCT by intensity or mirroring it moves the pose by 30 to 48 mm. Details and ablations are in [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 ## Limitations
 
@@ -136,4 +137,4 @@ docs/archive/                documents of the research code (git tag v1.1-archiv
 
 ## 中文摘要
 
-octreg 把琼脂包埋的连续切片 OCT 组织块无标签地仿射配准到已裁剪到组织块附近的离体 MRI。三个创新点：用各向同性纹理分割标本（掺杂琼脂强度与组织相近，但它的伪影只沿单一轴变化）；一个打分同时比较两类结构图和标本轮廓，交换 OCT 两类恰好使结构相关变号而轮廓项不变，所以对比度极性就是结构相关的符号；在 MRI 裁剪范围内做 FFT 朝向搜索（只搜旋转，手性以文件头为准），再做带尺度先验的仿射精配准。评估以视觉检查为主：在 qc_montage.png 和 freeview 叠加图中检查标本轮廓、纤维束、切面和折叠碎片是否对应并位于同一侧，result.json 的数值只作辅助。I58 上从两份原始文件一条命令跑完，耗时 9 分 36 秒；三个方向的所有切面里 MRI 标本轮廓都贴合 OCT 标本，小脑叶片碎片和圆形核团落在对应位置。另一手性的最佳位姿打分反而更高，但解剖结构位于错误的一侧，所以手性以文件头为准而不交给打分。
+octreg 把琼脂包埋的连续切片 OCT 组织块无标签地仿射配准到已裁剪到组织块附近的离体 MRI。三个创新点：用各向同性纹理分割标本（掺杂琼脂强度与组织相近，但它的伪影只沿单一轴变化）；一个打分同时比较两类结构图和标本轮廓，交换 OCT 两类恰好使结构相关变号而轮廓项不变，所以对比度极性就是结构相关的符号；在 MRI 裁剪范围内做 FFT 朝向搜索（只搜旋转，手性以文件头为准），再做带尺度先验的仿射精配准。评估以视觉检查为主：在 qc_montage.png 和 freeview 叠加图中检查标本轮廓、纤维束、切面和折叠碎片是否对应并位于同一侧，result.json 的数值只作辅助。I58 上从两份原始文件一条命令跑完，耗时 9 分 36 秒；三个方向的所有切面里，除撕裂、折叠后移位的小脑碎片外，MRI 标本轮廓都贴合 OCT 标本，小脑叶片碎片和圆形核团落在对应位置。另一手性的最佳位姿打分反而更高，但解剖结构位于错误的一侧，所以手性以文件头为准而不交给打分。

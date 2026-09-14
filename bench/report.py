@@ -5,8 +5,8 @@
 
 RUN: the CLI run (result.json; eval.json from bench/evaluate.py). ABL: bench/ablate.py output (ablations.json).
 LOGS (optional): bench/run_xiangrui.sh step logs, adding the wall clock (register.time) and the nvidia-smi peak (register.gpu_mib)
-to the in-process time and memory of result.json. Missing values print n/a. The reading after the READING marker in the old
-output is kept.
+to the in-process time and memory of result.json. Missing values print n/a. Two hand-written parts of the old output are kept:
+the '## Visual result' section before '## Main result', and the reading after the READING marker.
 """
 from __future__ import annotations
 
@@ -87,8 +87,8 @@ def main_section(run, logs):
         ("OCT specimen mask", f"{num(mk.get('volume_cm3'))} cm3, Dice {num(mk.get('dice'), 3)} against the v1.1 mask "
                               f"({num(mk.get('reference_cm3'))} cm3)"),
         ("registration time in process, peak RAM, peak GPU memory allocated by torch",
-         f"{num(sec['total'] / 60 if 'total' in sec else None, 1)} min, {num(res.get('peak_rss_gb'), 1)} GB, "
-         f"{num(res.get('gpu_peak_gb'), 2)} GB" + (f" (wall clock {num(wall / 60, 1)} min, nvidia-smi peak {num(gpu, 1)} GB)" if wall else "")),
+         f"{num(sec['total'] / 60 if 'total' in sec else None, 1)} min, {num(res.get('peak_rss_gb'), 1)} GiB, "
+         f"{num(res.get('gpu_peak_gb'), 2)} GiB" + (f" (wall clock {num(wall / 60, 1)} min, nvidia-smi peak {num(gpu, 1)} GiB)" if wall else "")),
         ("time per step (s)", steps or "n/a"),
     ]
     frame = ("passes" if fc["ok"] else "does not pass") if fc else "was not run"
@@ -157,7 +157,7 @@ def runtime_section(abl):
     if not abl:
         return []
     out = ["## Runtime and memory of the ablation driver", "",
-           "| step | seconds | peak RAM of the process so far (GB) |", "|---|---|---|"]
+           "| step | seconds | peak RAM (GiB) |", "|---|---|---|"]
     grid = next((p["grid"] for p in abl["prep"].values() if "grid" in p), None)
     if grid:
         out.append(f"| OCT fine grid {'x'.join(map(str, grid['fine_shape']))} (streamed once) | {num(grid['seconds'], 0)} | "
@@ -166,7 +166,7 @@ def runtime_section(abl):
         out.append(f"| prep {k} | {num(p.get('mask_seconds', p.get('seconds')), 0)} | {num(p.get('peak_rss_gb'), 1)} |")
     gpu = [r["gpu_peak_gb"] for r in abl["variants"].values() if r.get("gpu_peak_gb") is not None]
     out += [f"| all variants and preprocessing | {num(abl.get('seconds'), 0)} | {num(abl.get('peak_rss_gb'), 1)} |", "",
-            f"Peak GPU memory allocated by torch over the variants: {num(max(gpu) if gpu else None, 1)} GB.", ""]
+            f"Peak GPU memory allocated by torch over the variants: {num(max(gpu) if gpu else None, 1)} GiB.", ""]
     return out
 
 
@@ -177,16 +177,17 @@ SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A0c": "h
 
 
 def figures(run, abl, out):
-    """out/fig_qc_xiangrui.png: RUN/qc.png as 8-bit grey without the white margin. out/fig_ablation.png: block-corner mean pose change of every variant
-    against the final pose (variants: against base; removed steps: against the present base), log scale."""
+    """out/fig_qc_xiangrui.png: RUN/qc.png without the white margin, outline colours kept. out/fig_ablation.png: block-corner mean
+    pose change of every variant against its base (variants: the present base; removed steps: the base of the run that measured
+    them), log scale."""
     from matplotlib.figure import Figure
     from PIL import Image, ImageOps
     out.mkdir(parents=True, exist_ok=True)
-    qc = Image.open(run / "qc.png").convert("L")
-    x0, y0, x1, y1 = ImageOps.invert(qc).getbbox()
+    qc = Image.open(run / "qc.png").convert("RGB")
+    x0, y0, x1, y1 = ImageOps.invert(qc.convert("L")).getbbox()
     qc.crop((max(x0 - 8, 0), max(y0 - 8, 0), min(x1 + 8, qc.width), min(y1 + 8, qc.height))).save(out / "fig_qc_xiangrui.png", optimize=True)
     rows = [(n, r.get("pose_to_base", {}).get("corners_mean_mm"), r.get("error"), False) for n, r in abl["variants"].items() if n != "base"]
-    rows += [(n, r["pose_to_present_base"]["corners_mean_mm"], None, True) for g in abl.get("removed_steps", [])
+    rows += [(n, r["pose_to_base"]["corners_mean_mm"], None, True) for g in abl.get("removed_steps", [])
              for n, r in g["rows"].items()]
     rows.sort(key=lambda r: math.inf if r[1] is None else r[1])
     lo, ink, grey = 1e-3, "#0b0b0b", "#52514e"
@@ -201,20 +202,20 @@ def figures(run, abl, out):
         ax.text(max(d or lo, lo) * 1.2, i, label, va="center", fontsize=8, color=grey,
                 bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.3})
     ax.axvline(0.5, color=ink, linestyle="--", linewidth=1, zorder=1)
-    ax.text(0.5 * 1.1, len(rows) - 0.4, "0.5 mm deletion threshold", fontsize=8, color=ink, va="bottom")
+    ax.text(0.5 * 1.1, len(rows) - 0.4, "0.5 mm", fontsize=8, color=ink, va="bottom")
     ax.set_xscale("log")
     ax.set_xlim(lo, 400)
     ax.set_ylim(-0.6, len(rows) + 0.2)
     ax.set_yticks(range(len(rows)), [f"{n}  {SHORT.get(n, n)}" + ("  (removed)" if rm else "") for n, _, _, rm in rows], fontsize=8.5)
-    ax.set_xlabel("pose change against the final pose, block-corner mean (mm)", fontsize=9)
+    ax.set_xlabel("pose change from the one change, block-corner mean (mm)", fontsize=9)
     ax.tick_params(axis="x", labelsize=8, colors=grey)
     ax.tick_params(axis="y", length=0)
     ax.grid(axis="x", which="major", color="#e4e3df", linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
-    fig.text(0.02, 0.02, "Hatched: steps removed from the method, as variants of the ablation run that measured them, against the final\n"
-             "pose, which has none of them.", fontsize=7, color=grey)
+    fig.text(0.02, 0.02, "Hatched: steps removed from the method, measured in the first ablation run against the base of that run,\n"
+             "which still had them.", fontsize=7, color=grey)
     fig.savefig(out / "fig_ablation.png", dpi=150)
 
 
@@ -236,8 +237,10 @@ def main():
              "pipeline (v1.1) converted into the header frames. It is a body-level pose, not ground truth. The numbers are read from "
              "the run's result.json and eval.json and from ablations.json (copies in docs/results/xiangrui_I58/). "
              "Commands: `bash bench/run_xiangrui.sh` (see bench/README.md).", ""]
-    text = "\n".join(intro + main_section(a.main, a.logs) + ablation_section(abl) + runtime_section(abl))
     old = a.out.read_text() if a.out.exists() else ""
+    visual = re.search(r"^## Visual result\n.*?(?=^## Main result)", old, re.S | re.M)       # hand-written, kept
+    text = "\n".join(intro + ([visual.group(0).rstrip("\n"), ""] if visual else []) + main_section(a.main, a.logs)
+                     + ablation_section(abl) + runtime_section(abl))
     if READING in old:                                   # the hand-written reading at the end survives a rewrite
         text += "\n" + READING + old.split(READING, 1)[1]
     a.out.parent.mkdir(parents=True, exist_ok=True)

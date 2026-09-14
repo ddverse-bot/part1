@@ -19,8 +19,9 @@ Both file headers are taken to have the correct handedness.
 Transforms map world coordinates in mm from the OCT file to the MRI file, the world being the NIfTI header frame or diag(spacing)
 for TIFF and NPY. The OCT is streamed plane by plane into an isotropic 0.04 mm fine grid (box average over whole voxels, then
 trilinear), so memory holds the output and two planes. The fine grid is the largest OCT array held and serves only the
-specimen mask. The OCT, its mask, its measured-voxel fraction and the MRI then go to a 0.15 mm base grid for the scores and the
-refinement, and a further 4³ box average gives the 0.6 mm search grid.
+specimen mask. The OCT, its mask, its measured voxels and the MRI then go to a 0.15 mm base grid for the scores and the
+refinement, the mask and the measured voxels box-averaged and kept above 0.5. A further 4³ box average gives the 0.6 mm search
+grid, where these two become fractions.
 
 ## Specimen mask from isotropic texture
 
@@ -68,7 +69,7 @@ Swapping the OCT classes turns (p, 1 − p) into (1 − p, p) = 1 − u, so it n
 unchanged. One correlation scores both polarities, and the sign of S_class is the polarity, −1 meaning inverted contrast. The
 identity needs the OCT channels to sum to 1 wherever w > 0, which is why the mask is a weight and never multiplies the OCT
 channels. On I58 the rule chooses −1, with S_class −0.1175 and S_outline 0.5891 at the result. Forcing +1 (ablation A5+1)
-moves the pose by 47.7 mm (block-corner mean), and dropping the outline term (A9) moves it by 6.6 mm.
+moves the pose by 47.7 mm (block-corner mean), and dropping the outline term (A9) moves it by 41.8 mm.
 
 ## Orientation search in the MRI crop
 
@@ -120,8 +121,9 @@ tracts must continue across the checkerboard squares. Cut faces and detached or 
 be consistently inverted, or consistently not, over the whole specimen. Plausible alternative poses, including the best pose of
 the other handedness, are rendered with `octreg qc --T` and compared side by side.
 
-On I58 (docs/figures/fig_qc_montage_xiangrui.png) the MRI foreground outline follows the OCT specimen outline in the planes of
-all three axes, apart from the torn and folded cerebellar pieces, which have moved. The cerebellar folia of the MRI land on the
+On I58 (docs/figures/fig_qc_montage_xiangrui.png) the MRI foreground outline follows the OCT specimen in the planes of all three
+axes, apart from the torn and folded cerebellar pieces, which have moved; the OCT mask outline takes in a margin of agarose in
+some planes (most in axis 1 at 8.32 mm and axis 2 at 6.37 mm). The cerebellar folia of the MRI land on the
 folded folia of the OCT (axis 0 at 17.47 and 23.17 mm, axis 1 at 24.07 mm), and the folia strip and the round nucleus at the
 top of the axis-2 planes correspond. docs/figures/fig_handedness_xiangrui.png shows the result next to the best pose of the other
 handedness in the planes through the specimen centre: the mirrored pose also fits the outline, but its folia and nucleus lie on
@@ -130,15 +132,15 @@ the wrong side.
 ### Ablations
 
 Each ablation changes one element and reruns search and refinement from the same preprocessed grids, one set per OCT mask.
-Pose changes are block-corner means against the result (docs/figures/fig_ablation.png).
+Pose changes are block-corner means against the result, except for A3 and A7 (docs/figures/fig_ablation.png).
 
 | variant | change | pose change (mm) | note |
 |---|---|---|---|
 | A5+1 | polarity forced to +1 | 47.7 | turned by 158° |
 | A6 | no scale prior (λ 0, clamp 1.0) | 44.5 | S 0.3610, scales 0.91 / 0.83 / 0.43 |
 | A0 | intensity-valley OCT mask instead of the texture mask | 42.1 | mask 29.5 cm³, turned by 165° |
+| A9 | no outline term, S = 2 S_class / 3 | 41.8 | turned by 164° |
 | A8 | the other handedness (OCT world mirrored) | 29.8 | L 0.7133 against 0.7296, anatomy on the wrong side |
-| A9 | no outline term | 6.6 | turned by 15° |
 | A0c | holes filled in 3-D only | 1.69 | turned by 4° |
 | A4 | standardised intensities (z, −z) instead of two-class maps | 0.74 | 0.51 mm over the specimen points |
 | A0b | watershed mask of the earlier pipeline | 0.32 | |
@@ -147,15 +149,15 @@ Pose changes are block-corner means against the result (docs/figures/fig_ablatio
 | A3 | section-stripe flat field off (first run) | 0.15 | removed |
 | A7 | one affine fit instead of the refinement ladder (first run) | 0.0015 | removed |
 
-A3 and A7 are measured against the base of the first ablation run, which still had both steps and the earlier score.
+A3 and A7 are measured against the base of the first ablation run, which still had both steps, the earlier score and the
+mirror search.
 
-Forcing the other polarity, dropping the scale prior, thresholding the OCT by intensity or mirroring it sends the pose to another
-orientation, 30 to 48 mm away. Without the outline term the pose moves by 6.6 mm and turns by 15°. The two-class maps change the
+Forcing the other polarity, dropping the scale prior or the outline term, thresholding the OCT by intensity or mirroring it sends
+the pose to another orientation, 30 to 48 mm away. The two-class maps change the
 I58 pose only a little once the outline is in the score (A4), just above the 0.5 mm deletion threshold over the specimen points,
 and flattening less than that (A1, A2). Flattening is kept because it makes the pose stable. In an ablation run without
-flattening (docs/results/xiangrui_I58/no_flattening/ablations.json) the base pose moved by only 0.24 mm, but the watershed mask,
-3-D hole filling and dropping the outline term then moved the pose by 42.3, 40.9 and 42.5 mm, against 0.32, 1.69 and 6.6 mm
-with flattening. A6 reaches a higher S with a non-physical pose and A8 a lower L with the anatomy on the wrong side, so neither
+flattening (docs/results/xiangrui_I58/no_flattening/ablations.json) the base pose moved by only 0.24 mm, but the watershed mask
+and 3-D hole filling then moved the pose by 42.3 and 40.9 mm, against 0.32 and 1.69 mm with flattening. A6 reaches a higher S with a non-physical pose and A8 a lower L with the anatomy on the wrong side, so neither
 number can decide a registration.
 
 ### Label-free signals
