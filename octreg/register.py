@@ -1,4 +1,4 @@
-"""`octreg register` (method steps 1-5 on two files, then the outputs) and `octreg apply`.
+"""`octreg register` (docs/METHOD.md §1-4 on two files, then the outputs) and `octreg apply`.
 
 A transform T is a 4x4 matrix (mm) from the OCT world to the MRI world; worlds are the NIfTI header frames (array frame for
 TIFF / NPY). The OCT is only ever streamed: its largest array in memory is the fine grid (Params.fine_mm).
@@ -6,7 +6,6 @@ TIFF / NPY). The OCT is only ever streamed: its largest array in memory is the f
 from __future__ import annotations
 
 import json
-import resource
 import sys
 import time
 from pathlib import Path
@@ -49,21 +48,21 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
         sec[name] = time.time() - t0 - sum(sec.values())
         print(f"octreg [{time.time() - t0:6.0f} s] {name} done in {sec[name]:.0f} s", flush=True)
 
-    # step 1-2, MRI: base grid and histogram foreground
+    # §1, MRI: base grid and histogram foreground
     (mri_h, mask_m, A_m), fg_m = prepare_mri(vm, P, mm)
     lap("mri")
-    # step 1-2, OCT: fine grid, specimen mask (innovation 1), base grid
+    # §1, OCT: fine grid, specimen mask, base grid
     fine, A_f = G.resample_iso(vo, P.fine_mm)
     overlay = G.pool_iso(fine, A_f, P.fine_mm, max(_mm(vm.spacing_mm.min()), P.fine_mm))       # for oct_in_mri
     lap("oct_fine_grid")
     (oct_h, mask_o, A_o), valid_o, fg_o = prepare_oct(fine, A_f, P, mo)
     del fine
     lap("oct_mask")
-    # step 3: two-class maps (innovation 2)
+    # §2: two-class maps
     u, w = pp.oct_channels(pp.two_class(oct_h, mask_o, h, P), mask_o)
     v = pp.mri_channels(pp.two_class(mri_h, mask_m, h, P), mask_m)
     lap("two_class")
-    # steps 4-5: orientation search in the crop and affine refinement (innovation 3)
+    # §3-4: orientation search in the crop and affine refinement
     poses, info = align((u, w, valid_o, A_o), (v, mask_m, A_m), P, device)
     lap("search_refine")
 
@@ -89,7 +88,11 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
     qc_figures(out / "qc", (oct_h, mask_o, A_o), (mri_h, mask_m, A_m), T, pose["polarity"], vo.affine,
                f"S {pose['S']:.4f} (class {pose['S_class']:+.4f}, outline {pose['S_outline']:.4f})")
     lap("outputs")
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == "darwin" else 2 ** 20)
+    try:                                                        # peak RSS: Unix only, None elsewhere
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == "darwin" else 2 ** 20)
+    except ImportError:
+        rss = None
     result.update(seconds={**sec, "total": time.time() - t0}, peak_rss_gb=rss,
                   gpu_peak_gb=torch.cuda.max_memory_allocated() / 2 ** 30 if cuda else None)
     io.write_json(result, out / "result.json")
@@ -97,7 +100,7 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
 
 
 def prepare_mri(vol, params: Params = Params(), mask=None):
-    """Steps 1-2 for the MRI (io.Volume): base grid and foreground, the mask file `mask` (io.Volume) if given, else the histogram
+    """§1 for the MRI (io.Volume): base grid and foreground, the mask file `mask` (io.Volume) if given, else the histogram
     rule. -> ((mri_h float32 [D, H, W], foreground bool [D, H, W], affine), info)."""
     h = params.base_mm
     arr, A = G.resample_iso(vol, h)
@@ -106,7 +109,7 @@ def prepare_mri(vol, params: Params = Params(), mask=None):
 
 
 def prepare_oct(fine, affine, params: Params = Params(), mask=None):
-    """Steps 1-2 for the OCT fine grid (fine [D, H, W] of spacing params.fine_mm, affine): specimen mask (fine_mask), then the
+    """§1 for the OCT fine grid (fine [D, H, W] of spacing params.fine_mm, affine): specimen mask (fine_mask), then the
     OCT, the mask and the measured fraction box-averaged to base_mm, the last two > 0.5.
     -> ((oct_h float32, mask bool, base affine), measured bool, info)."""
     P = params
@@ -128,7 +131,7 @@ def fine_mask(fine, affine, params: Params = Params(), mask=None):
 
 
 def align(oct_base, mri_base, params: Params = Params(), device="cuda", polarity=0):
-    """Steps 4-5 on base-grid arrays, oct_base = (u [2, D, H, W], specimen mask, measured fraction, affine) and mri_base =
+    """§3-4 on base-grid arrays, oct_base = (u [2, D, H, W], specimen mask, measured fraction, affine) and mri_base =
     (v [2, D', H', W'], mask, affine): box average to search_mm, search.search there (polarity 0 reads the polarity off the sign
     of the two-class score, +1 / -1 force it), then refine.refine of every search pose on the base grid.
     -> (refined poses lowest L first, {'search': search info, 'refine': {n_poses, seconds}})."""

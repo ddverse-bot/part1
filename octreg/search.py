@@ -1,4 +1,4 @@
-"""Orientation search (method step 4) on the search grid (Params.search_mm).
+"""Orientation search (docs/METHOD.md §3) on the search grid (Params.search_mm).
 
 For every rotation of a fixed uniform set the OCT template is correlated with the MRI crop over all translations by FFT
 (weighted NCC with a Padfield-style mask). Rotations only: two physical specimens are never mirror images, so the handedness is

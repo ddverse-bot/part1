@@ -1,5 +1,5 @@
-"""Preprocessing (method steps 2-3): the MRI foreground, the OCT specimen mask from isotropic texture (innovation 1), two-class
-maps and channels (innovation 2). numpy/scipy on the CPU; arrays [D, H, W] on isotropic grids of voxel_mm (mm). Exact zeros in
+"""Preprocessing (docs/METHOD.md §1-2): the MRI foreground, the OCT specimen mask from isotropic texture, two-class maps and
+channels. numpy/scipy on the CPU; arrays [D, H, W] on isotropic grids of voxel_mm (mm). Exact zeros in
 the OCT are missing data (black tiles): never specimen."""
 from __future__ import annotations
 
@@ -97,9 +97,9 @@ def foreground(arr, voxel_mm, params: Params = Params()):
                "n_components": n}
 
 
-# ----------------------------------------------------------------------------- specimen mask (innovation 1)
+# ----------------------------------------------------------------------------- specimen mask (§1)
 def specimen_mask(fine, voxel_mm, params: Params = Params()):
-    """Specimen mask from isotropic texture (innovation 1): doped agarose has the intensity of tissue, but its artefacts
+    """Specimen mask from isotropic texture: doped agarose has the intensity of tissue, but its artefacts
     (section stripes, tile seams) leave it quiet along at least one array axis while tissue texture varies along all three.
     Measured voxels m = fine > 0; band-pass b = G(fine m) / G(m) (Gaussian sigma texture_bandpass_mm); per array axis the
     running coefficient of variation of b over texture_window_mm (weights m; counted where >= half the window is measured);
@@ -155,7 +155,7 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
                  "n_components": n_comp}
 
 
-# ----------------------------------------------------------------------------- two-class maps and channels (innovation 2)
+# ----------------------------------------------------------------------------- two-class maps and channels (§2)
 def flattened(arr, mask, voxel_mm, params: Params = Params()):
     """arr / its local foreground mean G(arr M) / G(M), Gaussian sigma flatten_sigma_mm on blocks of ~sigma / 4 voxels, linearly
     interpolated (removes slow multiplicative intensity changes). arr: [D, H, W]; mask: bool [D, H, W]. -> float32."""

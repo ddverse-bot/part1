@@ -27,11 +27,12 @@ octreg qc --run OUT --oct OCT --mri MRI [--T F] [-o PREFIX]
 octreg apply --run OUT --moving X --reference Y -o Z [--inverse]
 ```
 
-The OCT can be NIfTI, TIFF, OME-TIFF or NPY and is streamed plane by plane; the MRI is NIfTI. Both headers must have the right
-handedness. A CUDA GPU is expected for real volumes. `register` writes `T_oct2mri.txt` and `T_mri2oct.txt` (4×4, mm, between
-the worlds of the input files), the same transform as FreeSurfer LTA and ITK files, `oct_in_mri.nii.gz`, `mri_in_oct.nii.gz`,
-the QC images `qc.png` and `qc_montage.png`, and `result.json`. `qc --T` renders the same QC for another transform, so
-candidate poses can be compared side by side. `apply` resamples a volume through the registration.
+The OCT can be NIfTI, TIFF, OME-TIFF or NPY and is streamed plane by plane; the MRI is NIfTI. Both files must have the right
+handedness (for TIFF and NPY set by the array axis order, x, y, z = numpy axes 2, 1, 0). A CUDA GPU is expected for real
+volumes. `register` writes `T_oct2mri.txt` and `T_mri2oct.txt` (4×4, mm, between the worlds of the input files), the same
+transform as `oct2mri.lta` (FreeSurfer) and `oct2mri_itk.txt` (ITK), `oct_in_mri.nii.gz`, `mri_in_oct.nii.gz`, the QC images
+`qc.png` and `qc_montage.png`, and `result.json`. `qc --T` renders the same QC for another transform, so candidate poses can be
+compared side by side. `apply` resamples a volume through the registration.
 
 ## Checking a result
 
@@ -43,9 +44,10 @@ folded pieces should correspond and lie on the same side, and the contrast shoul
 
 ![Result and the best pose of the other handedness on I58](docs/figures/fig_handedness_xiangrui.png)
 
-The MRI outline of the result follows the OCT specimen, and the cerebellar folia of the MRI lie on the folded folia pieces of
-the OCT, at the lower right of the axis-1 plane and the upper right of the axis-2 plane. The best mirrored pose fits the outline
-as well and has the lower loss, but its folia lie on the wrong side. The montage of all planes is
+The MRI outline of the result follows the OCT specimen apart from the torn and folded cerebellar pieces, which have moved, and
+the cerebellar folia of the MRI lie on the folded folia pieces of the OCT, at the lower right of the axis-1 plane and the upper
+right of the axis-2 plane. The best mirrored pose fits the outline as well and has the lower loss, but its folia lie at the upper
+right of the axis-1 plane and are missing from the upper right of the axis-2 plane. The montage of all planes is
 [fig_qc_montage_xiangrui.png](docs/figures/fig_qc_montage_xiangrui.png). The run took 9 min 36 s on the original files
 (OCT 1457×2013×1595 at 20 µm, MRI 343×489×495 at 0.08 mm) with 5.2 GiB of RAM. Removing the texture mask, the outline term,
 the polarity rule or the scale prior, or mirroring the OCT, moves the pose by 30 to 48 mm.

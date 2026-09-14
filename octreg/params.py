@@ -10,11 +10,11 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Params:
     """Method constants (no switches); a variant via dataclasses.replace or from_dict (a partial dict)."""
-    # grids (step 1)
+    # grids
     search_mm: float = 0.6                    # isotropic grid of the orientation search, an integer multiple of base_mm
     base_mm: float = 0.15                     # isotropic grid of the two-class maps and the affine refinement
     fine_mm: float = 0.04                     # OCT grid of the specimen mask
-    # foreground (step 2)
+    # foreground and specimen mask (§1)
     valley_ratio: float = 0.5                 # MRI histogram valley / smaller neighbouring peak must be below this
     min_component: float = 0.01               # keep MRI foreground components >= this fraction of the foreground volume
     texture_bandpass_mm: float = 0.08         # Gaussian sigma of the band-pass before the directional variation
@@ -22,16 +22,16 @@ class Params:
     texture_grid_mm: float = 0.16             # block grid of the texture field
     texture_smooth_mm: float = 1.2            # Gaussian sigma of the log texture field before its two-class (Otsu) threshold
     texture_close_mm: float = 0.48            # closing radius of the specimen mask
-    # two-class maps (step 3)
+    # two-class maps (§2)
     flatten_sigma_mm: float = 10.0            # Gaussian sigma of the local foreground mean used for flattening
     sigmoid_std: float = 0.25                 # p = sigmoid((I - t) / (sigmoid_std * std of foreground values))
-    # orientation search (step 4)
+    # orientation search (§3)
     n_rot: int = 8000                         # uniform rotations, R[0] = identity (no mirror: handedness from the file frames)
     seed: int = 0                             # rotation set seed
     topk: int = 24                            # poses kept after non-maximum suppression, each one refined
     nms_mm: float = 3.0                       # same pose if centres closer than nms_mm ...
     nms_deg: float = 10.0                     # ... and rotations closer than nms_deg
-    # affine refinement (step 5)
+    # affine refinement (§4)
     iters: int = 200                          # Adam iterations per pose
     lam: float = 2.0                          # L = 1 - S + lam (sum log_scale^2 + sum shear^2)
     clamp: float = 0.15                       # |log_scale|, |shear| <= clamp (absolute)

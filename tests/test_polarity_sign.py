@@ -1,5 +1,5 @@
 """Swapping the OCT classes negates the two-class score exactly and leaves the outline score, in the FFT search and in the refiner,
-so the poses are the same and the contrast polarity is the sign of one score (method steps 4-5); a forced polarity (search
+so the poses are the same and the contrast polarity is the sign of one score (docs/METHOD.md §2-4); a forced polarity (search
 argument, an ablation) keeps its sign."""
 import dataclasses
 

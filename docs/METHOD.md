@@ -7,9 +7,10 @@ array axis, tile seams in the section plane and exact zeros where data are missi
 the MRI. The MRI is an ex-vivo scan already cropped to a region containing the block; the crop is the only position prior. Both
 voxel sizes are taken as correct, so the true scales are close to 1, and both file headers as having the correct handedness.
 
-Transforms map millimetres in the OCT file world to the MRI file world (NIfTI header frame, diag(spacing) for TIFF and NPY). The
-OCT is streamed plane by plane into a 0.04 mm fine grid, which serves only the specimen mask. Everything else runs on a 0.15 mm
-base grid (the masks there kept above 0.5), and the search on its 4³ box average, a 0.6 mm grid.
+Transforms map millimetres in the OCT file world to the MRI file world: the NIfTI header frame, or for TIFF and NPY
+diag(spacing) on the axes (x, y, z) = numpy axes (2, 1, 0). The OCT is streamed plane by plane into a 0.04 mm fine grid, where
+the specimen mask is computed; box averages of it give a 0.15 mm base grid (masks kept above 0.5), on which everything else
+runs, and oct_in_mri.nii.gz. The search runs on the 4³ box average of the base grid, a 0.6 mm grid.
 
 ## 1. Specimen mask from isotropic texture
 
@@ -18,17 +19,19 @@ sectioning axis and a tile seam only across the seam. Tissue varies along every 
 Gaussian, σ 0.08 mm), the running coefficient of variation c_a is computed along each array axis over 0.36 mm, and the texture
 field F = min_a c_a is averaged over 0.16 mm blocks. log F is smoothed (σ 1.2 mm) and split by Otsu's threshold, followed by
 closing (0.48 mm) and the largest component. Uniform tissue such as a white-matter bundle leaves holes, and a hole that reaches a
-cut face is not enclosed in 3-D, so holes are filled in every array plane. On I58 the mask measures 19.2 cm³; an intensity
-threshold on the same OCT takes in the agarose and gives 29.5 cm³.
+cut face is not enclosed in 3-D, so holes are filled in every array plane. On I58 the mask measures 19.3 cm³; an intensity
+threshold on the same OCT takes in the agarose and gives 29.9 cm³.
 
-The MRI foreground is the first histogram valley below 0.5 of its smaller neighbouring peak, with peaks found on the square
-root of the smoothed counts. Either mask can be supplied as a file.
+The MRI foreground threshold is the first histogram valley, walking down from the brightest peak, below 0.5 of its smaller
+neighbouring peak (peaks found on the square root of the smoothed counts); without one, nearly the whole field of view is kept
+and the run is flagged. Either mask can be supplied as a file.
 
 ## 2. One score for structure and outline, polarity as a sign
 
 OCT scattering and MRI intensity follow no fixed mapping, but in both the tissue falls into a brighter and a darker class. Each
 volume I with foreground M is divided by its local foreground mean G(I M) / G(M) (Gaussian σ 10 mm) and blurred by one voxel to
-give x; with t the Otsu threshold and s the standard deviation of the foreground values, p = sigmoid((x − t) / (0.25 s)).
+give x; with t the Otsu threshold and s the standard deviation of the foreground values of x clipped at their 99.5th
+percentile, p = sigmoid((x − t) / (0.25 s)).
 
 The OCT enters as channels u = (p_O, 1 − p_O) with its specimen mask w as weight, the MRI as v = (p_M M, (1 − p_M) M). The
 class structure alone is a weak signal on real blocks, so the score also compares the outlines, w against M over the measured
@@ -50,8 +53,8 @@ non-maximum suppression (3 mm, 10°) leaves 24 poses.
 
 Mirror images are not searched, so the handedness is that of the file headers. Two physical specimens are never mirror images,
 and the score cannot tell handedness on a nearly symmetric specimen: on I58 the best mirrored pose has the lower loss but its
-anatomy on the wrong side (docs/figures/fig_handedness_xiangrui.png). A stack with a mirrored header, for example a reversed
-section order, has to be fixed in its header.
+anatomy in the wrong place (docs/figures/fig_handedness_xiangrui.png). A mirrored stack, for example with a reversed section
+order, has to be fixed in its header, or for TIFF and NPY by reversing one array axis.
 
 ## 4. Prior-bounded affine refinement
 
@@ -64,11 +67,11 @@ h_i clamped to ±0.15. The lowest L wins. The prior is needed because S alone re
 
 ## Evaluation
 
-A registration is judged by looking at it, because label-free numbers can prefer a wrong pose. In every plane of
-qc_montage.png (four planes per OCT axis: OCT, MRI through the transform, checkerboard, both outlines) the OCT specimen must lie
-on the same anatomy in the MRI, internal structures must continue across the checkerboard, cut faces and folded pieces must
-correspond and lie on the same side, and the contrast must be consistently inverted or not. Plausible alternatives, such as the
-best pose of the other handedness, are rendered with `octreg qc --T` and compared side by side.
+A registration is judged by looking at it, because label-free numbers can prefer a wrong pose. In every plane of qc_montage.png
+(four planes per OCT axis, each shown as OCT, MRI through the transform, checkerboard and OCT with both outlines) the OCT
+specimen must lie on the same anatomy in the MRI, internal structures must continue across the checkerboard, cut faces and
+folded pieces must correspond and lie on the same side, and the contrast must be consistently inverted or not. Other candidate
+transforms can be rendered with `octreg qc --T` and compared side by side.
 
 ### Xiangrui's I58 brainstem pair
 
@@ -78,10 +81,10 @@ RAM and 1.8 GiB of GPU memory. S is 0.2747 (S_class −0.1175, S_outline 0.5891)
 most 0.270 with any OCT axis flipped.
 
 In the montage (docs/figures/fig_qc_montage_xiangrui.png) the MRI outline follows the OCT specimen in every plane apart from the
-torn and folded cerebellar pieces, which have moved; the OCT mask takes in a margin of agarose in some planes. The cerebellar
+torn and folded cerebellar pieces, which have moved; the OCT mask takes in a margin of agarose in most planes. The cerebellar
 folia of the MRI land on the folded folia of the OCT, and a round nucleus at the top of the axis-2 planes corresponds. The best
-mirrored pose fits the outline as well (S_outline 0.6438) and has the lower loss (L 0.7133 against 0.7296), but its folia lie on
-the wrong side.
+mirrored pose fits the outline as well (S_outline 0.6438) and has the lower loss (L 0.7133 against 0.7296), but its folia lie at
+the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
 
 Each ablation changes one element and reruns search and refinement; pose changes are block-corner means against the result.
 
@@ -94,21 +97,20 @@ Each ablation changes one element and reruns search and refinement; pose changes
 | the other handedness (OCT mirrored) | 29.8 |
 | holes filled in 3-D only | 1.69 |
 | standardised intensities instead of two-class maps | 0.74 |
-| watershed mask of our earlier pipeline | 0.32 |
+| an independently made rim-watershed specimen mask (Dice 0.92) | 0.32 |
 | MRI flattening off / OCT flattening off | 0.12 / 0.10 |
 
-Flattening barely moves the pose but keeps it stable: without it, the watershed mask and 3-D hole filling moved the pose by 42.3
-and 40.9 mm. A section-stripe flat field and a rigid-to-affine refinement ladder moved the pose by 0.15 and 0.0015 mm when
-removed and are not in the method; neither is an overlap gate, which the outline term replaces.
+Flattening barely moves the pose but keeps it stable: without it, the rim-watershed mask and 3-D hole filling moved the pose by
+42.3 and 40.9 mm.
 
 ## Parameters
 
-All constants are fields of `octreg.params.Params`; I58 used the defaults.
+The tunable constants are fields of `octreg.params.Params` (override with `--params`); I58 used the defaults.
 
 | parameter | default | role |
 |---|---|---|
 | `search_mm`, `base_mm`, `fine_mm` | 0.6, 0.15, 0.04 mm | search grid, base grid, OCT grid of the specimen mask |
-| `valley_ratio`, `min_component` | 0.5, 0.01 | MRI histogram valley / smaller peak; smallest MRI foreground component kept |
+| `valley_ratio`, `min_component` | 0.5, 0.01 | MRI histogram valley / smaller peak; smallest MRI foreground component kept, as a fraction of the foreground |
 | `texture_bandpass_mm`, `texture_window_mm` | 0.08, 0.36 mm | smoothing before, and window of, the directional coefficient of variation |
 | `texture_grid_mm`, `texture_smooth_mm`, `texture_close_mm` | 0.16, 1.2, 0.48 mm | texture blocks, smoothing of log F (set on I58), closing radius |
 | `flatten_sigma_mm`, `sigmoid_std` | 10 mm, 0.25 | flattening scale; sigmoid width in foreground standard deviations |

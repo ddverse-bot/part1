@@ -1,4 +1,4 @@
-"""Affine refinement (method step 5): every search pose is fitted on the base grid with its polarity fixed, and the lowest loss
+"""Affine refinement (docs/METHOD.md §4): every search pose is fitted on the base grid with its polarity fixed, and the lowest loss
 wins.
 
 Model x_mri = R(r) Sh(sh) diag(exp(ls)) (x_oct - c) + t, c = OCT grid box centre (mm); no mirror (handedness from the file frames).
