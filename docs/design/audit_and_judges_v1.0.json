@@ -1,0 +1,1112 @@
+{
+ "audit_evidence": {
+  "summary": "Evidence map built from README §0-4, HANDOFF ch. 5-7, 8.3-8.5, 11.8-11.11 and 12.C, docs/v11/REPORT_I58_v11.md with Appendix C.1-C.4, docs/v11 probe and judge JSONs, results/runs_summary.md, and two server summaries (work/runs/summary_all/summary.md, work/runs/v11/summary/summary.md). I also ran three read-only server checks: which runs have qc_fine.json or export/ (the brainstem pair only), whether the E1 or E2 runs exist (they do not), and work/v11/tests/mask_I46/result.json.\n\nWHAT THE EVIDENCE SUPPORTS AS A GENERAL METHOD. A short core has real support across more than one dataset:\n- training-free two-class structure maps, with the MRI flattened by a local tissue mean;\n- exhaustive FFT masked-NCC search over rotations x handedness x class polarity;\n- polarity decided by the refined NCC;\n- a clamped rigid -> similarity -> affine ladder with an absolute scale prior.\nThis core is what placed I46 and I55 (the only quantitatively confirmed subjects) and the brainstem body. The scale prior is also what stopped the shrink degeneracy on the brainstem.\n\nWHAT IS DATASET-SPECIFIC OR NEGATIVE.\n- Vascular channel: helps exactly one subject (I46: 12 um OCT with a wrong depth sidecar; ves_seg median 265 -> 167 um; controls collapse the gain). It is silent on I55, has no usable signal on the seven 30-35 um subjects (vessel NCC <= 0.053) and is harmful on the brainstem (2.65 mm move, 4778 s). The depth-scale story is n=1 each way, and I55 recovers 6/7.\n- v1.1 texture mask: works on agarose, but on I46 it keeps 0.28 of the 0.68 cm3 cortex mask. Only a volume-ratio switch keeps it off DANDI.\n- v1.1 fine stage: rejected on I58 in all 13 runs or configurations, and accepted-but-harmful on cortex (I46 vesseg 167 -> 264 um, stretch 1.219 -> 1.31; I55 GM Dice 0.930 -> 0.916).\n- Clear negatives: nonrigid, parser, self-distillation, MIND, raw intensity, and the P5-P11 objectives (surface distance, MI, piecewise, exclusion, renormalisation).\n- QC: restarts are anti-correlated with correctness (I58 and I61 at 12/12 are wrong; I46 and I55 are 9/12). The search margin also flags I55 and the brainstem. Absolute NCC is meaningless across subjects. Boundary-agreement and MI-landscape QC were only ever computed on the brainstem, were never calibrated, and give conflicting answers on its handedness.\n\nUNSOLVED GENERAL PROBLEM. Foreground separation (MRI bath, OCT agarose) is behind I61, DANDI I58, I56's broken mask and the brainstem mask excess (>= 5.5 cm3 non-tissue). The current handling is two different rules: a fail-open histogram rule and a texture mode behind an auto switch. Sectioning artefacts are also handled by two overlapping steps: slab normalisation hard-coded to array axis 0 with a window wrong by about 3x, and a separate axis-detected destripe. Neither step has an ablation on registration accuracy.\n\nSCORECARD. On the nine DANDI subjects: 2 confirmed (I46, I55); 3 unresolved (I38, I56, I62 rest on unverified AI-made figures, with annotations 55-66 mm away in a label frame known to be broken); 1 undecidable (I48, margin 0.0013); 3 failed (I61 mask; DANDI I58 at 10 deg flip angle; I57 undiagnosed). I57's \"wrong\" verdict has the same weight of evidence as I38's \"correct\" until map_labels_to_grid is fixed.\n\nREPRODUCIBILITY. The v1 snapshot reproduces I46 and I55 exactly, and v1.1 defaults give 0/26 regression failures on each. The brainstem one-command run reproduces R5 to 0.00 mm. The other seven DANDI subjects were never re-run on the current tree.\n\nWHAT A REVIEWER WILL ASK FOR THAT IS MISSING.\n1. Baselines: Costantini B0 (approximable), masked-MI multi-start affine (B1), ANTs/NiftyReg, MIND+ConvexAdam, generalist nets. None has been run.\n2. TRE: none on any pair. No landmarks requested; the authors' I46 affine sits 23 mm from ours, unresolved.\n3. Registration-level ablations of bias flattening, slab normalisation, the masks, destripe, the DOF ladder and the scale-prior values. Feature, mirror and vessel ablations exist on I46 only (40 mm crop).\n4. Sensitivity: n_rot, search level, topk/NMS, reg/clamp, overlap constants, metadata spacing (I46 at 14 um / I55 at 12 um), seeds on DANDI, noise/resolution, block size (0.09-7.19 % of the hemisphere), flip angle (I58 at 30 deg).\n5. Controls: a true random-pose control. A synthetic known-transform benchmark for capture range and accuracy.\n6. Evaluation fixes: correct label mapping for the six 0.12 mm subjects, a rotation metric that works for mirrored transforms, human-verified figures, and more labelled subjects (I45, I60 carry ves_seg).\n7. Runtime and memory for the final method on every pair. Current evidence: 18.7-131 min on DANDI, with the vascular stage taking up to 72-91 % of wall time; 27.6 min and 32 GB peak on the brainstem; no v1.1 runtime table across all pairs.\n8. Complexity: 49 register.py flags, 27 prep flags and 74 scripts. More than half of the flags belong to components the evidence says to drop (fine, polish, vascular gate, mask sub-options, parser, nonrigid).",
+  "items": [
+   {
+    "name": "Two-class structure maps (flattened Otsu, soft sigmoid, both OCT polarities)",
+    "where": "octreg/features.py (otsu_two_class, otsu_two_class_lowmem); scripts/prep_subject.py; scripts/register.py --features otsu; HANDOFF §5.1, §6.10.9; results/runs_summary.md",
+    "what": "Both volumes reduced to soft [bright, dark] class probability maps inside a tissue mask (Otsu threshold, sigmoid scale 0.25 std); OCT channel 0 is always the bright class and polarity is applied by swapping channels.",
+    "classification": "core-general",
+    "evidence": "I46 crop ablation (40 mm box, runs_summary.md): otsu top1 0.727 / refined 0.753 / restarts 7/8 / Dice 0.801/0.830. Raw intensity: 0.594 / 0.693 / 4/8. Parser: 0.650 / 0.710 / 5/8, 19 mm off. MIND: 0.219 / 0.185 / 3/8, 17.9 mm off. Mixed: 0.733 / 0.731. Whole hemisphere I46_otsu vs I46_parser: same centre to 0.03 mm, refined NCC 0.7564 vs 0.7218. Carried the pose on I46 and I55 (quantitative), on I38/I56/I62 (visual only) and on the brainstem body (v1 NCC 0.1014, channels [-0.017, 0.220]; v1.1 0.1241). Known blind spots: (1) depth scale: along depth dNCC 0.021 vs 0.169 along k over s 0.85-1.30 (scale_profiles.json), and Dice moves 0.007; (2) polarity symmetry at 0.6 mm: the wrong polarity scores 0.7275 vs 0.7273 at a pose 71 mm away; (3) the level is not comparable across subjects (I61 0.502 wrong, I62 0.284 visually correct). Every feature ablation is on one subject.",
+    "recommendation": "Keep as the single representation of the general method. Repeat the otsu vs intensity vs MIND ablation on I55 and the brainstem so it is not n=1, and state the depth-scale and polarity blind spots in the method text."
+   },
+   {
+    "name": "MRI bias-field flattening before Otsu",
+    "where": "features.otsu_two_class_lowmem (tissue-weighted local mean, sigma 10 mm, floor 0.5 x p5); HANDOFF §5.1.5, §6.14.2; README §1",
+    "what": "Divide the MRI by a smooth tissue-only local mean before the global Otsu split, so a receive-coil ramp does not become the class boundary.",
+    "classification": "core-general",
+    "evidence": "I46 whole hemisphere vs manual labels (re-derived first-hand, /tmp/flat.py): raw Otsu Dice WM/GM 0.6502/0.5987; flattened 0.9069/0.9343. The intensity ramp is 1.9x (local mean p5 29.3, p95 55.4). A tissue-inverted MRI (crop_final_inv2) still recovers the pose (vessels 179-182 um), but with 0/12 structural restarts (re-parsed twin 8/12). Not measured on I55, not on the 0.12 mm subjects (broken label mapping), and not on the 0.08 mm brainstem crop, where a 10 mm kernel on a ~30-40 mm FOV was never checked. No registration-level with/without ablation exists. The same idea at 3 mm gave the best fine-scale signal on I58 (P2: flattened NCC contrast 0.54 vs raw NCC 0.36).",
+    "recommendation": "Keep, and apply one physical-sigma flattening rule to both modalities. Add a registration-level ablation (flattening off) on I46, I55 and the brainstem, and the segmentation Dice on I55."
+   },
+   {
+    "name": "Raw intensity similarity (search or polish)",
+    "where": "features.build_features(kind='intensity'); scripts/test_polish.py; HANDOFF §7.3.4; REPORT P2",
+    "what": "Tissue z-scored intensities correlated directly across modalities.",
+    "classification": "experimental-negative",
+    "evidence": "I46 crop: top1/top2 0.594/0.592 (margin 0.002), refined 0.693, 4/8 restarts, correct centre only inside the crop. Brainstem: cross-modal NCC 0.033 at 0.32 mm and 0.030 at 0.16 mm; the polish dragged a correct pose 9.37 mm (centre) / 9.55 mm (corner mean) / 12.3 mm (corner max). P2: the relation is inverted and not uniform (raw masked NCC -0.23 at the pose; 26/37 sub-blocks negative, range -0.63 to +0.18).",
+    "recommendation": "Drop as an objective. Mention it as a baseline row only."
+   },
+   {
+    "name": "MIND-SSC descriptor",
+    "where": "features.mind_ssc; HANDOFF §7.3.5; REPORT P2",
+    "what": "12-channel modality-independent self-similarity descriptor used as search/refine features.",
+    "classification": "experimental-negative",
+    "evidence": "I46 crop: top1 0.219, the refinement lowered it to 0.185, 3/8 restarts, 17.9 mm corner-mean off (33 mm max), 0 manual vessels inside the block, about 3x slower search (31 s vs 11 s). Brainstem P2: peak-to-shoulder contrast 0.02, no optimum at 0.3 mm.",
+    "recommendation": "Remove from the package. Keep one table row as a standard-descriptor baseline."
+   },
+   {
+    "name": "Trained 3D U-Net parser (and synth.py domain randomisation)",
+    "where": "octreg/parser.py, octreg/synth.py, scripts/train_parser.py, parse_mri.py, register.py --features parser",
+    "what": "Supervised WM/infra-GM/supra-GM segmentation used as the structure map.",
+    "classification": "legacy/dead",
+    "evidence": "crop_parser_v2 lands 19 mm off (0.650/0.710, 5/8). crop_parser_v1: wrong pose, scales collapsed to 0.76/0.73/0.77. Whole-hemisphere I46_parser gives the same pose as otsu (0.03 mm) only because the search is robust; its refined NCC 0.7218 is below otsu's 0.7564. Whole-hemisphere parser Dice WM 0.485 / GM 0.586 (logs/parse_I46.log). The claimed 'Dice 0.98' is unverified. parse_mri.py on I56 was OOM-killed. It needs manual whole-hemisphere labels to train, so it cannot run on the brainstem (C-nolabels).",
+    "recommendation": "Remove from the method package and archive. Keep the I46 otsu-vs-parser comparison as a supplementary ablation."
+   },
+   {
+    "name": "Cross-modal self-distillation of an OCT parser",
+    "where": "scripts/distill_oct_parser.py; work/runs/summary/distill_log.json; HANDOFF §6.10.8, §7.3.2",
+    "what": "Train an OCT parser on MRI labels pulled through the current transform, re-register, iterate.",
+    "classification": "experimental-negative",
+    "evidence": "Two rounds: top1 0.708 -> 0.874, final NCC 0.724 -> 0.960, self-Dice 0.961, yet the pose moves only 0.51 then 0.68 mm. Vessel median stays 258-265 um / f150 0.27-0.28, against 167 / 0.47 after the vascular stage. Round 0 (MRI parser applied directly to OCT) lands 12.2 mm off.",
+    "recommendation": "Drop. Cite as the cautionary result that internal scores are not accuracy."
+   },
+   {
+    "name": "OCT slab normalisation along array axis 0",
+    "where": "common.oct_slab_normalize; prep_subject.py:145 (window = max(10, round(1200/sp_z)) slices along axis 0; fp16 gain 16384/median, cap 60000)",
+    "what": "Per-slice in-tissue median divided by its running mean along the assumed sectioning axis, removing the vibratome sawtooth.",
+    "classification": "general-but-unvalidated",
+    "evidence": "No with/without registration ablation on any subject. The window constant is wrong by about 3x: the measured section period is 33 slices on I46 (window 100 = 3.03 periods, works by luck) and 12 slices on I56 (window 34 = 2.83 periods, residual sawtooth left). On the brainstem the sectioning axis is array axis 2 (P3), so the step runs along an en-face axis. There it removes about 1.5 % (log-scale std 0.015, 85 % of its power on 2.82 mm tile harmonics). Undoing it, or replacing it with per-section normalisation along axis 2 or a 2-D tile flat field, changes structural NCC by <= 0.0004 and moves local refits 0.12-0.55 mm (P11 norm; search and restarts not re-run). The fp16 gain trick is needed engineering: it prevents uint16 overflow to inf, and denormal collapse of the brainstem mu_s map whose raw tissue threshold is 9.6e-4.",
+    "recommendation": "Merge with destripe into one sectioning-artefact step: detected axis, window = measured period. Or drop it if an I46/I55 ablation shows no effect; run that ablation either way. Keep the dtype gain logic as engineering."
+   },
+   {
+    "name": "Physical-unit grids and pyramid (pooling to 0.15 mm, levels 0.6/0.3/0.15 mm)",
+    "where": "common.py (layout_affine, pool_mean_np, resample_to_grid, sample_at_world); register.py:122 LEVELS; HANDOFF §5.7",
+    "what": "All kernels, windows, levels, tolerances and learning rates in mm/um. OCT pooled per axis, then resampled onto an exactly isotropic grid in world mm.",
+    "classification": "core-general",
+    "evidence": "The same core flags ran on 0.08, 0.12 and 0.15 mm MRI and 12, 14, 20 and 30-35 um OCT. Search cost scales with the MRI grid (44.8 s on the brainstem crop to 1010 s on I57). Brainstem prep geometry matches the raw file (Spearman 0.940; axis flips <= 0.10; peak at zero shift; C.4). Not sufficient alone: the brainstem still needed pair-specific flags (--vascular off, --skip-vessels, --oct-mask auto, --destripe on). One 'physical' constant (the slab window) is wrong. The 0.6 mm search level and the 0.15 mm finest level were never ablated.",
+    "recommendation": "Keep as a stated design principle. Derive the remaining data-dependent constants (section period, stripe axis) from measurements, not from protocol text."
+   },
+   {
+    "name": "OCT intensity tissue mask",
+    "where": "common.histogram_tissue_threshold + oct_tissue_mask (threshold, binary_closing x2, fill holes, largest connected component)",
+    "what": "Foreground (tissue) mask for the OCT block from the intensity histogram, kept to the single largest component.",
+    "classification": "general-but-unvalidated",
+    "evidence": "Adequate on DANDI cortex blocks (no embedding medium; the OCT/MRI volume ratio stays small, so the overlap gate never binds). Never compared with any OCT annotation. Fails on the agarose-embedded brainstem: no histogram valley, threshold falls to the floor, 28.86 cm3 = 77.9 % of the box, 2.17x the MRI tissue (13.32 cm3) (P1, prep.json). The largest-component rule is an untested suspect for I57, a two-piece 60 mm slab with the lowest OCT tissue fraction (0.404).",
+    "recommendation": "Replace both the intensity-only and texture-only rules with one foreground method validated on cortex (I46, I55, I57) and on the brainstem. Do not force a single component on multi-piece specimens."
+   },
+   {
+    "name": "OCT texture specimen mask with auto switch (v1.1, v1.1b sub-options)",
+    "where": "octreg/specimen.py; prep_subject.py --oct-mask auto (fires iff V_int > 1.5 V_MRI and V_tex in 0.5-1.75 V_MRI); --mask-fill-pockets/--mask-fill-holes/--mask-rim-required/--mask-erode-mm; oct150_mask_core.npy",
+    "what": "Min-over-axes directional texture std at 0.04 mm, two-component GMM threshold, rim watershed, pocket reassignment, hole filling.",
+    "classification": "dataset-specific",
+    "evidence": "Brainstem: 28.86 -> 18.05 cm3 (1.355x MRI, one component; port Dice 0.9999993). Overlap gate 0.369 -> 0.59. Structural pose reproducible across seed (0.31 mm / 1.1 deg) and destripe (0.35 mm / 1.4 deg) at the 7 mm cube. But the search margin fell from 1.053 to 1.005 and restarts from 10/12 to 6/12, and the pose moved 0.94 mm / 10.6 deg from the v1 pose with no evidence which is more accurate. P8: >= 5.5 cm3 (30 % of the mask) is still agarose shell and lamellar pockets at any rigid pose; the pocket/hole rules contribute < 0.07 cm3 and the rim rule is a no-op. On I46 (work/v11/tests/mask_I46/result.json) the same recipe keeps 0.28 cm3 against the 0.68 cm3 intensity mask, i.e. it would discard about 59 % of a cortex block; only the auto switch keeps it off DANDI. v1 notes (EXPLAINER §4) already record that pure texture failed on both datasets (only a PNG survives).",
+    "recommendation": "Do not ship as a mode behind a volume-ratio switch. Generalise it (texture fused with intensity, shown to work on I46, I55, I57 and the brainstem) or drop it in favour of the intensity mask plus the adaptive gate. Remove the v1.1b mask sub-flags, which had no measured effect."
+   },
+   {
+    "name": "MRI tissue mask (histogram peak-walk with fallback)",
+    "where": "common.histogram_tissue_threshold (rightmost peak, walk left, cut at the first valley with ratio < 0.5, else fallback min(p1, 0.5 x multiotsu[0])); prep.json mri.{valley_ratio, tissue_fraction}",
+    "what": "Air/bath vs tissue split of the MRI, used to mask Otsu statistics and the search overlap.",
+    "classification": "general-but-unvalidated",
+    "evidence": "Plausible hemisphere volumes on 6/9 subjects (386-806 cm3). Fails open on 3/9 (valley_ratio null): I56 2519 cm3 (98.9 % of the volume), I61 1839 cm3 (74.2 %), DANDI I58 1453 cm3 (58.7 %). I61 lands 95.7 mm outside the brain with 12/12 restarts; I56 survived visually. I55 is also null but correct (620.5 cm3). I57's mask is healthy (518 cm3, valley 0.0631) and I57 is still wrong. On the brainstem crop the mask is insensitive to threshold (P8: 0.45 / 0.541 / 0.65 leave region B at 7.26-7.34 cm3). The proposed volume gate (> 1.5 x 806 = about 1210 cm3) would catch all three failures with no false alarm, but it is not implemented, it is hemisphere-specific, and it is meaningless for crops.",
+    "recommendation": "This is the most consequential general gap. Make the rule fail loudly instead of falling back silently, or use one principled foreground model shared with the OCT side. Check foreground volume against the other modality's volume, not against a hemisphere constant."
+   },
+   {
+    "name": "Axis-detected destripe (v1.1)",
+    "where": "octreg/destripe.py; prep_subject.py --destripe on/--stripe-axis",
+    "what": "Detect the sectioning axis as the lowest adjacent-plane NCC of high-passed planes, then flat-field along it by normalised convolution (sigma 0.48 mm across, 0.24 mm along).",
+    "classification": "general-but-unvalidated",
+    "evidence": "Brainstem only: axis 2 detected (NCC 0.351 vs 0.630/0.661), period 7.49 voxels = 0.30 mm. x-profile residual 139 -> 50 (test) and 257.6 -> 94.6 (native prep), stripe FFT peak removed, zero fraction unchanged. Effect on the pose is small: R5 vs no-destripe 0.35 mm / 1.4 deg (0.67 mm at the block corners), rim boundary 2.02/1.05 vs 2.02/1.09 mm, restarts 6/12 vs 3/12. P11: a per-section normalisation along axis 2 shows no measurable benefit. I46: the detector is decisive on axis 0 (0.439 vs 0.80; period 16.2 voxels = 0.39 mm; residual 18.8 -> 3.8), but the 'other axes change < 3 %' check fails (y 4.0 -> 4.3, x 5.2 -> 5.6). It was never applied in a DANDI registration. It does not rescue the vessel channel (section-phase modulation 2.54x).",
+    "recommendation": "Keep only as part of one sectioning-artefact step (merged with slab normalisation), driven by the axis detector for all data. Validate by regression on I46/I55 before making it default."
+   },
+   {
+    "name": "Global exhaustive FFT masked-NCC search",
+    "where": "octreg/search.py; register.py (--n-rot 8000, x2 mirror, --topk 24, NMS 3 mm AND 10 deg, 0.6 mm level, var_floor 2 %); HANDOFF §5.2",
+    "what": "Scores every translation by FFT for 8000 random SO(3) rotations x {proper, mirrored} per polarity, then keeps the top 24 distinct poses.",
+    "classification": "core-general",
+    "evidence": "Finds I46 (0.09 % of the hemisphere) and I55 in whole hemispheres with no prior. Crop (30 mm) vs whole-hemisphere search gives identical poses on I46 (crop_final2 stretch [1.184, 0.973, 1.034] vs whole_final2 [1.195, 0.975, 1.035]; vessels 166.8 vs 166.6 um). Brainstem v1: 0.1247/0.1184, visually correct body pose. Cost: 44.8 s (brainstem) to 1010 s (I57) per polarity, about 690x cheaper than direct evaluation. Failures trace to the objective, not the search: I61 12/12 at a wrong optimum; the I48 and DANDI I58 landscapes are flat, and I48 had plateaued by 4000/16000 orientations. n_rot, topk, NMS radii and the 0.6 mm level were never swept (I48's plateau and the brainstem's convergence by 4000 orientations suggest 8000 is generous). The search also surfaces the brainstem handedness ambiguity (other handedness 0.1313/0.1250).",
+    "recommendation": "Keep as the centre of the method. Add a sensitivity table (n_rot 2000/4000/8000; level 0.6/0.9 mm) on I46, I55 and the brainstem, and run the true random-pose control."
+   },
+   {
+    "name": "Mirror / handedness branch",
+    "where": "search.run (Rs @ diag(1,1,-1)); refine.params_from_matrix (mirror fixed, never optimised); common.rotation_geodesic_deg (returns 180 for opposite determinant)",
+    "what": "Handedness enumerated as a discrete branch in the search and carried unchanged through refinement.",
+    "classification": "core-general",
+    "evidence": "6 of 9 DANDI runs are mirrored (I38, I46, I48, I56, I58, I62); I55, I57, I61 and the brainstem are not. I46 crop with --no-mirror: top1 0.7328 -> 0.6848, refined 0.7307 -> 0.6853, Dice 0.798/0.829 -> 0.767/0.806, scale degenerates to [0.955, 1, 1]. Cost: 2x search. Brainstem (C.4): undecided. Reported pose: NCC 0.1241, 6/12 restarts, rim 2.02/1.05 mm, y+ face 4.96 mm. Other handedness: NCC 0.1132, 1/12, rim 1.57/1.08 mm, y+ face 1.48 mm. Another other-handedness pose 30.6 mm away scores 0.1358. The headers at face value make the reported pose a mirror. The rotation_deg metric is broken for mirrored transforms (41 fields; for example 129 deg reported vs 2.73 deg true).",
+    "recommendation": "Keep. Output handedness as a discrete result with its score gap, and say 'undecided' when both branches are within noise. Fix rotation_deg before publishing any angle."
+   },
+   {
+    "name": "Overlap gate (fixed 0.85, then adaptive)",
+    "where": "register.py:134 MIN_OV = min(min_overlap, max(0.15, 0.8 * V_mri / V_oct)); result.json overlap_gate",
+    "what": "A pose is admissible only if enough of the OCT mask lands on MRI tissue; the threshold scales with the achievable overlap.",
+    "classification": "general-but-unvalidated",
+    "evidence": "Never binds on DANDI (effective 0.850 on all 8 runs that record it; I46_otsu predates the gate). Binds only on the brainstem: 0.369 with the v1 mask, 0.590 with the texture mask. A fixed 0.85 gate rejects every pose there (best achievable about 0.46). The constants 0.8, 0.15 and 0.85 were never swept. In P11, mirrored candidates about 30 mm away passed the 0.59 gate.",
+    "recommendation": "Keep the principle (a fraction of the achievable overlap) as one line and drop the separate 0.85 constant. Show it binding on a controlled case, such as synthetic crops of I46/I55."
+   },
+   {
+    "name": "Position-prior paths (--crop-centre/--crop-half-mm, --init-transform)",
+    "where": "register.py; REPORT §2.4; HANDOFF §5.2.6, §9.5.6",
+    "what": "Optional restriction of the search to a box, or skipping search and structural refinement from a given 4x4.",
+    "classification": "general-but-unvalidated",
+    "evidence": "A 30 mm crop vs whole hemisphere gives identical poses on I46 in three pairs and saves about 2 min. The PI states a prior exists in practice, and the brainstem MRI is already cropped (itself a prior). --init-transform was used only to start fine-stage runs (R1, R7, polish); there polarity is evaluated, not optimised (+0.1014 vs -0.1014 at the v1 pose). Never tested as the main mode, and no test of how wrong a prior may be.",
+    "recommendation": "Keep as a documented option. Measure capture range (prior error vs success) on I46/I55, and make the 'prior-free' claim on DANDI only."
+   },
+   {
+    "name": "Class polarity selection by refined NCC",
+    "where": "register.py --oct-wm-bright auto (the default is 'no'; run_subject.sh hard-codes auto); result.json polarity_trials",
+    "what": "Search and refinement run for both OCT polarities; the higher refined NCC wins.",
+    "classification": "core-general",
+    "evidence": "The coarse search prefers the wrong polarity on I46 (otsu 0.7411 vs 0.7259). Parser wrong-polarity run: 0.7275 vs 0.7273 at a pose 71 mm away, with a higher WM Dice (0.857 vs 0.803), 0 vessels inside, vessel NCC -0.035 vs 0.301. Refined NCC, winner vs loser: I46 0.7564 vs 0.7300; I55 0.746 vs 0.506; I38 0.478 vs 0.226; I56 0.366 vs 0.248; I62 0.284 vs 0.234; I57 0.512 vs 0.334; I61 0.502 vs 0.321; DANDI I58 0.271 vs 0.232; I48 0.2584 vs 0.2503 (unseparated). Brainstem: v1 0.1014 vs 0.0851; v1.1 0.1241 vs 0.1079, with the other branch 7.2 mm away. The winning polarity varies within one dataset (I46 GM-bright, I55 WM-bright). Correctness is verified only on I46 and I55. Cost: 2x the structural stage.",
+    "recommendation": "Keep. Make auto the default, report the refined-NCC gap, and return 'undecided' when the gap is at noise level (as on I48)."
+   },
+   {
+    "name": "Coarse-to-fine refinement ladder (rigid -> similarity at 0.6 mm, rigid -> affine at 0.3 mm, affine at 0.15 mm; candidates 24 -> 8 -> 3 -> 1)",
+    "where": "octreg/refine.py (Refiner, Adam with physical learning rates, best-data-loss return); register.py; HANDOFF §5.3",
+    "what": "Degrees of freedom opened stage by stage, with candidate pruning between levels.",
+    "classification": "core-general",
+    "evidence": "I46 structural pose is 1.36 mm (corner mean) from the oracle affine; about 72 % of that is the depth scale (0.98 mm by arithmetic). The refined NCC it produces is the quantity that decides polarity on all subjects. It is the only pose-producing stage accepted on the brainstem. Never ablated: opening the affine at 0.6 mm, a direct affine from the search pose, and the pruning counts. Structural restarts converge 8-12/12 on every DANDI run, including the wrong ones.",
+    "recommendation": "Keep. Add one ablation (direct affine at 0.15 mm from the search pose) to justify the ladder, and describe it in three sentences."
+   },
+   {
+    "name": "Scale prior and clamps",
+    "where": "refine.py loss (1 - NCC) + reg*(sum ls^2 + sum sh^2), reg 2.0, ls/sh clamps +-0.15 (scale 0.861-1.162); vascular stage reg 0.5, clamp 0.3",
+    "what": "An absolute prior on log-scale and shear, so a stage cannot buy scale its evidence cannot see.",
+    "classification": "core-general",
+    "evidence": "I46 loss arithmetic: reaching depth 1.162-1.219 costs 0.045-0.078 of prior, while the whole NCC range available along depth is 0.021, so the structural stage correctly refuses to stretch. Control: reg 0.5 / clamp 0.3 without the vessel channel reaches 265.8 um / f150 0.277, 1.24 mm from the oracle (T0 is 276.5 / 0.254 / 1.362): loosening alone buys nothing. I38 structural depth 0.861 = exp(-0.15), i.e. clamp-saturated; the vascular stage then goes to 0.808. Brainstem: without an absolute prior, surface distance (P5) and MI (P6) run into 22-32 % shrink basins, and 8 of 18 MI chains hit the -0.15 clamp, so the prior is what stops the shrink degeneracy. The reg=0 collapse (T_free_affine) was never logged [UNVERIFIED]. The reg and clamp values were never swept.",
+    "recommendation": "Keep and present it as 'each stage may change only what its evidence can see'. Sweep reg in {0.5, 1, 2, 4} and the clamp on I46, I55 and the brainstem. Write clamp saturation into result.json automatically."
+   },
+   {
+    "name": "Vascular channel (MRI local darkness vs OCT Frangi vessel density)",
+    "where": "octreg/vascular.py (mri_dark_channel, 1.35 mm window; oct_vessel_mask, top 1 % Frangi at 24-106 um, density); prep_subject.py (Frangi, gamma calibration); register.py --vascular, weights [1, 1, 2], reg 0.5, clamp 0.3, 8 restarts",
+    "what": "A third NCC channel added after the structural stage to recover what structure cannot see (the depth scale, sub-mm offset).",
+    "classification": "dataset-specific",
+    "evidence": "I46 (12 um OCT, wrong depth sidecar): ves_seg median 264.7 -> 166.7 um, f150 0.283 -> 0.473 (oracle full fit 0.466, held-out 0.416 +- 0.041); depth stretch 1.026 -> 1.219; 8/8 restarts; moved 1.52 mm. Controls collapse the gain: no vessel channel 265.8 um; depth-flipped density 269.5 um; k-slice-permuted 266.2 um. Design sweep (I46 only): the OCT side must be a density (a Frangi map gives 188-241 um); MRI dark vs MRI Frangi tie (166.7 vs 165.1 um); weight 1-4 insensitive; own Frangi within 4 % of manual ves_seg; Frangi at 12 um is useless (NCC 0.007). I55 (14 um, correct sidecar): moved 0.33 mm, vessel NCC 0.083, 8/8; only the training metric exists there (own vessels 173 -> 141 um). 30-35 um subjects: vessel NCC I38 0.053 (7/8), I56 0.020 (0/8), I62 0.003 (1/8), I57 -0.002 (1/8), I61 0.019 (4/8); I38 spent 5697 s of 7864 s in this stage. Brainstem: harmful (NCC 0.0055, moved 2.65 mm, 0/8, 4778 of 5244 s); Frangi fires on section seams (4.5 M voxels; section-phase modulation 2.54x). The depth-scale claim itself is open: I55 recovers a 0.8570 = 6/7 anisotropy, the single-axis probe shows the vessel metric responding on k rather than on depth [UNVERIFIED], and it is n=1 each way.",
+    "recommendation": "Remove from the core method. At most keep it as an optional, gated independent channel, or as an evaluation verifier for sub-25 um cortex. Before claiming the depth-scale result, run the I46-at-14,12,12 / I55-at-12,12,12 re-prep test."
+   },
+   {
+    "name": "Vascular acceptance gate and auto-skip (v1.1)",
+    "where": "register.py --vascular auto, --vessel-modulation-max 1.6, --vascular-min-ncc 0.02, --vascular-struct-drop 0.05, --vascular-max-move 3 mm; prep.json vessel_section_modulation",
+    "what": "Skip the vascular stage when section-phase modulation is high; accept its pose only if vessel NCC, structural drop and move pass.",
+    "classification": "dataset-specific",
+    "evidence": "Thresholds were set on the same three pairs they are tested on. I46 accepted (NCC 0.296, drop 0.027; the drop limit was raised from the spec's 0.03 to 0.05 because of this subject). I55 accepted (0.083, drop 0.004, 0.46 mm). Brainstem v1 0.0055 would be rejected. Modulation ratio: I46 1.43, brainstem 2.54. Never run on I38, I48, I56, I57, I61 or I62; I56's 0.0204 would pass by 0.0004 and I62's 0.003 would be rejected. The gate cannot tell a wrong pose from a missing vessel signal.",
+    "recommendation": "If the vascular channel survives, keep one gate (vessel NCC with a margin calibrated leave-one-out over all 9 DANDI subjects plus the brainstem). Drop the modulation switch and the struct-drop constant."
+   },
+   {
+    "name": "Fine stage: sign-corrected 3 mm-flattened intensity NCC with acceptance gates, plus v1.1b conservative-polish options",
+    "where": "octreg/fine.py (675 lines); register.py --fine, --fine-sim/-levels/-flatten-mm/-erode-mm/-lcc-mm/-clamp/-reg/-iters/-restarts/-max-move/-max-rot/-verify/-fixed-mask/-fixed-weight/-restart-mm/-restart-deg/-restart-logscale/-restart-tol-mm/-exclude-fov-mm/-dof; gates (a)-(h), U_mm, polarity guard",
+    "what": "A delta-affine polish on intensity after flattening, with an automatic sign, verified by restarts, witnesses, split-half and inverse consistency.",
+    "classification": "experimental-negative",
+    "evidence": "Brainstem: rejected in all 6 v1.1 runs (0/8 restarts within 0.3 mm; U 2.6-5.7 mm; candidates 2.5-11.6 mm apart), in 5 CPU fixed-mask configurations (0/6), and in both GPU polishes. Affine polish: 0/8, U 4.00. Rigid polish: 5/8, U 4.04, 4.85 mm / 10.7 deg from P_R5; boundary forward 0.06-0.10 mm better but reverse 0.14-0.16 mm worse; class NCC drops. Cortex: I46 accepted by its own gates (8/8, U 1.09 mm) but ves_seg 166.7 -> 263.5 um, f150 0.473 -> 0.286, depth 1.219 -> 1.31, Dice WM 0.803 -> 0.785 (7 of 11 regression rows fail). I55 accepted (U 0.40 mm) but Dice GM 0.930 -> 0.916, own vessels 140.9 -> 157.9 um. I46 affine polish: again 7/11 fail. I46 rigid polish rejected by the MI gate (no harm). The I55 rigid polish was never finished. The P2 motivation is real (inverted relation, contrast 0.54), but self-consistency U is not accuracy.",
+    "recommendation": "Remove from the method and the package (archive branch). Keep the finding that a self-consistent fine optimum sits about 1 mm from the annotation optimum on cortex as a reported negative result."
+   },
+   {
+    "name": "Nonrigid free-form deformation",
+    "where": "octreg/nonrigid.py; scripts/nonrigid_stage.py; run_demo_i46.py --nonrigid",
+    "what": "A displacement grid on top of the vascular affine, with smoothness and magnitude penalties.",
+    "classification": "experimental-negative",
+    "evidence": "I46 only. Best label-free variant (5x8x8, smoothness 1): 172.7 um / f150 0.458 (+0.018 over 0.440), Dice +0.015/+0.019, displacement 0.116 mm mean / 0.355 mm max. Well-regularised variant: 0.048 mm mean, below the 0.15 mm voxel. Oracle nonrigid ceiling f150 0.480. Without the vessel channel: 191.1 um / 0.413. Never tried on the brainstem, where P7-P10 show non-corresponding pieces that a deformation would warp into place.",
+    "recommendation": "Remove from the package. Keep one supplementary row with the headroom argument."
+   },
+   {
+    "name": "I58 alternative objectives and levers (P5 surface distance, P6 MI, P7 piecewise, P9 symmetric partners, P10 reverse cerebellum search, P11 renormalisation and exclusion)",
+    "where": "work/probe_xr/*; docs/v11/probe_P5P6_surface_mi.json, probe_P7P8_pieces_maskdiff.json, probe_P9_impostor.json, probe_P10_cerebellum_search.json; docs/v11/p11/p11_unmerged_options.patch",
+    "what": "Attempts to pin the brainstem pose below body level.",
+    "classification": "experimental-negative",
+    "evidence": "Surface distance: flat in rotation (shoulder contrast 1-6 %); basins 9.5-12 mm / 22-28 deg away with 22-32 % shrink. MI: 18 distinct optima 4-10 mm from their starts, while a synthetic control converges to 0.04 mm (the objective drifts, not the optimiser). Body-only fine: 0/8. Mask regions A 8.60 / B 7.32 / C 2.93 / D 2.13 cm3, with >= 5.5 cm3 non-tissue at any rigid pose. Cerebellum best score 0.251, below its polarity-flipped null (0.261); torn folia sit on the opposite side of the body. Renormalisation: NCC change <= 0.0004. Exclusion: the pose jumps 6.5-8.2 mm into a basin with worse body boundary (rim 3.84/1.25 vs 3.24/0.97 mm).",
+    "recommendation": "Nothing goes into the method. Summarise as the diagnosis 'MRI crop and OCT block are not the same rigid assembly', as part of the honest failure analysis."
+   },
+   {
+    "name": "Structural restarts as QC",
+    "where": "register.py (12 perturbations of 5-30 deg / +-5 mm, converged if corner mean < 0.5 mm on a 7 mm lever); evaluate.transform_diff",
+    "what": "Stability of the refinement basin around the chosen pose.",
+    "classification": "tooling",
+    "evidence": "Anti-correlated with correctness on DANDI: I58 12/12 and I61 12/12 are wrong, I38 12/12 is contested, while I46 and I55 score 9/12 with outliers at 15.5 and 10.8 mm. Mean 11.3/12 for wrong runs vs 10.2/12 for visually correct ones. Brainstem: v1 10/12; v1.1 6/12 (seed 1 8/12, no destripe 3/12, smoke prep 4/12); other handedness 1/12; the P11 exclusion basin gives 12/12 small restarts with a worse boundary. The fixed 7 mm lever makes the threshold depend on block size.",
+    "recommendation": "Report as stability only, with the counter-statistic, and never as acceptance. Keep one restart mechanism instead of three (structural 12, vascular 8, fine 8)."
+   },
+   {
+    "name": "Search margin (top1/top2) and polarity gap as QC",
+    "where": "result.json search.top1/top2, polarity_trials; HANDOFF §5.2.6, §6.9.4",
+    "what": "Decisiveness of the global search, as a warning signal or proposed reject gate.",
+    "classification": "general-but-unvalidated",
+    "evidence": "It flags I48 (1.005) and DANDI I58 (1.0003). It also flags I55 (1.004, confirmed correct) and brainstem v1.1 (1.005; v1 was 1.053). The wrong I57 (1.013) and I61 (1.012) would pass a 1.02 gate only narrowly. The proposed rule top1/top2 < 1.02 rejects I55; the extra top1 < 0.35 clause rejects I56, I62 and the brainstem. The template volume varies about 40x, so raw margins are not comparable across subjects.",
+    "recommendation": "Report it and do not gate on it without calibration. Build a size-normalised decisiveness statistic (for example the margin relative to the score distribution over searched poses) and calibrate it on all labelled subjects."
+   },
+   {
+    "name": "Absolute refined NCC as an acceptance criterion",
+    "where": "result.json refine.final_ncc; older prose proposing >= 0.35",
+    "what": "A proposed numeric pass mark on the refined score.",
+    "classification": "experimental-negative",
+    "evidence": "I61 0.5020 and I57 0.5121 are both wrong. I62 0.2842 is visually correct. The brainstem's correct body pose scores 0.10-0.14. A failed bath-heavy mask inflates the score.",
+    "recommendation": "Never state a threshold. Use the score only within a subject (polarity, handedness)."
+   },
+   {
+    "name": "MRI foreground-volume sanity gate (proposed)",
+    "where": "HANDOFF §4.3, §6.9.4, C7.2 (not implemented)",
+    "what": "Reject or flag when the MRI 'tissue' volume exceeds 1.5 x 806 cm3.",
+    "classification": "general-but-unvalidated",
+    "evidence": "On this corpus it catches I56 (2519), DANDI I58 (1453) and I61 (1839 cm3) and clears the six sane masks (max 805.8 cm3). The constant is derived from the same corpus, applies only to whole hemispheres, would not catch I57, and does nothing for crops or the OCT side.",
+    "recommendation": "Generalise to a cross-modal consistency warning (MRI foreground vs OCT foreground vs expected specimen size) and print it in every run. Do not ship a hemisphere constant."
+   },
+   {
+    "name": "Boundary-agreement QC (qc_fine.py)",
+    "where": "scripts/qc_fine.py; qc_fine.json (brainstem runs only: 11 files, none on DANDI)",
+    "what": "Median distances from the OCT mask boundary to the MRI tissue boundary and back, per face class.",
+    "classification": "dataset-specific",
+    "evidence": "Brainstem R5: rim median 2.02 mm forward / 1.05 mm reverse; y+ face 4.96 mm; only 54.8 % of the MRI boundary inside the OCT box. It depends on the OCT mask, which still contains >= 5.5 cm3 non-tissue. Optimising it (P5) produces anatomically wrong poses (rim 1.19/0.82 mm with MI halved). In the handedness test it favours the other handedness (1.57 vs 2.02 mm) while class NCC and restarts favour the reported pose, so it cannot adjudicate. For cortex blocks cut from inside a hemisphere the OCT box faces are cut faces, so the measure is undefined there. Never calibrated against labels.",
+    "recommendation": "Keep only as a descriptive figure for whole specimens with a real outline. Do not present it as accuracy. If kept, calibrate it on a labelled specimen that has an outline."
+   },
+   {
+    "name": "MI landscape QC",
+    "where": "scripts/qc_fine.py (MI-32 over nine axes at 0.15 mm); qc_fine_landscape.png",
+    "what": "One-dimensional MI profiles around the shipped pose.",
+    "classification": "tooling",
+    "evidence": "Brainstem R5: 7 of 9 profiles peak at a range end. P6 shows MI optima are run-away shrink poses, and a synthetic control recovers the truth to 0.04 mm, so the landscape reports a property of the objective, not an error in the pose. Never run on DANDI.",
+    "recommendation": "Drop from the standard QC outputs, or keep it as an optional diagnostic figure without interpretation."
+   },
+   {
+    "name": "Vessel-channel NCC as an independent pose verifier",
+    "where": "result.json vascular.ncc_channels[2]; HANDOFF §5.2.5, §6.5.3",
+    "what": "Correlation of MRI darkness with OCT vessel density at the final pose, not used in the structural objective.",
+    "classification": "dataset-specific",
+    "evidence": "I46: 0.301 at the correct pose vs -0.035 at the wrong-polarity pose (vascular restarts 8/8 vs 0/8). I55: 0.083. Near zero on the wrong DANDI runs (I57 -0.002, I61 0.019), but also on the visually correct I56 (0.020) and I62 (0.003), and on the brainstem (0.0055). So it separates poses only where the OCT resolves vessels (<= about 24 um cortex).",
+    "recommendation": "Keep only as an optional verifier for high-resolution vascularised tissue. It is not general QC."
+   },
+   {
+    "name": "Export in the original NIfTI frames",
+    "where": "scripts/export_registration.py, scripts/check_export_header.py, scripts/run_xiangrui_i58.sh; REPORT C.4",
+    "what": "Composes T_nii = T_oct2mri @ A_layout @ inv(A_header) and writes 4x4s in both directions, a FreeSurfer LTA and overlays in both frames.",
+    "classification": "tooling",
+    "evidence": "Xiangrui pair only. The exported image equals register.py's own resampling (NCC 0.99999999998; support Dice 0.996/0.995). Raw 20 um check: Spearman 0.933 (reported pose) and 0.937 (other handedness), against 0.09-0.25 with one header axis flipped and 0.26/0.31 after a 2 mm shift. register.py's own .lta lives in the prep layout frame and does not apply to the original OCT file. DANDI OME-TIFFs carry no world coordinates (PhysicalSize placeholder), so no header export exists for DANDI.",
+    "recommendation": "Keep and make it the standard output of every run, DANDI included with a declared layout, as part of the reproducible benchmark."
+   },
+   {
+    "name": "Evaluation suite (label Dice, vessel distance to ves_seg, +-3 mm control, oracle fits, annotation distances)",
+    "where": "octreg/evaluate.py; prep_subject.map_labels_to_grid; scripts/refine_validate.py, oracle_cv.py, scale_probe.py, vessel_channel_refine.py, test_own_vessels.py",
+    "what": "All accuracy evidence on DANDI.",
+    "classification": "tooling",
+    "evidence": "Dice is usable only on I46 (0.803/0.825) and I55 (0.921/0.930). The label mapping is wrong for the six 0.12 mm subjects (I38 keeps 65.7 % of labels vs 100 % under the shape-consistent permutation; confirmed, unfixed, not re-evaluated). Dice accepts a 71 mm wrong pose (WM 0.857). vessels_own is a training metric. The +-3 mm control is local; a true random-pose control was never run. rotation_deg is broken in 41 fields. The authors' coarse placement is 23 mm from ours, unresolved. ves_seg evidence exists for I46 only. On the shared point set the vessel gain is 260 -> 119 um, so the reported 265 -> 167 um is conservative.",
+    "recommendation": "Fix map_labels_to_grid and rotation_deg, re-evaluate all 9 subjects (no re-registration needed), add the random-pose control, and standardise one evaluation JSON per pair for the benchmark."
+   },
+   {
+    "name": "Reproducibility and regression tooling",
+    "where": "scripts/regress.py; /root/autodl-tmp/oct-mri-registration_v1 (7ef90e5); scripts/run_v11_regress.sh; run_xiangrui_i58.sh",
+    "what": "Bit-level and tolerance-band comparison of runs across code versions.",
+    "classification": "tooling",
+    "evidence": "The v1 snapshot reproduces the stored I46_otsu and I55_otsu results exactly (transform difference 0.0), which settles HANDOFF N12 for these two. v1.1 defaults: 0/26 regression rows fail on each. The brainstem one-command run reproduces R5 to 0.00 mm (27.6 min, 32 GB peak). The other seven DANDI subjects were not re-run on the current tree.",
+    "recommendation": "Re-run all 9 DANDI subjects plus the brainstem from one tagged commit with one command, and publish transforms and evaluation JSONs."
+   },
+   {
+    "name": "Runtime and memory engineering",
+    "where": "features.otsu_two_class_lowmem (CPU float16), MRIFeatures pooled/region crops, Frangi chunking and gamma calibration, var_floor; HANDOFF §5.8, §6.3.2",
+    "what": "The engineering that makes whole-hemisphere features fit on one 24 GB GPU.",
+    "classification": "tooling",
+    "evidence": "DANDI totals 18.7-131.1 min per subject. Search is 8-38 % of wall time; the vascular stage is up to 72 % (I38) and 91 % on the brainstem with vascular on. The brainstem end-to-end run takes 27.6 min without the vascular stage (32 GB peak RAM). The single-frame Frangi gamma calibration prevents chunk-boundary striping. There is no runtime table for the final v1.1 path across all pairs, and no baseline runtime.",
+    "recommendation": "Keep. Report per-stage runtime and peak memory for the final simplified method on every pair."
+   },
+   {
+    "name": "Failure mode: I48 (uncertain)",
+    "where": "work/runs/I48_otsu/result.json; work/I48/prep.json; HANDOFF §6.13.1, §7.1.2",
+    "what": "Flat search landscape on a low-contrast MRI.",
+    "classification": "general-but-unvalidated",
+    "evidence": "top1/top2 0.2571/0.2558 (margin 0.0013), plateaued from 4000/16000 orientations. Refined 0.2584, barely above the search score. Polarity unseparated (other branch 0.2503). MRI valley ratio 0.474 (worst in the corpus), tissue fraction 0.156, 386 cm3 (smallest). The flip-angle sidecar is missing. Restarts 11/12, vascular 7/8. Annotation distances of 50.7 mm are measured in the broken 0.12 mm frame (only 62.7 % of labels land on tissue). Its OCT covers 7.19 % of the hemisphere, the easiest retrieval in the set. Cause is only partly diagnosed: low MRI class contrast gives a flat objective.",
+    "recommendation": "The method should return 'undecided' when both the search margin and the polarity gap are at noise level. Recover the true flip angle, and re-evaluate after the label-mapping fix."
+   },
+   {
+    "name": "Failure mode: I57 (wrong, undiagnosed)",
+    "where": "work/runs/I57_otsu/result.json; work/I57/prep.json; HANDOFF §6.13.3, §7.1.3",
+    "what": "A wrong pose with a healthy MRI mask.",
+    "classification": "general-but-unvalidated",
+    "evidence": "The 'wrong' verdict rests on visual QC ('captured by a flat MRI region, two-piece slab') plus annotation distances of 44.5-57.3 mm in the broken 0.12 mm frame (only 6.56 % of BA labels on tissue). MRI mask healthy: 518 cm3, valley 0.0631, threshold above the median. top1/top2 0.4394/0.4337; refined 0.5121; 10/12 restarts (max 0.536 mm); vessel NCC -0.002, 1/8. OCT block 26.9 x 37.5 x 60.6 mm in two pieces, tissue fraction 0.404 (lowest); flip-4 MRI file. No mechanism. The hypotheses (union scoring of two pieces under the largest-component mask; a flip-4 contrast confound) were never tested. Until the label mapping is fixed, its verdict carries the same evidentiary weight as I38's 'correct'.",
+    "recommendation": "Re-evaluate after the mapping fix. Then test per-component placement (each OCT piece must land on tissue). Report it as an unexplained failure."
+   },
+   {
+    "name": "Failure mode: I61 (wrong, MRI foreground fail-open)",
+    "where": "work/runs/I61_otsu/result.json; work/I61/prep.json; HANDOFF §6.13.2",
+    "what": "The bath was admitted as tissue, and the block locked onto a homogeneous field.",
+    "classification": "general-but-unvalidated",
+    "evidence": "valley_ratio null; threshold 6.80 sits below the median (10.42); 74.2 % of the volume, 1838.8 cm3, called tissue. The block lands 95.7 mm from the labelled hemisphere, more than the broken mapping could explain on a 192 x 168 x 76.8 mm grid. top1/top2 0.5172/0.5112; refined 0.5020; 12/12 restarts within 0.18 mm; vessel NCC 0.0185. The mechanism (a smooth, reproducible correlation maximum over a homogeneous field) is diagnosed from the MRI alone.",
+    "recommendation": "Fix through the general foreground step (fail loudly), re-run, and use it as the robustness demonstration after the fix."
+   },
+   {
+    "name": "Failure mode: DANDI I58 (wrong, 10 deg flip angle)",
+    "where": "work/runs/I58_otsu/result.json; work/I58/prep.json; data/costantini/.../sub-I58 sidecars; HANDOFF §6.13.4",
+    "what": "No usable GM/WM contrast in the only volume used, plus a failed mask.",
+    "classification": "dataset-specific",
+    "evidence": "Only 10 deg (flip-3, used) and 30 deg (flip-1) volumes exist. At 10 deg: one histogram peak, p50/p99 16.9/40.8; mask fail-open at 1453 cm3. top1/top2 0.2896/0.2895 (margin 0.0001); refined 0.2708 with channels [0.344, 0.197]; 12/12 restarts; 63-75 mm from the annotations. The 30 deg file (re-downloaded after corruption and verified) and a VFA-synthesised 20 deg contrast were never tried (E2).",
+    "recommendation": "Run on the 30 deg volume before counting it as a method failure. Otherwise exclude it from the benchmark with the stated reason (no class contrast)."
+   },
+   {
+    "name": "Unresolved: I38, I56, I62 ('correct', visual QC only)",
+    "where": "work/runs/{I38,I56,I62}_otsu/result.json; octreg/figures/fig_I38/56/62.png; HANDOFF §6.4.3, §6.8, §7.1.5",
+    "what": "Coronal-slab subjects judged correct from AI-generated figures.",
+    "classification": "general-but-unvalidated",
+    "evidence": "The figures were not human-verified. Manual vessels and BA labels sit 55-66 mm from the blocks with 0 % inside; nearest annotation 23-26 mm outside the box. This correlates perfectly with the broken 0.12 mm label mapping. On-label OCT-WM landing on MRI WM: 35.0 % (I38) and 36.8 % (I56), below chance but in the same suspect frame. I38's structural depth is clamp-saturated (0.861). I56's MRI mask failed (2519 cm3) and the run was still judged correct. Vessel NCC 0.053 / 0.020 / 0.003. I62 has no whole-hemisphere label. These slabs are 0.5-5 % of the hemisphere, an easier retrieval than I46.",
+    "recommendation": "Run E1 (fix the mapping, re-evaluate; about 1 h, no re-registration) and human-verify the figures before counting successes. Until then report 2 confirmed / 3 unresolved / 1 undecidable / 3 failed."
+   },
+   {
+    "name": "Xiangrui I58 brainstem pair: body-level pose and undecided handedness",
+    "where": "work/runs/v11/xiangrui_I58bs (R5), work/runs/xiangrui_I58_final{,_mirror}; REPORT §3-4, C.4",
+    "what": "The lab's own label-free pair, with no numeric ground truth.",
+    "classification": "dataset-specific",
+    "evidence": "The structural pose is reproducible (seed 0.31 mm / 1.1 deg, destripe 0.35 mm / 1.4 deg at the 7 mm cube; 0.56/0.67 mm at the block corners). Boundary 2.02/1.05 mm; rotational spread of 10.6-20 deg across prep variants. No TRE. Handedness undecided (see the mirror item). The data themselves do not correspond rigidly: the cerebellum has no rigid counterpart, the MRI crop is truncated on three faces, and torn folia sit at the bottom of the block. v1 search without a prior worked, but the MRI crop is itself a position prior.",
+    "recommendation": "Present it as a body pose with an uncertainty. Request about 20 landmark pairs and header provenance. Do not use this pair to support the prior-free search claim."
+   }
+  ],
+  "open_questions": [
+   "Does fixing map_labels_to_grid (E1: re-evaluation only, about 1 h, no re-registration) move the annotations onto I38, I56 and I62, and does it change the verdicts for I48 and I57? The honest success count depends on this.",
+   "Does DANDI I58 register on the 30 deg flip-1 volume (E2)? If not, is the failure the contrast or the fail-open mask?",
+   "Which reading of the depth anisotropy is right? I55 recovers 0.8570 = 6/7. Re-prep I46 at 14,12,12 um and I55 at 12,12,12 um; this decides whether the vascular depth-scale claim survives.",
+   "What causes I57? Test per-component scoring of the two-piece slab, and check the flip-4 contrast confound.",
+   "Can one foreground method handle both bath-heavy MRI (I56, I58, I61) and agarose OCT (brainstem) without an auto switch, while keeping cortex blocks intact (the texture recipe keeps only 0.28 of 0.68 cm3 on I46)?",
+   "Does slab normalisation help at all on DANDI, and does a single 'normalise along the detected sectioning axis with the measured period' step reproduce I46 and I55 within regression tolerance?",
+   "Is the vascular channel worth keeping in a general method, given benefit on one subject, no signal on the seven 30-35 um subjects, and harm on the brainstem? Or should it become an evaluation-only verifier?",
+   "Which QC statistic, if any, separates correct from wrong poses once calibrated on all labelled subjects (size-normalised search margin, polarity gap, handedness gap, cross-modal foreground consistency)?",
+   "Is the brainstem OCT NIfTI header orientation physical (it decides the handedness), and will Xiangrui provide landmarks, the uncropped MRI and the dissection sequence?",
+   "Why does the authors' published I46 placement differ from ours by 23 mm (needs the oct.nii header or crop parameters from the Costantini authors)?",
+   "How sensitive are the core results to n_rot, the search level, topk/NMS, reg/clamp and the overlap constants? None was swept.",
+   "Which baselines can be run on the same pairs: approximated Costantini B0, masked-MI multi-start affine, ANTs/NiftyReg, MIND+ConvexAdam, a generalist network? What is their success rate and runtime?",
+   "Can a true random-pose control and a synthetic known-transform benchmark (capture range, handedness, depth-scale recovery) be added to replace the local +-3 mm control?",
+   "Can I45 and I60 (which carry OCT ves_seg) be added, to go beyond n=1 for vessel-level evidence?",
+   "What is the scientific endpoint the paper must serve (PI question Q6)? It decides whether depth-scale and sub-mm accuracy matter or body/millimetre placement is enough."
+  ]
+ },
+ "audit_benchmark": {
+  "summary": "I did a read-only check of the AutoDL server: file listings, NIfTI/OME-TIFF headers, prep.json, result.json and logs. I edited nothing and started no jobs. My local scratch files are deleted.\n\nEverything needed to prep all 10 pairs from scratch is on the server. That is 9 DANDI subjects (I38, I46, I48, I55, I56, I57, I58, I61, I62) plus Xiangrui's I58 brainstem pair. All 81 files in the multi-subject manifest match their declared sizes and there are no partial downloads. Size is the only integrity check, though: the multi-subject manifest has no sha256 (only the I46 starter manifest does), and the earlier corrupt I58 30-degree file had the right size and still failed its gzip CRC. The raw data takes 63 G (DANDI, including a 2.76 G `.corrupt.bak` copy) plus 13 G (Xiangrui). All of `work` is 207 G, of which the 9 DANDI prep dirs are about 137 G. The disk has 1.2 T free.\n\nThe code on the server matches local HEAD db2282e (md5 checked on octreg/*.py and the 5 main scripts). But no prep.json records a code version, arguments or time. All 9 DANDI preps were made on 08-20/21 by the tree from before git. Xiangrui's final prep was made on 09-14 by code equal to HEAD.\n\n**Blocker for label-based numbers.** For the seven 0.12 mm DANDI subjects, the EPIC MRI header does not match the label files. The labels (BA, vessel and whole-hemisphere files all agree with each other) describe a hemisphere about 70-77 mm left-right. The MRI header instead gives 168-192 mm left-right, and for I38 the label arrays are also axis-permuted relative to the MRI.\n\nSo every label-based check on these subjects was sampled through a broken mapping: labels4, BA labels, MRI vessels, Dice, \"0 % of the BA label inside the block\" and vessel n_inside = 0. The registrations themselves are not affected.\n\nI did a header-only re-check (block centre from result.json, pushed through a label file with the same array shape):\n- **I56:** the block centre lands 0.4 mm from the BA label's crop box. HANDOFF says 65.9 mm, so that \"contradiction\" looks like a header artefact.\n- **I48:** the block centre is about 44 mm from the MRI vessel-annotation crop box, which leans towards the pose being wrong.\n\nBoth estimates need the label data loaded to confirm. Two more evaluation problems:\n- **OCT vessel segmentations:** for I38 and I48 they are not on the OCT grid (crops). For I46 the depth offset of 0 or 66 slices is still undecided.\n- **Dice denominator:** it uses the whole OCT class count, so Dice collapses whenever labels cover only part of the block.\n\n**Compute budget (serial, from logs).**\n- DANDI prep: 188-1459 s each, 8530 s in total (2.4 h). About 60-800 s of each is label mapping, which should move to the evaluation step.\n- DANDI registration (v1 settings, which are still HEAD defaults for these data): 1125-7864 s each, 23638 s in total (6.6 h). I38's vascular stage alone took 5697 s.\n- Xiangrui one-command chain (both handedness candidates, QC and export): 27.5 min, 32 GB peak.\n- QC on whole-hemisphere MRI was never run; I assume a few minutes per pair.\n\nThat gives about 10 h serial for a full run, one heavy job at a time (the 62 GB container limit has frozen the instance before). Re-running the evaluation from the stored transforms after the frame fix would take roughly 1-2 h.\n\n**Metrics.**\n- **Label-based** (after the frame fix):\n  - GM/WM agreement restricted to labelled voxels: 8 subjects, not I62.\n  - Fraction of the BA label inside the registered block: all 9 DANDI blocks are sample BrocaAreaS01.\n  - MRI manual vessels against the OCT vessel distance map, with a random-shift control: I46, I55, and the others once n_inside is 20 or more.\n  - OCT ves_seg vessels: I46 only.\n  - Depth scale against the physical prior: I46 against I55.\n- **Label-free** (all 10 pairs): search margin, polarity margin, handedness margin, restart convergence, vascular acceptance gate, stretch plausibility, overlap volumes, distance to the distinct runner-up, MI landscape shape, and the export round-trip check. The boundary (rim) check only means something for whole-specimen OCT like Xiangrui's, not for cortex blocks whose faces are cuts. None of these separates right from wrong on its own: I58 and I61 converge 12/12 and are wrong, and I57/I61 have NCC around 0.5 and are wrong. They should be calibrated against the label verdicts on the 9 DANDI pairs.",
+  "items": [
+   {
+    "name": "DANDI I46 (0.15 mm, quantitative anchor)",
+    "where": "raw: data/costantini/dandi-000026/sub-I46/ses-OCT/micr/*OCT.ome.tiff (941 MB, uint8 627x1271x1230, OME physical size in 'pixel' units), derivatives/EPIC/sub-I46/.../flip-2_VFA.nii.gz (2.49 GB, 1280x1040x576 @0.15, ASL, sidecar FlipAngle 20); labels: wholehemi + infrasupra (BA) + vessels (34069 vox) + OCT derivatives/sub-I46/ses-OCT/vessel/ves_seg.tif (561x1271x1230). prep work/I46 (6.3 G, 08-20 10:04, pre-git tree, 188 s). Latest run work/runs/v11/I46_v11 (60 M, 09-13, v1.1 code on the old prep; identical to I46_otsu).",
+    "what": "OCT sidecar says 12x12x12 um, but true depth is about 14 um: sibling I55 is 12/12/14, the authors' affine gives 1.174 and our vessel oracle 1.177. The MRI and all three label headers agree (same world box), so the label mapping is lossless. ves_seg is 66 slices shorter than the OCT; prep assumes offset 0, and 0 versus 66 is undecided. Run v11/I46_v11: search 0.726/0.704, mirrored, OCT WM dark, restarts 9/12, vascular stage 8/8 and accepted (gate 0.296). Stretch 1.219/0.977/1.031. Own-vessel median 123 um, f150 0.56 (control 212 um). ves_seg median 167 um, f150 0.47 (control 352 um; the annotation ceiling is f150 0.466). Dice WM/GM 0.803/0.825. 1131 s. The authors' published mri2oct affine (code/costantini/biccn-broca-I46/results/mri2oct/affine.lta) is in the FreeSurfer flash20 frame and sits 23 mm from our pose, unresolved.",
+    "classification": "core-general",
+    "evidence": "prep.json (spacing_um_zyx [12,12,12], labels_agreement 0.932, labels4 111.3 M voxels); v11/summary/summary.md; OME header read with tifffile; HANDOFF 3.5.3 tier 1 and the zoff0/zoff66 entry; regress.py R8/R9 26 checks 0 failures (memory note). Fine stage made it worse: vessels 123 to 165 um, ves_seg 167 to 263 um.",
+    "recommendation": "Keep as the main quantitative pair. Put the OCT spacing in a per-pair data card: use 12/12/14 with a note, or keep 12 iso and report the recovered depth scale against 1.167 as a metric. Report ves_seg numbers for both offsets 0 and 66, or state the ambiguity. Re-prep at HEAD and write the code hash into prep.json. Label mapping for this subject is already correct."
+   },
+   {
+    "name": "DANDI I55 (0.15 mm, null control for depth scale)",
+    "where": "raw OCT ome.tiff 9.44 GB (uint16 1573x1768x1772, OME and sidecar both 12/12/14 um), MRI flip-2 630 MB (1280x1040x576 @0.15, ASL; sidecar TR written as '34' instead of 0.034); labels wholehemi + BA + vessels (13899 vox), no OCT ves_seg. prep work/I55 (8.4 G, 517 s). Latest run work/runs/v11/I55_v11 (109 M).",
+    "what": "Metadata is consistent. Search 0.611/0.609, not mirrored, OCT WM bright, restarts 9/12, vascular stage 8/8 and accepted (gate 0.083), moves the block only 0.33 mm. Stretch 0.913/1.097/1.084. Own-vessel median 141 um, f150 0.52 (control 228 um). Dice 0.921/0.930. 1274 s. 59 % of the BA label is inside the block, centroid 7.8 mm away. The MRI tissue histogram has no valley (valley_ratio null), but the threshold landed correctly.",
+    "classification": "core-general",
+    "evidence": "prep.json; summary.md; HANDOFF 3.5.4 scoreboard; OME header PhysicalSizeZ 0.014 mm.",
+    "recommendation": "Keep as the second quantitative pair and as the null control for the depth scale. Caveat from HANDOFF: its depth/in-plane anisotropy of 0.857 is the exact inverse of I46's missing factor, so the control is not fully independent. Evaluation can be computed directly; no frame fix needed."
+   },
+   {
+    "name": "DANDI I38 (0.12 mm large slab, visual-only)",
+    "where": "raw OCT ome.tiff 4.33 GB (uint16 832x1724x1573, OME and sidecar 30/30/35 um), MRI flip-2 4.58 GB (1600x1400x640 @0.12), labels wholehemi + BA + vessels (both full grid 1400x640x1600, axis-permuted relative to the MRI) + OCT ves_seg 520x1386x1294 (not on the OCT grid). prep work/I38 (23 G, 1184 s). Latest run work/runs/I38_otsu (1.2 G, 08-20, pre-git).",
+    "what": "Search 0.314/0.263, mirrored, OCT WM bright, restarts 12/12, vascular 7/8. Stretch after the vascular stage 0.808/0.956/0.941; the structural depth scale 0.861 is exactly the clamp bound. Dice 0.251/0.477 and vessel n_inside 0, both computed through the broken label/MRI frame, so neither can be trusted. 7864 s, of which the vascular stage is 5697 s. Header-only: pushing the block centre through the BA/vessel grid with the shape-consistent transpose gives label world (-16.5, 61.7, 13.5) mm. The BA bounding box needs the data loaded.",
+    "classification": "general-but-unvalidated",
+    "evidence": "NIfTI headers: MRI world box x -84.8..83.1 (168 mm left-right) against the label box x -39..37.6 (76.8 mm). prep_I38.log; result.json; HANDOFF 3.4.5 (the transpose keeps 3,856,521 labels and puts 99.0 % on tissue, against 87.8 % now).",
+    "recommendation": "Repair the frame on the evaluation side, then re-score BA-inside, whole-hemisphere Dice and MRI vessels from the stored T_oct2mri. Exclude ves_seg until its crop offset is known. Investigate the vascular-stage runtime before the benchmark (it alone is about 1.6 h)."
+   },
+   {
+    "name": "DANDI I48 (0.12 mm, uncertain)",
+    "where": "raw OCT ome.tiff 2.46 GB (plain TIFF, not OME; uint16 735x1408x1244; sidecar 30/30/35), MRI flip-2 2.32 GB with no JSON sidecar (flip angle unknown; not in the manifest), labels wholehemi + BA (full grid) + vessels crop 305x284x276 + OCT ves_seg 441x893x780 (a crop, not on the OCT grid). prep work/I48 (18 G, 1249 s). Latest run work/runs/I48_otsu (869 M, 08-21).",
+    "what": "Search 0.257/0.256 (margin 0.0013), mirrored, restarts 11/12, vascular 7/8. Stretch 0.949/0.981/1.02. Dice 0.255/0.483 and vessels n_inside 0, both through the broken frame. 2223 s. MRI valley_ratio 0.474, the weakest in the set. Header-only: the block centre through the same-shape BA grid is (-6.2, -13.7, -14.6) mm, about 44 mm (along y) from the MRI vessel-annotation crop box (x -27..6, y 30..66.5, z -27.9..6.1). That leans towards a wrong pose.",
+    "classification": "general-but-unvalidated",
+    "evidence": "prep.json valley_ratio 0.4737, vessels 79331 voxels after mapping (the README says the annotation is empty, which is not accurate); summary.md; the header-only calculation above.",
+    "recommendation": "Keep it as a hard case. Confirm with a proper frame repair and the BA-inside metric. Fetch the I48 MRI sidecar if DANDI has one. Do not use ves_seg."
+   },
+   {
+    "name": "DANDI I56 (0.12 mm, visual-only; broken MRI mask)",
+    "where": "raw OCT ome.tiff 2.31 GB (plain TIFF, float32 280x1506x1434; sidecar 30/30/35), MRI flip-2 4.60 GB (1600x1600x576 @0.12), labels wholehemi + BA crop 301x294x351 + vessels full grid (1600x1600x576, different header from the MRI). prep work/I56 (14 G, 646 s). Latest run work/runs/I56_otsu (770 M, 08-20).",
+    "what": "Search 0.340/0.331, mirrored, OCT WM dark, restarts 10/12, vascular 0/8. Stretch 0.998/1.076/1.054. Dice 0.260/0.330 through the broken frame. 2263 s. The MRI tissue mask covers 98.9 % of the volume (threshold 3.62 against a median of 15.15), yet the pose was judged correct by eye. Header-only: the block centre through the same-shape vessels grid is (13.3, 70.5, 26.3) mm, 0.4 mm outside the BA crop box (x -3.4..38.6, y 34.1..70.1, z 1..36.2). HANDOFF's '65.9 mm, 0 % of BA' came from the broken frame.",
+    "classification": "general-but-unvalidated",
+    "evidence": "NIfTI headers (MRI box x 192 mm against vessels box x 69 mm); result.json block_centre_mri_mm [9.6, 8.4, 65.0]; prep.json tissue_fraction 0.989.",
+    "recommendation": "This is the strongest candidate to move from 'contradicted' to 'supported'. Confirm with BA-inside and whole-hemisphere metrics after the frame repair. Keep it in the benchmark as the broken-MRI-mask case."
+   },
+   {
+    "name": "DANDI I62 (0.12 mm, visual-only; no whole-hemisphere label)",
+    "where": "raw OCT ome.tiff 2.12 GB (OME in 'pixel' units, uint16 600x1231x1500; sidecar 30/30/35), MRI flip-3 (FlipAngle 20) 3.95 GB, labels BA + vessels (both full grid, same shape as the MRI but different header); no wholehemi on DANDI. prep work/I62 (16 G, 1003 s). Latest run work/runs/I62_otsu (772 M, 08-20).",
+    "what": "Search 0.287/0.277, mirrored, restarts 11/12, vascular 1/8. Stretch 0.919/0.963/0.95. NCC 0.284. Dice 0 and frac_on_labels 0: labels4 is the BA-only label (3.35 M voxels) and was mapped through the broken frame. 2243 s. Header-only: block centre in label world (-3.1, 47.2, 1.7) mm; the BA bounding box needs the data loaded.",
+    "classification": "general-but-unvalidated",
+    "evidence": "prep.json (no labels_wholehemi, labels4 3,350,780 voxels, vessels 16287); result.json; MRI box x -75.7..92.1 against label box x -30.1..46.6.",
+    "recommendation": "Score only BA-inside and MRI vessels after the frame repair. No GM/WM Dice possible. Correct the README wording about this subject."
+   },
+   {
+    "name": "DANDI I57 (0.12 mm, wrong, cause unknown)",
+    "where": "raw OCT ome.tiff 3.70 GB (plain TIFF, uint16 768x1251x2021), MRI flip-4 (FlipAngle 20, TR 0.045) 3.00 GB, labels wholehemi (RAS, permuted) + BA crop 101x338x248 + vessels crop (same box; contains 17 voxels of -32768). prep work/I57 (20 G, 1459 s). Latest run work/runs/I57_otsu (1.1 G, 08-21).",
+    "what": "Search 0.439/0.434, not mirrored, restarts 10/12, vascular 1/8. NCC 0.512 despite being wrong. frac_on_labels 0.0005. 2831 s. MRI mask looks normal (fraction 0.209, valley 0.063), so the tissue-mask explanation does not apply. Whole-hemisphere agreement with BA is only 0.67. No same-shape label grid exists, so the frame repair needs a flip choice (8 variants, e.g. by label-on-tissue).",
+    "classification": "experimental-negative",
+    "evidence": "summary.md; prep.json; HANDOFF 3.5.4 (cause open); crop boxes read from headers.",
+    "recommendation": "Keep as a documented failure. A general method must either fix it or flag it without labels, and it is a good test of whether the label-free reliability scores flag failures."
+   },
+   {
+    "name": "DANDI I58 (0.12 mm, wrong, 10-degree MRI)",
+    "where": "raw OCT ome.tiff 1.93 GB (OME in 'pixel' units, 672x1067x1407), MRI flip-3 = 10 degrees (2.68 GB, used) and flip-1 = 30 degrees (2.76 GB, re-downloaded 08-30, sha256 01eb49d3..., never used) plus flip-1 .corrupt.bak (2.76 GB duplicate), labels wholehemi + BA + vessels (full grid, 33745 voxels). prep work/I58 (16 G, 1246 s, of which 801 s is label/vessel mapping). Latest run work/runs/I58_otsu (368 M, 08-21).",
+    "what": "Search 0.290/0.290, mirrored, restarts 12/12 (a stable wrong basin), vascular 1/8. Dice 0. 1790 s. MRI mask broken (threshold 2.12 against a median of 16.93, fraction 0.587). The 10-degree image has almost no GM/WM contrast. Not the same specimen or frame as Xiangrui's brainstem (resampled NCC -0.056).",
+    "classification": "experimental-negative",
+    "evidence": "JSON sidecars (flip-1 FlipAngle 30, flip-3 FlipAngle 10); summary.md; prep.json; HANDOFF flip-N entry.",
+    "recommendation": "Add the 30-degree pair as a benchmark variant (about 50 min). Keep the 10-degree pair as the low-contrast failure case. Delete the .corrupt.bak copy once writing is allowed."
+   },
+   {
+    "name": "DANDI I61 (0.12 mm, wrong, bath-heavy MRI)",
+    "where": "raw OCT ome.tiff 1.75 GB (OME in 'pixel' units, 608x1067x1407), MRI flip-4 (FlipAngle 20) 3.52 GB, labels wholehemi + BA crop 102x315x260 + vessels crop (same box). prep work/I61 (15 G, 1038 s). Latest run work/runs/I61_otsu (426 M, 08-21).",
+    "what": "Search 0.517/0.511, not mirrored, restarts 12/12, vascular 4/8. NCC 0.502 while wrong. The distinct runner-up is 80 degrees and 14 mm away. frac_on_labels 0. 2020 s. MRI mask swallows the bath (threshold 6.80 against a median of 10.42, fraction 0.742, no valley).",
+    "classification": "experimental-negative",
+    "evidence": "summary.md; prep.json; result.json refine.distinct_runner_up; HANDOFF 3.5.4.",
+    "recommendation": "Keep as the MRI-foreground failure case. Frame repair needs the flip choice, as for I57."
+   },
+   {
+    "name": "Xiangrui I58 brainstem (label-free target pair)",
+    "where": "raw data/xiangrui/OCT_to_MRI/I58_Brainstem_mus_Slice_full_20um_corr.nii.gz (12.4 GB, float32 1457x2013x1595 @0.02 mm, LPI with negative determinant, time units msec) and I58_brainstem_MRI_cropped_to_OCT.nii.gz (88 MB, 343x489x495 @0.08, RIA). prep work/xiangrui_I58_final (2.7 G, HEAD code, 718 s; texture mask 18.05 cm3, destripe along axis 2, vessels skipped); the mirror prep is 12 K of symlinks. Runs work/runs/xiangrui_I58_final (603 M) and _mirror (622 M) with export/ and summary.json. Legacy: work/xiangrui_I58bs (4.8 G), work/v11/xiangrui_I58bs (2.7 G), work/runs/v11/* (about 3 G).",
+    "what": "Chain command: prep --oct-mask auto --destripe on --skip-vessels, then register, viz, qc_fine and export, repeated for the other handedness (flipped oct150_affine plus --no-mirror). Chosen candidate: search 0.138/0.137, not mirrored, NCC 0.124, restarts 6/12, stretch 1.01/0.996/0.994. Rim boundary median forward/reverse 2.02/1.05 mm (y+ face 4.96 mm). MI landscape not unimodal in 3 of 9 DOF. Register 384 s. Other handedness: search 0.131/0.125, NCC 0.113, restarts 1/12, rim 1.57/1.08 mm, 30.5 mm apart. Export checked against the raw file (Spearman 0.933). Chain total 27.5 min, 32 GB peak. No labels; the cerebellum moved or tore between the scans.",
+    "classification": "general-but-unvalidated",
+    "evidence": "logs/xiangrui_I58_final_{chain,prep,register,qc}.log; qc_fine.json; summary.json; NIfTI headers; REPORT_I58_v11 Appendix C.4 and P7-P10.",
+    "recommendation": "Include with label-free metrics only, plus the handedness margin. To get any quantitative number, ask Xiangrui for 5-10 landmark pairs, the uncropped MRI or crop offsets, and which OCT axis is the optical depth axis. The pair currently needs three per-pair flags (destripe on, skip-vessels, a separate mirror run); a general method should decide these itself."
+   },
+   {
+    "name": "Label/MRI frame defect on the 0.12 mm subjects (evaluation blocker)",
+    "where": "scripts/prep_subject.py map_labels_to_grid (lines 61-70, perm from the affines, unchanged at HEAD); NIfTI headers of EPIC flip-*.nii.gz for I38 I48 I56 I57 I58 I61 I62; work/<SUB>/labels4.npy, ba_labels.npy, mri_vessels.npy; evaluation.* in the result.json files.",
+    "what": "For every 0.12 mm subject the MRI header orientation matrix is inconsistent with its array shape: the MRI world box is 168-192 mm left-right, the label box 69-77 mm. The labels (BA, vessels, wholehemi) agree with each other. Labels mapped with the affine-derived axis permutation lose 32-42 % of their content and land in the wrong place. The same-shape labels are the reliable reference for the voxel grid: I48/I58/I62 BA and I56 vessels have the same shape as the MRI, I38's are transposed. I57/I61 only have the permuted RAS wholehemi plus crops, so the flips are ambiguous. The two 0.15 mm subjects are unaffected. Registration is not affected (search and refine never read labels, and the mirror search absorbs header handedness), but the MRI-world exports for these subjects inherit the wrong frame.",
+    "classification": "dataset-specific",
+    "evidence": "Header boxes, e.g. I38 MRI x -84.8..83.1 against labels -39..37.6, I56 MRI x 192 mm against vessels 69 mm. HANDOFF 3.4.5 and A4.2 (I38 transpose: 99.0 % on tissue against 87.8 %). Header-only re-check: I56 block centre 0.4 mm from the BA crop box, not 65.9 mm.",
+    "recommendation": "Make evaluation a separate step. Map labels by array axes to the same-shape label file (flips chosen by label-on-tissue fraction when ambiguous), and map crops through the label world. Then re-score all 9 subjects from the stored T_oct2mri, with no re-registration. Retract the 'BA 0 % inside' evidence for I38/I56/I62 until this is redone. Fix map_labels_to_grid in the same change."
+   },
+   {
+    "name": "OCT metadata and OCT vessel segmentations",
+    "where": "sub-*/ses-OCT/micr/*.json and OME-XML; derivatives/sub-{I38,I46,I48}/ses-OCT/vessel/ves_seg.tif.",
+    "what": "OME physical sizes exist only for I38 and I55 (both agree with the sidecar). I46, I58, I61 and I62 have 'pixel' units. I48, I56 and I57 are plain TIFF despite the .ome name, so the JSON sidecar is the only spacing source. I46's sidecar is wrong (depth 12 instead of about 14). Sample types differ (I46 uint8, I56 float32, others uint16). OCT vessel segmentations exist on DANDI for only 5 subjects (I38, I45, I46, I48, I60); we hold 3. I38 and I48 differ from their OCT on all three axes (crops, not downsampled); I46 is 66 slices short. prep does full[:nz] = seg[:nz], which is only defensible for I46. DANDI OCT has no world frame: the SPR layout is arbitrary and the search covers all 16000 orientations including mirrored ones.",
+    "classification": "dataset-specific",
+    "evidence": "tifffile header read; prep.json oct.vesseg z_slices 520/561/441; HANDOFF 4.1.3 and 3.4.5.",
+    "recommendation": "Keep one small data card per pair (spacing with its source, and a note for known-bad metadata) instead of flags scattered through scripts. Score ves_seg only on I46 (both offsets). Consider downloading I45 and I60 for more OCT-vessel evidence."
+   },
+   {
+    "name": "Raw data store, manifests and integrity",
+    "where": "data/costantini/selection_manifest.tsv (I46 starter only: asset_id plus sha256); data/manifest_multisub.txt (81 lines, path|uuid|size, no sha256); data/fetch_manifest.sh, restart_dl.sh, dl_watchdog.sh (aria2, presigned URLs expire after 6 h); code/costantini/biccn-broca-I46 (authors' code, tag 1.0, commit b36e398, 247 M).",
+    "what": "All 81 multi-subject files match their declared sizes and there are no .aria2 partials. Size checks cannot catch a size-correct corruption, which already happened once (I58 flip-1). Not downloaded but relevant: I45, I59, I60 (OCT plus MRI, about 2.5-3.7 GB OCT each; I45 and I60 have OCT ves_seg); DANDI depth-normalised OCT (36 GB, not needed); I48 MRI sidecar; I62 wholehemi (does not exist on DANDI). Xiangrui's pair was md5-verified at transfer from xulab; the uncropped MRI and crop provenance are missing.",
+    "classification": "tooling",
+    "evidence": "The size check loop run on the server (81 checked, 0 bad); ls of the data dirs; memory note on the I58 CRC failure and re-download.",
+    "recommendation": "Add sha256 from the DANDI API to one benchmark manifest covering all pairs, including Xiangrui's md5, and verify it once before the benchmark. Record the dandiset version, since the draft is mutable."
+   },
+   {
+    "name": "Prep cache provenance and reproducibility",
+    "where": "work/<SUB>/prep.json (DANDI 08-20/21), work/xiangrui_I58_final/prep.json (09-14); octreg server tree (no .git; md5 equal to local HEAD db2282e); octreg_live_4170ef0_202609140007.tgz, octreg_v1_snapshot_20260912.tgz, /root/autodl-tmp/oct-mri-registration_v1 (24 M).",
+    "what": "prep.json stores inputs, shapes, thresholds and mask/destripe diagnostics, but no code hash, command line, timestamp or runtime. The DANDI preps predate git, and their prep.json lacks the v1.1 keys (mask_mode, destripe, oct150_provenance). v1.1 code on those preps reproduced v1 exactly for I46/I55, but the other 7 were never re-run at HEAD. prep_subject.py and register.py are unchanged since 2a9ef62, so xiangrui_I58_final is reproducible at HEAD. The default --oct-mask auto compares the OCT volume with the MRI tissue volume; on a whole-hemisphere MRI it can never trigger, so the rule quietly assumes an MRI cropped to the block.",
+    "classification": "tooling",
+    "evidence": "md5 comparison of 18 files; git log of prep/register code; prep.json key lists; HANDOFF note that the tree was unversioned and the exact I46_otsu revision cannot be recovered.",
+    "recommendation": "A publication-grade benchmark should re-prep every pair at one commit and write git hash, argv, time and runtime into prep.json and result.json. Split label mapping out of prep into evaluation. Write prep outputs to new dirs (for example work/bench/<commit>/<pair>) so the old caches stay comparable."
+   },
+   {
+    "name": "Evaluation code defects",
+    "where": "octreg/evaluate.py (gm_wm_overlap, vessels_own and vessels_vesseg); register.py evaluation block; summary.md columns.",
+    "what": "Dice uses the whole OCT class count as denominator, so it collapses when labels cover only part of the block (I38/I48/I56 about 0.25/0.48, I62 0). Vessel metrics return only n_inside when fewer than 20 points fall inside, which happens for all 7 subjects scored through the broken frame. Nothing calls BA-inside-block, although every DANDI block is BrocaAreaS01. valley_ratio, the MRI tissue fraction and the overlap volumes are never shown in the summaries.",
+    "classification": "tooling",
+    "evidence": "result.json evaluation.final for all 9 subjects (frac_on_labels 0.45-0.61 on the large slabs, n_inside 0); HANDOFF 3.5.2.",
+    "recommendation": "Metric set:\n- Label-based: Dice restricted to labelled voxels and a confusion matrix; BA-inside fraction plus centroid distance; MRI vessel distance with a shift control; ves_seg distance for I46 only; depth scale against the physical prior.\n- Label-free: search, polarity and handedness margins; restart convergence; vascular gate; stretch; volume overlap; runner-up distance; MI landscape; a boundary metric only where the OCT outline is a real specimen boundary; export round trip.\nCalibrate the label-free scores against label verdicts on the 9 DANDI pairs; never use one as a hard correctness test."
+   },
+   {
+    "name": "Serial compute budget for a full benchmark",
+    "where": "logs/prep_*.log, logs/reg_*_otsu.log, result.json total_seconds and polarity_trials.seconds, logs/xiangrui_I58_final_chain.log, logs/v11_R9_*.log.",
+    "what": "Prep per subject: I46 188, I55 517, I56 646, I62 1003, I61 1038, I38 1184, I58 1246, I48 1249, I57 1459 s. Total 8530 s (2.4 h); label and vessel mapping is 60-800 s of each, Frangi 25-650 s.\n\nRegistration per subject: I46 1125, I55 1279, I58 1790, I61 2020, I48 2223, I62 2243, I56 2263, I57 2831, I38 7864 s. Total 23638 s (6.6 h). Auto polarity runs search and refine twice (388-1167 s per polarity).\n\nQC: qc_fine took 51-55 s on Xiangrui; never run on a whole-hemisphere MRI (assume 2-5 min). Viz takes seconds.\n\nXiangrui full chain with both handedness candidates: 1654 s.\n\nTotal about 34 ks, roughly 9.5-10 h serial including QC. Label re-scoring from stored transforms: about 1-2 h. Optional extras: I58 30-degree about 50 min; I45/I59/I60 about 1 h each plus downloads. Peak memory 32 GB on Xiangrui. The container limit is 62 GB / 16 cores, and two parallel heavy jobs have frozen sshd three times.",
+    "classification": "tooling",
+    "evidence": "The logs and result.json total_seconds listed above; memory note on the cgroup limits.",
+    "recommendation": "Run the benchmark as one serial queue with a memory watchdog: prep, then register, QC and evaluate for each pair, then summarise. Profile I38's vascular stage first (5697 s)."
+   },
+   {
+    "name": "Disk usage and legacy clutter",
+    "where": "/root/autodl-tmp (1.5 T, 327 G used, 1.2 T free): oct-mri-registration/work 207 G, data 76 G, results_inspection 6.1 G, results_inspection_v11 29 M; /root/autodl-tmp/v11_dev 38 G.",
+    "what": "DANDI preps: I38 23, I57 20, I48 18, I58 16, I62 16, I61 15, I56 14, I55 8.4, I46 6.3 G. Each holds a float32 MRI copy (3.1-5.9 G), four uint8 MRI-grid label/mask volumes (0.77-1.47 G each), and native-resolution octv, masks, vessels and distance maps. Latest runs: I38 1.2 G, I57 1.1 G, I48 869 M, I62 772 M, I56 770 M, I61 426 M, I58 368 M, I55 109 M, I46 60 M, Xiangrui 603 M and 622 M. Legacy: 7 parser dirs of 4.3 G each (about 30 G), i46 6.8 G, probe_xr 9.1 G, v11/{I58bs_s40, tests, xiangrui_I58bs} about 7 G, runs/crop_* and whole_* in the 13 G runs dir, the 2.76 G corrupt.bak, and v11_dev 38 G.",
+    "classification": "legacy/dead",
+    "evidence": "du -sh on the server.",
+    "recommendation": "Space is not a constraint for re-prepping (about 140 G). After the benchmark, archive or delete the parser, probe and v11_dev dirs and the old caches, with the user's approval. Never copy volumes to the local Mac (about 2.5 GB free)."
+   }
+  ],
+  "open_questions": [
+   "Is mapping labels by array axes (no flips) right for I38, I48, I56, I58 and I62? For I57 and I61, which of the 8 flip variants is right? One data load per subject (label-on-tissue fraction) settles it, but that is a server job, not a read-only check.",
+   "Once the frame is repaired, do I38, I56 and I62 contain the BA label? The header-only estimate says I56 does (0.4 mm from the BA crop box). Is I48 wrong (about 44 mm from its vessel-annotation box)?",
+   "I46 OCT spacing: override to 12/12/14 in a data card, or keep the sidecar and treat the recovered depth scale as a metric? This decides how 'general, no dataset flags' is framed.",
+   "Should DANDI I58 be benchmarked on the 30-degree MRI (flip-1) instead of, or next to, the 10-degree one? Which general rule picks the MRI contrast?",
+   "Can the I38 and I48 ves_seg crop offsets be recovered from DANDI or the authors, or should those segmentations be dropped? For I46, the 0 versus 66 slice offset is still open.",
+   "Should the benchmark add I45, I59 and I60? I45 and I60 carry OCT vessel segmentations; about 9 GB download and about 3 h compute.",
+   "For Xiangrui's pair: can we get landmark pairs, the uncropped MRI or crop offsets, the optical-depth axis, and a confirmation of the header handedness? Without them it can only get label-free metrics.",
+   "What label-free boundary or QC metric is meaningful on DANDI cortex blocks, whose OCT faces are mostly cut surfaces? qc_fine was designed for whole specimens and has never been run on a whole-hemisphere MRI (runtime and memory unknown).",
+   "Should the benchmark re-prep all 9 DANDI subjects at one commit? The v1.1 regression reproduced I46/I55 on the old preps; the other 7 preps are pre-git with no recorded code version."
+  ]
+ },
+ "audit_code": {
+  "summary": "Audit of octreg at db2282e (package 13 files / 2,815 lines; scripts 53 .py + 19 .sh + 1 .json / ~5,600 lines), read in full, with read-only checks of result.json args and prep.json on the server.\n\n1. Most of the code is not the method. Every reported number comes from two entry points: scripts/prep_subject.py and scripts/register.py. They use about two thirds of the package: common, search, refine, the two-class split in features, evaluate, parts of vascular, plus specimen and destripe for I58. The QC/export tools are qc_fine.py, export_registration.py and check_export_header.py. About 45 of the 73 scripts are legacy, experimental-negative or one-off: the I46 v0 driver, the I46-only prep chain, the I46 validation suite, the parser/distillation branch, reference-pose forensics, brainstem one-offs, 10 recovery drivers and 5 v1.1 run plans. Most of them cannot run on current prep outputs (they need oct12_affine, oct24 or oct_ves_dist48_z0, which prep_subject.py never writes). Three modules are dead weight for the method: parser.py, synth.py (except gaussian_blur3d, which features.py imports) and nonrigid.py. fine.py (675 lines, 22 CLI flags) is a measured negative: rejected in every I58 run, and on I46/I55 it passes its own gates but makes the labelled metrics worse.\n\n2. The published default path is less general than the docs say. Every reported run passes `--oct-wm-bright auto` explicitly; the default 'no' is wrong for 7 of the 9 DANDI subjects plus the brainstem. The OCT two-class map is NOT bias-flattened (only the MRI map is), and its blur is in voxels, not mm. The slab normalisation assumes array axis 0 and a 1.2 mm section period: measured periods are about 3x shorter on I46/I56, and on I58 the sectioning axis is axis 2. The texture-mask auto rule compares the OCT block volume to the whole MRI tissue volume, so it can only fire when the MRI is cropped to the block. On I46 the texture mask would keep 0.28 of about 0.68 cm3 of tissue. The foreground threshold fails open (silent keep-everything fallback) on I61, DANDI I58 and I56. The vascular stage and all its gate thresholds come from I46/I55/I58 numbers, and the section-phase gate has never been exercised. `--destripe on` would stop with SystemExit on 14 um spacing like I55 (worked out from the code, not run). map_labels_to_grid still mis-pairs label axes on the six 0.12 mm subjects. prep ignores the OCT NIfTI orientation (layout letters), which is the only reason export_registration.py exists.\n\n3. Mechanisms that do the same job:\n   - Sectioning/bias normalisation, 4-5 of them: slab normalise, destripe, the MRI 10 mm flattening, the fine 3 mm flattening, the archived P11 normalisation.\n   - Foreground masks, more than 10.\n   - Polarity, 5 mechanisms; handedness, 4.\n   - Pose-difference metrics: a fixed 7 mm cube (rotation broken for mirrored poses) versus block corners.\n   - QC figures and summaries, 7+ each.\n   - Low-level helpers: pooling, erosion, largest component, Gaussian, MI-32, perturbation and GridDisp are each written 2-5 times.\n\n4. Minimal reproduction path:\n   - DANDI: prep_subject.py (defaults + annotation flags) then register.py --oct-wm-bright auto, then viz_result.py and summarize.py.\n   - Xiangrui I58: run_xiangrui_i58.sh = prep with --oct-mask auto --destripe on --skip-vessels, register without the fine stage, qc_fine, export and header check, and the other handedness via an inline affine flip plus --no-mirror.\n   - Reproducibility is only partly shown. R8/R9 re-ran register.py bit-identically from the STORED DANDI preps, and the one-command I58 run reproduces R5 to 0.00 mm. But the DANDI preps were made by older prep code: the I46 prep has no float16 gain (octv level ~100 vs I55 ~14k) and was never regenerated.\n\n5. Suggested general method, a few steps:\n   - loader that uses header affines;\n   - one sectioning flat-field along the detected axis;\n   - one foreground estimator with explicit failure, applied to both modalities;\n   - the same flattened two-class maps on both sides;\n   - FFT search over rotation x {handedness, relative polarity};\n   - rigid then similarity then affine with a stated scale prior;\n   - boundary-agreement QC calibrated on the labelled pairs;\n   - export in the input file frames.\n   Vessels become optional. The fine stage, parser, nonrigid and ~50 scripts are archived.",
+  "items": [
+   {
+    "name": "octreg/__init__.py",
+    "where": "octreg/__init__.py (13 lines)",
+    "what": "Version string 0.1.0 and a module docstring that presents the package as a 'contrast-agnostic structural parser' method; lists common/synth/parser/features/search/refine/evaluate, omits vascular, specimen, destripe, fine, nonrigid.",
+    "classification": "legacy/dead",
+    "evidence": "The parser branch was rejected (needs labels; flattened Otsu is better and free, HANDOFF 7.3.3); every reported run uses --features otsu (server result.json args for I38..I62, xiangrui_I58_final, v11 runs).",
+    "recommendation": "Rewrite as the one-paragraph description of the released method after the package is cut down; bump version at release."
+   },
+   {
+    "name": "common.py geometry, resampling and I/O core",
+    "where": "octreg/common.py L27-178 (affines, rotations, sample_at_world, grid_points, resample_to_grid, avg_pool_iso, crop_volume, world_bbox_to_voxel), L257-273 (pool_mean_np, pooled_affine), L290-328 (save_nifti, load_nifti, write_json, lta_text); DEVICE global L23",
+    "what": "Voxel->world 4x4 conventions, Rodrigues, uniform random rotations (R[0]=I), geodesic angle, polar rotation, trilinear world-space sampling via grid_sample (the single primitive for search, refinement, QC, outputs), chunked resampling, integer pooling with affine update, NIfTI/JSON/LTA writers. Read by every module and by prep_subject.py, register.py, qc_fine.py, export_registration.py and all legacy scripts.",
+    "classification": "core-general",
+    "evidence": "Conventions checked end to end: selftest_search.py (synthetic block of known pose), export_registration.py oct_in_mri vs register.py resampling NCC 0.99999999998, check_export_header.py Spearman 0.933/0.937 vs axis flips 0.09-0.25 (REPORT C.4). Known defect: rotation difference via polar_rotation is meaningless for mirrored poses (I46 vascular vs structural reported 129.0 deg, true 2.73 deg; 41 inconsistent rotation fields, HANDOFF 6.14.1). Dead helpers: iso_grid_affine (only prep_i46.py), crop_volume (only run_demo_i46.py), load_nifti (no caller). avg_pool_iso (torch) and pool_mean_np+pooled_affine (numpy) are two pooling implementations; specimen.pooled_affine_np is a third copy.",
+    "recommendation": "Keep as the geometry core. Delete iso_grid_affine, crop_volume, load_nifti; merge the pooling variants; replace rotation comparison by the polar factor of T1 inv(T2) with an explicit 'handedness differs' result; pass device as a parameter instead of a module global."
+   },
+   {
+    "name": "common.oct_slab_normalize and prep's slab window/threshold formula",
+    "where": "octreg/common.py L181-211 (defaults tissue_thresh=30, window=100, float16 gain 16384 and cap 60000); scripts/prep_subject.py L140-146 (thr_raw = 0.5*Otsu of raw[::4,::8,::8]>0; window = max(10, round(1200/sp_z)))",
+    "what": "Per slice along array axis 0: median of voxels above a raw threshold (only if >2000 voxels), divide by it, multiply by a running mean of the medians over 'window' slices. Output float16 with tissue median scaled to ~16384. Writes nothing itself; its output feeds oct150.npy and octv.npy in prep.",
+    "classification": "dataset-specific",
+    "evidence": "Axis-0 assumption: on I58 the sectioning axis is array axis 2 (P3; the axis-0 correction removes 1.5 %, P11 norm probe). Window formula: comment says 1.2 mm = one section period at 12 um, but the measured period is 33 slices on I46 (window 100) and 12 slices on I56 (window 34) (HANDOFF 5.1.7, 7.2.9). Function defaults 30/100 are I46 values. On the I58 NIfTI the 0.5*Otsu raw threshold is 0.00096, i.e. everything >0 (server prep.json). Mixed provenance: I46 octv level ~100 (prep 2026-08-20 10:04, before the gain trick) vs I55 ~14,388 (server check), so DANDI preps come from different prep versions. P11: undoing it or replacing it with per-section / tile flat-field changes structural NCC by <=0.0004 at P_R5. The slab step itself was never ablated on DANDI.",
+    "recommendation": "Replace with one sectioning-artefact step that takes axis and period from the data (destripe.detect_stripe_axis plus its FFT period), or drop it after a DANDI ablation. Keep the float16 gain only as a storage detail. Re-prep all benchmark pairs with one code version."
+   },
+   {
+    "name": "common.histogram_tissue_threshold, common.oct_tissue_mask and the MRI tissue mask in prep",
+    "where": "octreg/common.py L214-237 (256 bins, smoothing 5, prominence 0.05, distance 5, valley depth ratio <0.5, clip p99.5, fallback min(p1, 0.5*multi-Otsu[0])), L240-254 (threshold on vol[::2] + binary_closing 2 iterations + fill holes + largest CC; docstring still says Otsu); scripts/prep_subject.py L91-96 (MRI: threshold on mri[::4]>0, no morphology) and L185/L212/L239 (OCT 0.15 mm mask)",
+    "what": "Foreground (tissue vs air/bath/agarose) threshold by walking left from the rightmost histogram peak. The MRI mask is the raw threshold (mri_tissue.npy); the OCT intensity mask adds voxel-unit closing, fill and largest component (oct150_mask_intensity.npy / oct150_mask.npy). Read by register.py (search tissue, overlap gate, Otsu statistics), fine.py, qc_fine.py, specimen.choose_oct_mask.",
+    "classification": "general-but-unvalidated",
+    "evidence": "Healthy on I46 (valley 0.116), I38 0.198, I62 0.087, I48 0.474. Fails open with valley_ratio null on I61 (tissue fraction 0.742, 1,839 cm3; block placed 95.7 mm outside the brain with 12/12 restarts), DANDI I58 (0.587, 1,453 cm3) and I56 (0.9886, run still correct). I55 took the fallback and was correct (HANDOFF 5.1.6, 6.13.2; server prep.json). On the I58 brainstem OCT histogram (unimodal) the OCT mask is the whole block, 28.86 cm3 = 2.17x MRI tissue (P1). I57 is wrong with a normal mask (cause open). qc_fine.py has to re-clean the MRI mask because 55 % of its raw boundary voxels on I58 are interior holes (impl:C).",
+    "recommendation": "One foreground estimator applied identically to both modalities, with physical-size cleanup and an explicit failure flag (no silent keep-everything fallback). Merge with the texture mask into one mask module (same problem family: bath, agarose)."
+   },
+   {
+    "name": "common.layout_affine and --oct-layout",
+    "where": "octreg/common.py L276-287; scripts/prep_subject.py L32 (--oct-layout default 'SPR'), L139 (A_nat = layout_affine(raw.shape, sp/1000, layout)); writes work/oct_native_affine.npy",
+    "what": "Builds the OCT voxel->world affine from three RAS letters and the spacing, corner origin; ignores any NIfTI header orientation. Read by export_registration.py.",
+    "classification": "general-but-unvalidated",
+    "evidence": "The search covers all rotations and both handedness, so the letters only fix a handedness convention. On I58 the layout-to-header map is a signed permutation with det -1: the reported pose is proper in the prep frame and mirrored in the header frame, and the other-handedness candidate is proper there (REPORT C.4). This is why export_registration.py and check_export_header.py were written. DANDI OME-TIFFs have no world frame at all (HANDOFF 12, 96 permutations scanned).",
+    "recommendation": "When the OCT file carries a header affine, use it directly; keep a layout only for header-less stacks and mark the output handedness as 'unknown physical'. This removes the export composition step."
+   },
+   {
+    "name": "features.otsu_two_class (OCT structure map)",
+    "where": "octreg/features.py L51-65 (blur smooth_sigma_vox=1.0, Otsu inside tissue, sigmoid scale 0.25*std); scripts/register.py L120 (built once with wm_bright=True, channels swapped for the other polarity)",
+    "what": "Soft two-class [bright, dark] maps of oct150 inside the OCT mask. Bias flattening is not applied on the OCT side, and the blur is in voxels, not mm. Read by search, all refiners, the vascular stage and the evaluation class map oct_class150.npy.",
+    "classification": "core-general",
+    "evidence": "I46 crop feature ablation: otsu refined NCC 0.753, Dice 0.80/0.83, 7/8 restarts; raw intensity same pose but 4/8 restarts; parser Dice 0.44/0.70; MIND 0.185 and 17.9 mm off (HANDOFF 6.10.9). Asymmetry with the MRI side (10 mm flattening) was never tested. On I58 the class NCC is low (0.124) and the local OCT-MRI relation is inverted (P2).",
+    "recommendation": "Single two-class function for both modalities with the same mm-based flattening and blur; test OCT-side flattening on the benchmark before release."
+   },
+   {
+    "name": "features.otsu_two_class_lowmem (MRI structure map)",
+    "where": "octreg/features.py L68-103 (pool 4, flatten_sigma_mm 10, field floor 0.5*p5, Otsu on [::3] subsample clipped p99.5, sigmoid 0.25*std, z-chunks 64, float16 CPU output); scripts/register.py L91; scripts/test_fine.py L54",
+    "what": "Divides the MRI by its local tissue mean (10 mm Gaussian, normalised by the tissue fraction), then the same sigmoid two-class split, chunked on the GPU for whole hemispheres.",
+    "classification": "core-general",
+    "evidence": "I46 whole-hemisphere Dice vs manual labels: raw Otsu 0.650/0.599, flattened 0.907/0.934 (re-derived, HANDOFF 5.1.5; README quotes 0.66/0.62 -> 0.90/0.93). Tissue-inverted MRI still recovers the I46 pose (crop_final_inv2). The flattening effect was measured on I46 only.",
+    "recommendation": "Keep; merge with the OCT function (same code path for both modalities, physical blur). Report the flattening gain on a second labelled pair (I55)."
+   },
+   {
+    "name": "features Frangi vesselness (frangi_gamma, frangi_dark_vesselness, sym3x3_eigvals)",
+    "where": "octreg/features.py L150-238 (alpha=beta=0.5; gamma per scale from the 99.9th percentile globally, or per processing chunk when gamma=None)",
+    "what": "Separable Gaussian-derivative Hessian, closed-form eigenvalues, dark-tube Frangi response. Used by prep_subject.py (own OCT vessel segmentation, with global gamma) and vascular.py (per-chunk gamma by default).",
+    "classification": "general-but-unvalidated",
+    "evidence": "Per-chunk gamma produced stripe artefacts (bug 5, HANDOFF 7.2.5) and is still the default of frangi_dark_vesselness / vascular.frangi_chunked / vascular.oct_vessel_mask. On I58 the top-1 % vesselness density is modulated 2.54x by section phase (P3), so the channel is unusable there. Automatic MRI vessel detection ~8 % precision (HANDOFF 7.3.6).",
+    "recommendation": "Move with the vascular stage to an optional module; make a global gamma mandatory."
+   },
+   {
+    "name": "features legacy representations (mind_ssc, parser_features, build_features)",
+    "where": "octreg/features.py L20-47, L107-146",
+    "what": "MIND-SSC, parser-probability channels, and a dispatcher over parser/mind/otsu/intensity/vessel/parser_vessel/mind_vessel. Callers: run_demo_i46.py and the I46 validation/forensics scripts only.",
+    "classification": "experimental-negative",
+    "evidence": "MIND: search top1 0.219, refined 0.185, 3/8 restarts, block 17.9 mm off; parser no gain over otsu and requires manual labels (HANDOFF 6.10.9, 7.3.3, 7.3.5).",
+    "recommendation": "Remove from the package; keep the ablation table for the paper."
+   },
+   {
+    "name": "search.FFTSearcher (global masked-NCC search)",
+    "where": "octreg/search.py (152 lines); scripts/register.py L196-197",
+    "what": "MRI features and tissue zero-padded by half a template; for each rotation (and its mirror R*diag(1,1,-1)) the OCT features and mask are sampled on a template grid aligned with the MRI axes covering the block's bounding sphere (+3 voxels); masked NCC over all translations with rfftn correlations; variance floor 0.02*tissue variance; overlap gate (fraction of OCT mask on MRI tissue); per-rotation argmax; NMS 3 mm / 10 deg; top-K. Class defaults n_rot 3000, topk 32, min_overlap 0.85 differ from register.py's 8000/24.",
+    "classification": "core-general",
+    "evidence": "Correct whole-hemisphere poses on I46 and I55 (vessel and label evidence) and visually on I38/I56/I62. On I46 the crop and whole-hemisphere results are identical. Mirror branch required: without it I46 top1 drops 0.733 -> 0.685 and the scale degenerates; 6/9 DANDI poses are mirrored. Margins are often tiny: I48 0.257/0.256 undecided, I58 R5 0.1379/0.1372. Polarity is not separable at this level: on I46 the wrong polarity scores higher, 0.7411 vs 0.7259 (HANDOFF 5.2.5, 6.10.9).",
+    "recommendation": "Keep as the central step. Parameterise by angular step, not rotation count, and remove the duplicate defaults. Always report the top1/top2 margin and a decisiveness flag. Search (handedness x polarity) as discrete hypotheses in the same loop."
+   },
+   {
+    "name": "refine.py (Refiner, compose, params_from_matrix, masked_ncc)",
+    "where": "octreg/refine.py (148 lines); scripts/register.py L153-164, L229; subclassed/used by vascular.py, fine.py, nonrigid.py",
+    "what": "Point-based masked NCC of MRI features sampled at OCT tissue points (mask > 0.05). Parameters: rotation vector, translation about the block centre, log-scales, shears, mirror flag. Adam with lr 0.02 rad / 0.3 mm / 0.01 / 0.01 and cosine schedule. Absolute clamps +-0.15 and regulariser reg*(|ls|^2+|sh|^2), default reg 2.0. Returns the best data loss.",
+    "classification": "core-general",
+    "evidence": "Parameterisation round-trips; autograd matches finite differences (implementation_review_record impl:B). Scale prior is load-bearing: at reg 2 the prior costs 0.045-0.078 to reach the I46 depth scale while the whole depth-axis NCC range is 0.021. I38 depth stretch 0.861 = exp(-0.15) is clamp-saturated. Loosening the prior alone gains nothing (265.8 vs 276.5 um) (HANDOFF 5.3.3-5.3.4). Clamps are absolute, which is why fine.py wraps a delta refiner.",
+    "recommendation": "Keep. Make the clamps relative to the start pose inside Refiner, which removes fine.py's _DeltaRefiner. State the prior once as a physical scale bound."
+   },
+   {
+    "name": "vascular.py (label-free vessel channel)",
+    "where": "octreg/vascular.py (98 lines): mri_dark_channel L25-40 (local median 1.35 mm, p99.5, half-resolution approximation above 4e7 voxels), mri_frangi_channel L43, frangi_chunked L51 (zchunk 24, overlap 10, gamma None), oct_vessel_mask L63 (top q), density_on_grid L72 (p99.5), vascular_refine L84 (default w 1.0, reg 0.5, clamp 0.3, 300 iterations, factors (2,1)); scripts/register.py L243-285",
+    "what": "Third NCC channel: MRI local darkness vs OCT vessel density (from prep's octv_vessels.npy pooled to the oct150 grid), affine refinement from the structural pose, gated in register.py.",
+    "classification": "dataset-specific",
+    "evidence": "I46: vessels 265/0.28 -> 167/0.47 (annotation ceiling), 0.29 mm from the oracle; flipped/permuted density controls give no gain. I55: moves 0.33 mm, Dice unchanged. I38/I56/I62: no vessel annotation inside the block, so no evidence. I58 brainstem: OCT 'vessels' dominated by section seams, vessel NCC 0.0055, harmful, disabled. I61: vessel NCC 0.0185 on a wrong pose. Channel design (MRI 'dark', OCT 'density', w=2) chosen by a sweep on I46 only (vessel_channel_refine.py; HANDOFF 5.4, 6.10.4). Depends on ex-vivo FLASH dark vessels and seam-free OCT.",
+    "recommendation": "Take out of the general core; keep as an optional module behind one flag, validated on at least one more labelled vessel pair. Fix the per-chunk gamma defaults."
+   },
+   {
+    "name": "evaluate.py (annotation metrics and v1 QC figure)",
+    "where": "octreg/evaluate.py (117 lines): vessel_distance_stats L16 (random-shift control +-3 mm x30; 150/300 um fractions), gm_wm_overlap L47 (label coding 1 WM, 2/3 GM), transform_diff L72 (fixed 7 mm cube), qc_figure L83 (qc_oct_space.png)",
+    "what": "Evaluation with manual annotations (never used by the method), pose difference, and the per-run checkerboard figure. Called by register.py, regress.py, fine.py (transform_diff inside pose_move) and many legacy scripts.",
+    "classification": "tooling",
+    "evidence": "All reported Dice/vessel numbers come from it. transform_diff under-reads rotations of large blocks: a 12 deg rotation of the 29 mm I58 block is 2.1 mm at the 7 mm cube vs 6.2 mm at the block corners (REPORT 2.3). Its rotation_deg is invalid for mirrored poses (41 fields). Label coding follows the DANDI label files; docstring names the I46 pair.",
+    "recommendation": "Keep as an evaluation module separated from the method; use one pose-difference metric (block or mask-point displacement plus polar-factor rotation); label coding as a parameter."
+   },
+   {
+    "name": "nonrigid.py",
+    "where": "octreg/nonrigid.py (81 lines); callers run_demo_i46.py, nonrigid_stage.py (GridDisp re-implemented in refine_validate.py)",
+    "what": "Trilinear control-grid displacement on top of the affine, 3-channel masked NCC with smoothness and magnitude penalties; fixed-point inverse.",
+    "classification": "experimental-negative",
+    "evidence": "I46: Dice +0.015, vessels +0.01; not adopted in v1 (README section 4.4, HANDOFF 7.3.1). Not used by any reported run.",
+    "recommendation": "Remove from the package; archive."
+   },
+   {
+    "name": "parser.py and synth.py",
+    "where": "octreg/parser.py (227 lines: UNet3D, PatchSampler, train_parser, load_parser, parse_volume); octreg/synth.py (155 lines: synthesize, random_block_cut, sawtooth_attenuation, random_bias_field, gaussian_blur3d, standardize, random_flip_perm)",
+    "what": "3D U-Net structural parser trained on the whole-hemisphere labels plus SynthSeg-style synthetic images with OCT degradations, and sliding-window inference.",
+    "classification": "experimental-negative",
+    "evidence": "Training needs manual labels; only work/parsers/I46 exists. Two-class flattening + Otsu matches or beats it without training; the parser gave crop Dice 0.44/0.70 (HANDOFF 6.10.9, 7.3.3). Distillation inherits the initial scale (7.3.2). Coupling: features.otsu_two_class and otsu_two_class_lowmem import synth.gaussian_blur3d, so synth.py cannot be deleted as is.",
+    "recommendation": "Remove both; move a single Gaussian blur into common (see the low-level duplicates item)."
+   },
+   {
+    "name": "specimen.py (texture specimen mask)",
+    "where": "octreg/specimen.py (323 lines): constants L27-33 (band-pass 0.08, std window 0.36, grid 0.16, smoothing 0.48, rim window 0.20, open 0.64, close 0.48 mm; 'P1 validated at 0.04 mm'), oct_specimen_mask L186 (log-GMM threshold, rim watershed, pockets, cleanup, options fill_pockets/fill_holes/rim_required/boundary_erode_mm), rim_gate L160, want_texture L289 (V_int > 1.5 V_MRI), choose_oct_mask L298 (band 0.5-1.75, 1e5-voxel fallback), mask_qc_png L311; scripts/prep_subject.py L152, L192-196, L215-219, L245",
+    "what": "Min-over-axes directional texture on the ~0.04 mm level separates specimen from scatterer-doped agarose; markers + watershed on rim strength; resampled to the 0.15 mm and octv grids. Writes oct150_mask_texture.npy and octv_mask_texture.npy; the chosen mask goes to oct150_mask.npy.",
+    "classification": "dataset-specific",
+    "evidence": "I58: 28.86 -> 18.05 cm3 against 13.32 cm3 MRI tissue (still 1.36x; >=5.5 cm3 agarose shell and lamellar pockets remain, P8). Overlap gate 0.369 -> 0.590; structural pose reproducible across seed/destripe (REPORT 3.3). v1.1b options change < 0.07 cm3 on I58; rim gate is a no-op (REPORT C.1). The auto rule compares the OCT block volume with the whole MRI tissue volume, so it fires only for MRI crops (DANDI ratios 0.72/803 and 5.5/621). On I46, R0_mask_I46 gives 0.28 cm3 (frac150 0.176) against the intensity mask frac150 0.424 (~0.68 cm3), i.e. it would drop tissue on cortex (server work/v11/tests/mask_I46/result.json). Relies on agarose artefacts being anisotropic.",
+    "recommendation": "Do not present as a general component. Either validate on DANDI cortex plus a second embedded block, or ship as an explicit embedding option. Replace the MRI-volume ratio rule with a data-internal criterion. Delete the four v1.1b options."
+   },
+   {
+    "name": "destripe.py (sectioning-stripe detection and flat field)",
+    "where": "octreg/destripe.py (260 lines): CAP_F16 L20 (re-declared), DETREND_MM 2.4 L22, MIN_PLANE_COUNT 2000 L23, detect_stripe_axis L87 (40 plane pairs, hp_sigma_vox 3.0, ratio_max 0.8, fixed 60-plane detrend L112, FFT SNR >= 3 L116), destripe_inplace L181 (sigma 0.48 mm in-sheet, 0.24 mm along the axis, clip [1, 60000], zchunk 64, pad 40, fork pool), section_phase_modulation L238; scripts/prep_subject.py L197-243",
+    "what": "Detects the array axis whose adjacent planes decorrelate after high-pass (the sectioning axis) and its period. Subtracts an additive normalised-convolution stripe field in place on octv; oct150 is then re-derived. Also measures section-phase modulation of the vessel mask.",
+    "classification": "general-but-unvalidated",
+    "evidence": "I58: axis 2 (NCC 0.630/0.661/0.351, ratio 0.557, period 7.49 voxels = 0.30 mm); x-profile residual 139 -> 50, 11/11 checks pass (R0). Pose effect small: R5 vs no-destripe 0.35 mm / 1.4 deg (0.67 mm at block corners). I46: detection decisive on axis 0 (0.439 vs 0.80, period 0.39 mm) but destripe never applied on DANDI, so its effect on registration outside I58 is untested. Clip floor 1.0 assumes the 16384 gain level (I46 octv level ~100 would clip ~1 %). hp_sigma_vox 3 and the 60-plane detrend are voxel counts tuned at 0.04 mm (impl:C).",
+    "recommendation": "The right general mechanism for serial-section artefacts: make it the single normalisation step in place of oct_slab_normalize, with physical and level-relative parameters and a no-op when no axis is decisive. Validate on DANDI before claiming generality."
+   },
+   {
+    "name": "fine.py (sign-corrected fine stage with gates)",
+    "where": "octreg/fine.py (675 lines): FineConfig L74-84; Level L237; polarity_guard L285 (4x4x4 tiles, 60 %/-0.05 thresholds from P2); FineRefiner/FineDense L345/L365; MI32 and mi_polish L445/L470; landscape, restarts, split_half, inverse_consistency L483-558; fine_stage L562 with gates (a)-(h) L656-671; scripts/register.py L287-305; scripts/test_fine.py",
+    "what": "Two-level delta refinement of a 3 mm-flattened masked NCC with the sign of the local OCT-MRI relation, or LCC/LCC^2 when mixed, inside a pose-dependent specimen mask, followed by label-free verification and acceptance gates. Writes T_oct2mri_prefine.npy, T_oct2mri_fine_candidate.npy, result.json fine.*. Its helpers mri_box/block_corners/pose_move are also used by register.py's vascular gate.",
+    "classification": "experimental-negative",
+    "evidence": "I58: rejected in all six v1.1 runs (0/8 restarts within 0.3 mm, U 2.6-5.7 mm, candidates 2.5-11.6 mm apart, REPORT 3.4). The conservative polish (fixed mask, 1 mm/2 deg restarts, rigid, FOV rind) is also rejected; the rigid variant has 5/8 restarts agreeing at 4.85 mm / 10.7 deg from P_R5 that nothing independent confirms (REPORT C.3). Cortex: accepted by its own gates on I46 and I55 but regress --tol fine fails 7/11 on I46 (own-vessel 123 -> 165 um, vesseg 167 -> 264 um, depth stretch 1.219 -> 1.31) and 3/11 on I55 (GM Dice 0.930 -> 0.916); polish variants the same (REPORT 6, C.3). Polarity guard had no evaluable blocks on I46.",
+    "recommendation": "Remove from the method and the CLI; keep the negative result (self-consistency is not accuracy). Move block_corners/pose_move into the shared pose-metric utility."
+   },
+   {
+    "name": "prep_subject.py input, spacing and frame flags",
+    "where": "scripts/prep_subject.py L29-38, L57-59, L85-90, L121-139: --work (required), --mri (required), --oct (required), --oct-spacing-um (None -> NIfTI zooms or BIDS sidecar), --oct-layout ('SPR'), --skip-mri, --skip-oct",
+    "what": "Loads the MRI NIfTI (4-D -> first volume, non-finite -> 0) and the OCT from .npy, NIfTI or (OME-)TIFF. Hard-coded rules: a 4-D squeeze (raw[:,0] if shape[1] < shape[-1] else raw[...,0]); sidecar PixelSize reversed from [x,y,z] to [z,y,x], with a 2-element case [px1,px1,px0]; the .ome.tiff sidecar name; NIfTI zooms taken as (z,y,x) with header orientation ignored. Writes mri.npy, mri_affine.npy, oct_native_affine.npy, prep.json.",
+    "classification": "general-but-unvalidated",
+    "evidence": "Runs on DANDI OME-TIFF + sidecar and on the Xiangrui NIfTI pair. Spacing is trusted blindly: the I46 sidecar says 12 um isotropic while depth is ~1.167x larger (HANDOFF 4.5; the vascular stage absorbed it as a 1.22 stretch). Ignoring the header forced the export composition (REPORT C.4). --skip-mri/--skip-oct used only in reruns (rerun_xiangrui_fixed.sh, run_v11_i58.sh R2).",
+    "recommendation": "One loader: NIfTI -> header affine; TIFF -> sidecar spacing and an explicit axis-order argument instead of shape heuristics; record 'orientation unknown' in prep.json when there is no header."
+   },
+   {
+    "name": "prep_subject.py annotation flags (evaluation only)",
+    "where": "scripts/prep_subject.py L33-34 (--labels-wholehemi, --labels-ba, --mri-vessels, --oct-vesseg; all None), map_labels_to_grid L61-82, label handling L101-117, ves_seg handling L320-328, edt48 L273-278",
+    "what": "Maps label volumes onto the MRI grid through an affine-derived signed permutation (nearest fallback) -> labels4.npy, ba_labels.npy, mri_vessels.npy. Zero-pads the provided OCT vessel segmentation assuming alignment at z=0 and writes its EDT on a 48 um grid (oct_ves_dist48_vesseg.npy). Read by register.py's evaluation, viz_result.py, and legacy I46 scripts (ba_labels).",
+    "classification": "dataset-specific",
+    "evidence": "DANDI BIDS names and label coding. map_labels_to_grid mis-pairs axes on the six 0.12 mm subjects: 31.7-41.6 % of whole-hemisphere labels dropped; I38 keeps 65.7 % vs 100 % with the shape-consistent pairing. Unfixed in the tree (HANDOFF addendum item 6, 4.4.3), so every Dice for I38/I48/I56/I57/I58/I61 uses corrupted labels. ves_seg z=0 alignment verified only on I46 (zoff0 166.8 um / 0.469 vs zoff66 301.9 / 0.187). The registration never reads these files.",
+    "recommendation": "Move annotation mapping and EDTs out of prep into the benchmark/evaluation script. Fix the permutation (prefer the shape-consistent pairing) and recompute evaluation for the 0.12 mm subjects before publishing any of their numbers."
+   },
+   {
+    "name": "prep_subject.py resolution and pooling (--target-mm, --vessel-level-um)",
+    "where": "scripts/prep_subject.py L35 (--target-mm 0.15, --vessel-level-um 24.0), L148-149 (k150 = round(target/sp), kv = ceil(24/sp)), L181-184 and L205-209 (integer pooling then trilinear resample to an exactly isotropic grid), L202 (destripe path: SystemExit unless k150 % kv == 0), L259-261 (octv_mask.npy by nearest resampling)",
+    "what": "Builds oct150.npy/oct150_affine.npy at the target spacing and the 'vessel level' octv.npy (native if >=24 um, else pooled: 24-40 um). octv_mask.npy has no downstream reader.",
+    "classification": "general-but-unvalidated",
+    "evidence": "register.py hard-codes LEVELS (0.6, 0.3, 0.15) mm and fine.py levels 0.3/0.15, so --target-mm other than 0.15 is not honoured downstream. np.round(12.5) = 12 gives 0.144 mm pooling on 12 um data. Destripe on 14 um depth spacing (I55: k150 = 11, kv = 2) would exit (derived from the code, never run). 20 um data -> 40 um vessel level. octv_mask.npy: no reader (grep).",
+    "recommendation": "Resample with a physical anti-alias filter to the target grid instead of integer factors; derive the register/fine pyramid from target_mm; drop the divisibility constraint and the unused octv_mask output."
+   },
+   {
+    "name": "prep_subject.py threshold overrides (--oct-tissue-thresh, --mri-tissue-thresh)",
+    "where": "scripts/prep_subject.py L36-37 (both None), L94, L140-143",
+    "what": "Manual overrides of the raw OCT threshold used by the slab normalisation (else 0.5*Otsu of a subsample) and of the MRI tissue threshold (else peak-walk).",
+    "classification": "general-but-unvalidated",
+    "evidence": "No reported prep used them (prep.json raw thresholds automatic: I46 42.3, I55 15,424, I58 NIfTI 0.00096). The 0.5*Otsu raw threshold is a third independent foreground rule next to the peak-walk and the texture mask.",
+    "recommendation": "Remove from the published CLI (or keep one documented escape hatch for the unified foreground estimator)."
+   },
+   {
+    "name": "prep_subject.py mask flags",
+    "where": "scripts/prep_subject.py L39 (--oct-mask auto), L43 (--mri-tissue-cm3 None), L44 (--mask-band 0.5,1.75), L46-52 (--mask-fill-pockets on, --mask-fill-holes on, --mask-rim-required off, --mask-erode-mm 0.0, --mask-core-mm 2.0), L158 (DIAG_ERODE_MM 2.0), L159-163 (erode_from_boundary), L244-253",
+    "what": "Chooses the 0.15 mm OCT mask (intensity vs texture) and sets texture-mask options. Writes oct150_mask.npy (chosen), oct150_mask_intensity.npy, oct150_mask_texture.npy, oct150_mask_core.npy (mask eroded 2 mm) and oct150_mask_qc.png. The stripe diagnostic uses the chosen mask eroded 2 mm.",
+    "classification": "dataset-specific",
+    "evidence": "The auto rule fires only on I58 (ratio 2.17); DANDI never. v1.1b options change < 0.07 cm3 on I58, rim gate no-op (REPORT C.1). oct150_mask_core.npy has no reader in the tree (its own help text and grep). The band 0.5-1.75, the 1.5 ratio and the 2 mm core come from I58 probes P1/P8.",
+    "recommendation": "Collapse to a single mask module with no user options (or one on/off for embedding). Delete core, pocket, hole, rim, erode and band flags and the unused core file."
+   },
+   {
+    "name": "prep_subject.py destripe flags and section-phase diagnostic",
+    "where": "scripts/prep_subject.py L40-41 (--destripe off, --stripe-axis auto), L45 (--save-stripe-field off), L197-243 (detect, destripe, oct150_nodestripe.npy), L264-270 (diagnostic axis when the texture mask was computed), L314-319 (section_phase_modulation -> prep.json oct.vessel_section_modulation)",
+    "what": "Optional flat field of octv along the detected sectioning axis before deriving oct150; stores the un-destriped oct150 for ablation and optionally the stripe field octv_stripeS.npy. Records the vessel section-phase modulation that register.py's --vascular auto reads.",
+    "classification": "general-but-unvalidated",
+    "evidence": "Used only for I58 (R2, R4, run_xiangrui_i58.sh). The vessel_section_modulation key needs vessels computed AND a stripe diagnostic: never true on DANDI (no texture mask, destripe off) nor on I58 (vessels skipped). All server prep.json have it null, so register.py's modulation gate (>1.6) has never been exercised. The I46 ratio 1.43 was measured separately (REPORT 6 note ii).",
+    "recommendation": "Make the flat field the always-on sectioning step with automatic no-op; remove --stripe-axis and --save-stripe-field from the public CLI; remove the section-phase gate if the vascular stage leaves the core."
+   },
+   {
+    "name": "prep_subject.py vessel block (--skip-vessels)",
+    "where": "scripts/prep_subject.py L42 (--skip-vessels, default off), L279-302 (Frangi sigmas 24/36/53/72/106 um converted with the mean of all three octv spacings; GPU slab budget 30e6 voxels; gamma from 6 slabs within 20e6; top-1 % inside tissue; subsample to 20M), edt48 at 48 um",
+    "what": "Own OCT vessel segmentation octv_vessels.npy (read by register.py vascular stage, viz_result.py, fig_doc.py) and its EDT oct_ves_dist48_own(.npy/_affine) for evaluation.",
+    "classification": "dataset-specific",
+    "evidence": "Useful only where the vascular stage is (I46/I55). On I58 skipped because of section seams (P3). Sigma conversion assumes isotropic spacing (I55 is 14/12/12 um).",
+    "recommendation": "Move together with vascular.py into an optional module; not part of default prep."
+   },
+   {
+    "name": "register.py inputs, features, evaluation and outputs (--work, --out, --features, --parser-dir, --ref-transform)",
+    "where": "scripts/register.py L29-30 (--work, --out required; --features otsu|parser default otsu; --parser-dir None), L38 (--ref-transform None), L65-94 (load; MRIFeatures CPU float16), L310-366 (evaluation and outputs)",
+    "what": "Loads prep arrays (MRI mmap), builds CPU-resident MRI features with pooled levels and block crops. Evaluates whatever annotations exist (vessels own/vesseg, Dice, vs reference) and writes T_oct2mri.npy/.lta, T_oct2mri_structural.npy, oct_class150.npy, result.json (written twice), qc_oct_space.png, and oct_in_mri_region / mri_region / mri_labels_region .nii.gz (box = block radius + 8 mm, QC box -4 mm, z-chunks 64).",
+    "classification": "core-general",
+    "evidence": "All reported runs: features otsu, parser-dir unused (server result.json args). --features parser needs mri_prob_*.npy from a label-trained parser (work/parsers/I46 only). --ref-transform only reports. The .lta refers to the pipeline OCT layout frame, not the input OCT file (REPORT C.4).",
+    "recommendation": "Drop --features/--parser-dir/--ref-transform. Move evaluation to the benchmark script so register.py only registers. Write transforms directly in the input file frames."
+   },
+   {
+    "name": "register.py position priors (--crop-centre, --crop-half-mm, --init-transform)",
+    "where": "scripts/register.py L31 (--crop-centre None, --crop-half-mm 30.0), L40 (--init-transform None), L74-80, L168-191",
+    "what": "Crop the MRI around a world point before the search, or skip the search and the structural refinement entirely and only evaluate polarity at a given 4x4 pose (then optionally vascular/fine).",
+    "classification": "general-but-unvalidated",
+    "evidence": "--crop-centre was not used by any reported register.py run (server args crop_centre None everywhere); on I46 the old driver showed crop and whole identical. --init-transform was used for R1, R7, R13 polish, candeval and the handedness polish, i.e. only as a start for the fine stage. The PI says a position prior is available (HANDOFF 9.5.6).",
+    "recommendation": "Keep one prior mechanism: an optional initial pose with translation radius and angular range that restricts the same search (not a path that skips it)."
+   },
+   {
+    "name": "register.py global search flags and hard-coded structural schedule",
+    "where": "scripts/register.py L32-33 (--n-rot 8000, --topk 24, --min-overlap 0.85, --no-mirror off), L37 (--seed 0); hard-coded L122 LEVELS (0.6, 0.3, 0.15) mm, L133-136 adaptive gate MIN_OV = min(0.85, max(0.15, 0.8*V_MRI/V_OCT)), L138 over-inclusive warning at 1.5, L156 refiner crop block radius + 6 mm, L197 scales (1.0,), L199-201 keep 8/3/3 with rigid+similarity 120 iterations at 0.6, rigid+affine 200 at 0.3, affine 200 at 0.15, L220 distinct runner-up 2 mm / 5 deg",
+    "what": "FFT search at ~0.6 mm over proper and mirrored rotations, then coarse-to-fine refinement of the top candidates.",
+    "classification": "core-general",
+    "evidence": "Adaptive gate: I58 v1 0.369 (over-inclusive OCT mask), v1.1 0.590; always 0.85 for whole hemispheres; the I61 bath pose passes the gate. Seed 1 reproduces I58 R5 within 0.31 mm / 1.1 deg. A mirrored 0.1358-scoring pose was dropped at the 0.3 mm keep-3 step (REPORT C.4). --no-mirror used only by the handedness test; the old Xiangrui run used --min-overlap 0.5. On 0.12 mm and 0.08 mm MRIs the levels round to 0.6/0.24/0.12 and 0.64/0.32/0.16 mm.",
+    "recommendation": "Keep the schedule but express levels as multiples of the target grid and the rotation budget as an angular step. The adaptive gate compensates for mask mismatch using the whole-MRI tissue volume: define overlap against the MRI field actually available once the mask is unified."
+   },
+   {
+    "name": "register.py polarity flags (--oct-wm-bright, --mri-wm-bright)",
+    "where": "scripts/register.py L33 (--oct-wm-bright auto|yes|no, default 'no'), L34 (--mri-wm-bright, default False = GM bright as ex-vivo 20 deg FLASH), L165, L193-213",
+    "what": "'auto' runs search plus the whole structural refinement for both OCT class polarities and keeps the lower refined loss; MRI polarity is a manual switch.",
+    "classification": "dataset-specific",
+    "evidence": "Every reported run passed auto explicitly (server args; run_subject.sh hard-codes it). The default 'no' matches only I46 and I56: I55, I38, I62, I48, I57, I61, DANDI I58 and the I58 brainstem all chose wm_bright True. Polarity is decidable only after refinement: I46 search prefers the wrong polarity (0.7411 vs 0.7259), refined NCC separates it (0.7564 vs 0.7300); I58 0.1241 vs 0.1079. Auto doubles the runtime.",
+    "recommendation": "Treat relative class polarity as a searched discrete variable by default and drop --mri-wm-bright (only the relative polarity matters); remove the flag from the public CLI."
+   },
+   {
+    "name": "register.py structural prior and restart flags (--ls-clamp, --sh-clamp, --reg, --n-restarts)",
+    "where": "scripts/register.py L35 (--ls-clamp 0.15, --sh-clamp 0.15, --reg 2.0), L37 (--n-restarts 12); hard-coded restarts L225-232 (rotation U(5,30) deg, translation U(-5,5) mm, 0.3 rigid 150 -> 0.3 affine 150 -> 0.15 affine 150 iterations, crops block radius + 12 mm, converged if transform_diff corner_mean < 0.5 mm on the 7 mm cube)",
+    "what": "Scale/shear prior of the structural refinement, and perturbed restarts around the structural pose (diagnostic, logged as evaluation.restarts).",
+    "classification": "core-general",
+    "evidence": "Prior is load-bearing and deliberately stops the structural stage from reaching the true I46 depth scale (HANDOFF 5.3.3). Restart counts are anti-correlated with correctness: I61 12/12 and DANDI I58 12/12 are both wrong, I46/I55 9/12, I58 R5 6/12, seed 1 8/12 (HANDOFF 5.3.6, 6.9.2; REPORT 3.3).",
+    "recommendation": "Keep the prior as one stated scale bound. Report restarts only as a basin-width statistic with the block-corner metric, never as acceptance."
+   },
+   {
+    "name": "register.py vascular flags and gate",
+    "where": "scripts/register.py L36 (--vascular-w 2.0, --vascular-reg 0.5, --vascular-clamp 0.3), L41-45 (--vascular auto|on|off default auto, --vessel-modulation-max 1.6, --vascular-min-ncc 0.02, --vascular-struct-drop 0.05, --vascular-max-move 3.0); hard-coded L270-278 vascular restarts (8x, U(3,8) deg, U(-2.5,2.5) mm, +-0.1 log-scale, factors (4,2,1), within 0.3 mm on the 7 mm cube), box block radius + 8 mm",
+    "what": "Runs the vessel-channel affine refinement when octv_vessels.npy exists and the section-phase modulation is not flagged. Accepts the vascular pose only if vessel NCC, structural NCC drop and block-corner move pass.",
+    "classification": "dataset-specific",
+    "evidence": "Thresholds set from three numbers: vessel NCC I46 0.296, I55 0.083, I58 v1 0.0055. The structural-drop limit was raised from the spec's 0.03 to 0.05 because v1's accepted I46 pose drops 0.027 (REPORT 2.4). The modulation gate has never fired on any prep (see destripe flags item). w=2 comes from the I46-only sweep. DANDI reported runs used v1 'on'; the v1.1 'auto' gives identical results (R9 0 FAIL of 26).",
+    "recommendation": "Leave out of the general method; if kept, expose one --vessels on/off flag with internal gate constants documented as calibrated on I46/I55."
+   },
+   {
+    "name": "register.py fine-stage flags",
+    "where": "scripts/register.py L46-60: --fine off, --fine-sim auto, --fine-levels 0.3,0.15, --fine-flatten-mm 3.0, --fine-erode-mm 1.3, --fine-lcc-mm 4.5, --fine-clamp 0.15, --fine-reg 0.5, --fine-iters 200, --fine-restarts 8, --fine-max-move 3.0, --fine-max-rot 5.0, --fine-subsample 1, --fine-verify basic, --fine-fixed-mask off, --fine-fixed-weight auto, --fine-restart-mm 3.0, --fine-restart-tol-mm 0.3, --fine-restart-deg 5.0, --fine-restart-logscale 0.03, --fine-dof affine, --fine-exclude-fov-mm 0.0; L287-305",
+    "what": "Configure fine.py (22 flags); outputs T_oct2mri_prefine.npy, T_oct2mri_fine_candidate.npy and result.json fine.*.",
+    "classification": "experimental-negative",
+    "evidence": "Same as the fine.py item: never accepted on I58 in any configuration; harmful on I46/I55 when accepted (REPORT 3.4, 6, C.2, C.3). The shipped Xiangrui run runs without it.",
+    "recommendation": "Delete all 22 flags from the public CLI together with fine.py."
+   },
+   {
+    "name": "qc_fine.py (label-free boundary agreement and MI landscape)",
+    "where": "scripts/qc_fine.py (243 lines); flags L30-33: --work, --run (required), --T (default run/T_oct2mri.npy), --out (default run dir), --checker-mm 0.9, --erode-mm 1.3, --planes 0.2,0.35,0.5,0.65,0.8, --skip-landscape, --pad-mm 4.0; hard-coded DEEP_END 'z+' L37, MRI mask cleanup (closing 2 voxels + fill + components >= 1 mm3) L65-71, face margin 3 voxels L77, valid erosion 2 voxels L75, smoothing 2 voxels L80, FOV margin 1 mm L84, landscape offsets L162",
+    "what": "Q1: OCT mask boundary through T vs cleaned MRI tissue boundary, both directions, per face class along the OCT array axes. Q2: MI-32 landscape at T (re-implements fine.MI32 and perturbation). Q3: five-plane figure. Reads prep and run outputs; writes qc_fine.json, qc_fine.png, qc_fine_landscape.png.",
+    "classification": "tooling",
+    "evidence": "I58 R5: rim median 2.02 mm forward / 1.05 mm reverse (REPORT 3.5). Used to compare the two handedness candidates (1.57 vs 2.02 forward). Meaningless on intensity masks without a rim (1,533 usable rim voxels on the v1 I58 prep). Never run on DANDI (impl:C open item 6), so its relation to accuracy is uncalibrated. MI optima point to run-away poses (REPORT 4.1). The z+ 'deep end' class and the cleanup constants were set on I58.",
+    "recommendation": "Keep boundary agreement as the main label-free QC, calibrated on I46/I55 against annotations first. Drop the deep-end special case and the MI landscape. Share mask cleanup with the unified mask module."
+   },
+   {
+    "name": "export_registration.py",
+    "where": "scripts/export_registration.py (147 lines); flags L31-36: --work, --run, --oct-nifti, --mri-nifti, --out (required), --T (default run/T_oct2mri.npy), --mri-in-oct-mm 0.08, --chunk 24",
+    "what": "Composes T_nii = T_oct2mri @ A_layout @ inv(A_header). Writes the 4x4 in both directions, a FreeSurfer LTA with volume geometry, oct150 in the OCT header frame, oct_in_mri.nii.gz on the MRI grid, mri_in_octnii_frame.nii.gz, export.json and README.md. Checks that the frames differ by a signed permutation, corner consistency, and agreement with register.py's own resampling.",
+    "classification": "tooling",
+    "evidence": "NCC 0.99999999998 against register.py's oct_in_mri_region for both I58 candidates (support Dice 0.996/0.995). Exists only because prep ignores the OCT header. NIfTI OCT only: no export path for DANDI OME-TIFFs. The 0.08 mm default is the I58 MRI spacing.",
+    "recommendation": "Fold into register.py's output writer; unnecessary once prep uses header affines. Derive the default grid from the input spacings."
+   },
+   {
+    "name": "check_export_header.py",
+    "where": "scripts/check_export_header.py (66 lines); flags --export, --oct-nifti, --mri-nifti (required), --n 40000, --seed 0, --box 7",
+    "what": "Streams the raw OCT .nii.gz plane by plane (Fortran order) and correlates box-averaged raw values at random MRI voxels, mapped through the exported transform and the header affine, with the exported image. Controls: each header axis flipped, and a 2 mm shift. Writes check_header.json.",
+    "classification": "tooling",
+    "evidence": "Spearman 0.933 (reported pose) and 0.937 (other handedness) vs 0.09-0.25 for axis flips and 0.26/0.31 for a 2 mm shift (REPORT C.4). --box 7 = 0.14 mm at 20 um, tied to I58's resolution.",
+    "recommendation": "Keep as a frame-handling test (box size from spacing), not part of the method."
+   },
+   {
+    "name": "regress.py",
+    "where": "scripts/regress.py (237 lines); arguments ref_run, new_run, --tol default|fine, --set KEY=VALUE, --work-ref, --work-new, --json; tolerance tables TOL L19-26 and TOL_FINE L27-30",
+    "what": "Compares two runs row by row (prep md5/mtime, mask rule, search, refined NCC, restarts, vascular gate, pose, stretch, Dice, vessel medians, wall time), or the fine-stage table; exit 1 on any FAIL.",
+    "classification": "tooling",
+    "evidence": "R9: I46 and I55 v1 snapshot vs v1.1 defaults 0 FAIL of 26. R10: fine on fails 7/11 (I46) and 3/11 (I55) (REPORT 6). Tolerances hard-coded from spec 5.3/5.4 on I46/I55. G1c/G1d assume the intensity mask. F7 points to results/final/summary.",
+    "recommendation": "Generalise into the benchmark comparator over all pairs with tolerances in a config file."
+   },
+   {
+    "name": "summarize.py",
+    "where": "scripts/summarize.py (39 lines); flags --runs work/runs, --out work/runs/summary_all, --pattern *",
+    "what": "Globs result.json into summary.md/summary.json (22 columns including vascular, fine, mask and destripe fields).",
+    "classification": "tooling",
+    "evidence": "Produced work/runs/summary_all/summary.md (v1 table in README section 3) and work/runs/v11/summary/summary.md.",
+    "recommendation": "Fold into one benchmark report generator; drop fine columns."
+   },
+   {
+    "name": "viz_result.py",
+    "where": "scripts/viz_result.py (59 lines); flags --work, --run (required), --out (default run/qc_vessels.png); hard-coded 22 mm crop, slices at 0.2/0.5/0.8 depth, density contour 0.35",
+    "what": "Per-run figure: OCT with own vessels and class boundary; MRI resampled through the structural, prefine and final transforms with overlays.",
+    "classification": "tooling",
+    "evidence": "Visual verdicts in README section 3 and results_inspection used qc_vessels.png; tolerates missing vessel files (impl:C).",
+    "recommendation": "Merge with evaluate.qc_figure and the qc_fine figure into one per-run QC figure."
+   },
+   {
+    "name": "run_xiangrui_i58.sh (one-command Xiangrui pair)",
+    "where": "scripts/run_xiangrui_i58.sh (74 lines); env W, R, DATA, HANDEDNESS=both|search, REUSE_PREP=0|1",
+    "what": "prep_subject.py --oct-mask auto --destripe on --skip-vessels -> register.py --oct-wm-bright auto -> viz_result.py -> qc_fine.py -> export_registration.py -> check_export_header.py. Then an inline python flips oct150_affine along array axis 2 in a symlinked work dir, register.py --no-mirror, qc, conversion back to the prep frame, export, header check, fig_handedness.py, and an inline summary.json.",
+    "classification": "dataset-specific",
+    "evidence": "27.6 min, peak 32 GB; reproduces R5 to 0.00 mm at the block corners (REPORT C.4). Hard-coded server path, file names, flip axis 2, OMP 8, busy check for other jobs.",
+    "recommendation": "Keep as the reproduction record for this pair. In the release, the other handedness should be an output of the search itself (best proper and best mirrored pose, refined and exported), and drivers should read a per-pair config."
+   },
+   {
+    "name": "DANDI drivers run_subject.sh and run_all.sh",
+    "where": "scripts/run_subject.sh (21 lines), scripts/run_all.sh (15 lines)",
+    "what": "Per-subject prep (if needed) + register.py --oct-wm-bright auto + viz_result.py, with DANDI BIDS paths and annotation flags. run_all.sh loops over 9 subjects with a hard-coded flip-angle mapping and first deletes work/I46/octv_vessels.npy (forcing an I46 re-prep).",
+    "classification": "dataset-specific",
+    "evidence": "Produced work/runs/I*_otsu (the v1 DANDI table). run_subject.sh hard-codes the polarity flag that register.py's default lacks (HANDOFF 10.6.2).",
+    "recommendation": "Replace with a manifest-driven benchmark runner (one entry per pair: files, spacing, optional annotations)."
+   },
+   {
+    "name": "recovery and one-off drivers",
+    "where": "scripts/recover_serial.sh, recover_serial_dandi.sh, rx2.sh, rx3.sh, tail_fixups.sh, chain_after_batch.sh, restart_xiangrui_first.sh, rerun_xiangrui_fixed.sh, run_xiangrui.sh, build_inspection.sh",
+    "what": "Kill/relaunch chains written during the 2026-08-20/21 freeze. The old Xiangrui prep+register (--min-overlap 0.5 in run_xiangrui.sh). The results_inspection bundle with a hand-written INDEX.md.",
+    "classification": "legacy/dead",
+    "evidence": "rx2.sh/rx3.sh relaunch the DANDI batch in the background (HANDOFF 10.6.2). run_xiangrui.sh is superseded by run_xiangrui_i58.sh but README section 5 still points to it. The INDEX.md slab size for I56 is wrong by about 3x (HANDOFF 6.14.2).",
+    "recommendation": "Delete from the release; keep in git history."
+   },
+   {
+    "name": "v1.1 run plans",
+    "where": "scripts/run_v11_i58.sh (R0-R7, R11), run_v11_regress.sh (R8-R11, V1_DIR snapshot), run_v11_polish.sh (R12-R14), run_v11_candeval.sh (R15), run_i58_handedness.sh",
+    "what": "Serial experiment chains with inline gate/summary reporters that produced the REPORT_I58_v11 runs.",
+    "classification": "legacy/dead",
+    "evidence": "All results recorded in REPORT sections 3, 6 and C.2-C.4. R15 candeval was never started (C.3). Hard-coded server paths and pre-declared criteria.",
+    "recommendation": "Archive with the report; not part of the released package."
+   },
+   {
+    "name": "v1.1 component test scripts (test_specimen_mask.py, test_destripe.py, test_fine.py)",
+    "where": "scripts/test_specimen_mask.py (183 lines: --work, --out, --ref, --T, --mri-tissue, --mri-clean, --configs, --fill-pockets, --fill-holes, --rim-required, --erode-mm, --n-workers, --core-mm, --eval-mask); scripts/test_destripe.py (156 lines: --work, --out, --axis, --ref, --n-workers, --save-stripe-field, --sigma-smooth-mm 0.48, --sigma-hp-mm 0.24, --target-mm, --resid-max 55); scripts/test_fine.py (108 lines, mirrors register.py fine flags)",
+    "what": "Standalone checks of the mask, destripe and fine stage on cached prep arrays, with PASS criteria.",
+    "classification": "tooling",
+    "evidence": "R0: mask Dice 0.9999993 vs the P1 reference, destripe 11/11 PASS on I58 and 9/10 on I46, fine P2 reproduction 0.1377. PASS bands are I58 numbers (17.5-18.6 cm3, x residual <= 55, P8 baseline Dice_FOV 0.627). test_specimen_mask duplicates qc_fine's MRI cleanup.",
+    "recommendation": "Turn the retained components (destripe, unified mask) into small synthetic unit tests with data-independent criteria; delete test_fine.py with fine.py."
+   },
+   {
+    "name": "parser branch scripts",
+    "where": "scripts/train_parser.py, parse_mri.py (--auto-polarity geometric cue, --invert), parse_oct150.py, eval_parser_maps.py, viz_parser.py, distill_oct_parser.py",
+    "what": "Train the U-Net on I46 labels, parse the MRI and OCT into class probabilities, evaluate, visualise, and cross-modal self-distillation of an OCT parser through T.",
+    "classification": "experimental-negative",
+    "evidence": "Need manual labels. parse_oct150.py and eval_parser_maps.py hard-code work/i46 and sys.path 'octreg'. distill_oct_parser.py hard-codes the I46 OME-TIFF path and needs oct_ves_dist48_z0. Distillation inherits the initial scale (HANDOFF 7.3.2).",
+    "recommendation": "Remove from the release (archive)."
+   },
+   {
+    "name": "v0 driver run_demo_i46.py with run_ablations.sh and summarize_runs.py",
+    "where": "scripts/run_demo_i46.py (352 lines; --scenario crop|whole, --features mixed|parser|mind|otsu|intensity|..., --vascular off|auto|own|ves_seg, --nonrigid on, hard-coded crop centre [-19, 24, 20]); scripts/run_ablations.sh; scripts/summarize_runs.py",
+    "what": "Pre-v1 monolithic I46 pipeline with parser-derived polarity, vessel variants and a non-rigid stage; ablation chain; summary for its result.json schema.",
+    "classification": "legacy/dead",
+    "evidence": "Superseded by register.py. 'mixed' features are not accepted by register.py. summarize_runs.py raises KeyError 'scenario' on v1 runs (HANDOFF A5.5). run_ablations.sh produced the feature ablation table still cited (HANDOFF 6.10.9).",
+    "recommendation": "Delete. If the feature ablation goes into the paper, re-run it with register.py on the benchmark pairs."
+   },
+   {
+    "name": "I46-only prep chain",
+    "where": "scripts/prep_i46.py, prep_vessels.py, prep_large_vessels.py, prep_oct_fine.py, prep_oct_vessels.py",
+    "what": "Old I46 cache builders: MRI tissue by a hard-coded valley search between intensities 15 and 28, OCT 12 um fixed spacing, Z = 627, slab window 100, tissue threshold 30, ves_seg at z offsets 0/66, oct24/oct12 levels, large-vessel subset, cached vessel density.",
+    "classification": "legacy/dead",
+    "evidence": "They read/write oct12_affine.npy, oct24.npy, oct_ves_dist48_z0/z66.npy, which prep_subject.py never writes; they fail on current work dirs (HANDOFF A5.6, 10.6.5).",
+    "recommendation": "Delete."
+   },
+   {
+    "name": "I46 validation suite",
+    "where": "scripts/oracle_cv.py, refine_validate.py, scale_probe.py, vessel_channel_refine.py, test_own_vessels.py, test_vessel_scales.py, test_soft_density.py, nonrigid_stage.py, analyze_oracle.py, profile_vessels.py, check_vesselness.py, label_offset.py",
+    "what": "Evidence scripts:\n- oracle affine and non-rigid fits to the manual annotations, cross-validated by vessel component;\n- scale profiles along the OCT axes;\n- vessel-channel design sweep with flip/permutation controls;\n- own vs DANDI vessel segmentation;\n- non-rigid ablation;\n- vessel appearance statistics;\n- shift profiles;\n- Frangi precision/recall;\n- label offset.",
+    "classification": "experimental-negative",
+    "evidence": "Produced the design evidence:\n- structural residual about 1.4 mm to the oracle;\n- held-out oracle f150 0.42;\n- NCC and Dice flat along the depth axis;\n- w=2 from the vessel sweep and no gain in the controls;\n- non-rigid +0.015 Dice (HANDOFF 6.10).\nAll need --parser outputs and old-prep files (oct_ves_dist48_z0, oct24, oct12_affine), so none run on current prep (A5.6). test_soft_density.py and label_offset.py hard-code work/i46 and run paths. GridDisp and the Adam/compose oracle loop are re-implemented in several of them.",
+    "recommendation": "Archive. Re-implement only what the paper needs (oracle residual, depth-scale profile, vessel control) as one analysis script over current prep outputs of the labelled benchmark pairs."
+   },
+   {
+    "name": "I46 reference-pose forensics",
+    "where": "scripts/find_reference_pose.py, find_reference_pose2.py, refine_author_init.py, analyze_candidates.py, diag_candidates.py, verify_top_hypothesis_fsraw_spr.json",
+    "what": "Manual-vessel-driven reference poses, the authors' affine.lta tried under six layout conventions, and candidate diagnostics.",
+    "classification": "legacy/dead",
+    "evidence": "Need ref_author_T.json and the authors' code checkout. refine_author_init.py hard-codes FreeSurfer c_ras and the 1280x1040x576 grid. analyze_candidates.py has a never-installed monkeypatch (A5.7). The authors' coarse placement remains 23 mm from ours, unresolved (HANDOFF 12).",
+    "recommendation": "Delete (the JSON is also kept in costantini_b0/reports)."
+   },
+   {
+    "name": "selftest_search.py",
+    "where": "scripts/selftest_search.py (56 lines); flags --work, --parser (required), --seed, --mirror, --noise 0.1, --n-rot 3000",
+    "what": "Cuts a synthetic block of known pose (optionally mirrored) out of the MRI features and checks that search + refinement recover it.",
+    "classification": "tooling",
+    "evidence": "The only end-to-end convention test in the tree. Hard-codes the I46 centroid [-6.8, 23.9, 16.0] and needs parser probability maps (HANDOFF 10.6.5).",
+    "recommendation": "Port into the release test suite as a data-independent synthetic test (random or two-class feature volume, known rotation, handedness, polarity)."
+   },
+   {
+    "name": "brainstem one-off scripts",
+    "where": "scripts/diag_xiangrui.py, diag2_xiangrui.py, test_polish.py, test_texture_mask.py",
+    "what": "Early I58 histogram and slice diagnostics; a z-scored intensity NCC polish; the local-std texture mask prototype.",
+    "classification": "legacy/dead",
+    "evidence": "Hard-coded work/xiangrui_I58bs and run paths. Cross-modal intensity NCC about 0.03 was useless (README section 3). test_texture_mask.py is superseded by specimen.py (and pure texture thresholding failed, HANDOFF 5.1.6).",
+    "recommendation": "Delete."
+   },
+   {
+    "name": "figure scripts",
+    "where": "scripts/fig_doc2.py (5-panel figures written to figures/fig_*.png; CASES hard-coded to I46/I55/I38/I56/I62 and xiangrui_I58bs_novasc), fig_doc.py (4-panel predecessor), fig_bs.py, fig_handedness.py (display threshold 1.0211*0.55), viz_pose.py, viz_region.py, viz_vascular.py",
+    "what": "Publication and inspection figures; the handedness side-by-side for I58.",
+    "classification": "tooling",
+    "evidence": "figures/fig_I38..I62 and fig_I58_brainstem.png exist. viz_pose.py, viz_region.py and viz_vascular.py need old I46 files (labels, oct_ves_dist48_z0, oct24). All use sys.path 'octreg' or relative paths from the server root. fig_pipeline.png has no generator.",
+    "recommendation": "Keep one manifest-driven publication-figure script (fig_doc2 logic); delete the rest."
+   },
+   {
+    "name": "archived code outside scripts/",
+    "where": "docs/v11/probe_scripts/{mask (p1_*.py), sim (p2_*.py), stripes (p3_*.py)}; docs/v11/p11/p11_unmerged_options.patch (octreg/octnorm.py, renorm_prep.py, make_exclusion_masks_i58.py, test_octnorm.py, test_prep_options.py, test_qc_options.py, run_p11_impl_i58.sh, prep_subject.py and qc_fine.py changes)",
+    "what": "Validated probe code ported into specimen/destripe/fine, and the unmerged P11 normalisation and cerebellum-exclusion options.",
+    "classification": "legacy/dead",
+    "evidence": "P11 normalisation: no measurable benefit at P_R5. Exclusion: the pose jumps 6.5-8.2 mm into a basin with worse body boundary agreement (REPORT C.4).",
+    "recommendation": "Keep as archive only; do not merge."
+   },
+   {
+    "name": "DUPLICATE: sectioning-artefact and bias normalisation",
+    "where": "common.oct_slab_normalize (axis 0, multiplicative, window = 1200 um / spacing); destripe.destripe_inplace (detected axis, additive, 0.48/0.24 mm); features.otsu_two_class_lowmem (10 mm local-mean flattening, MRI only); fine.flatten_masked (3 mm, both sides, fine stage only); specimen texture field normalised by a local mean; P11 octnorm (archived); float16 gain 16384 with CAP_F16 declared in both common and destripe",
+    "what": "Five-plus mechanisms remove intensity trends or periodic artefacts, each with its own scale and axis assumption. On I58 slab normalisation (wrong axis) and destripe both run in sequence.",
+    "classification": "dataset-specific",
+    "evidence": "P3/P11: axis-0 slab correction removes 1.5 % on I58, and alternatives change the local objective by <=0.0004. Destripe changes the I58 pose 0.35 mm / 1.4 deg. The OCT two-class map gets no flattening while the MRI map does (register.py L91 vs L120).",
+    "recommendation": "One per-modality normalisation: (i) OCT sectioning flat field along the detected axis, a no-op when undetected; (ii) one bias flattening in mm applied identically to OCT and MRI before the two-class split."
+   },
+   {
+    "name": "DUPLICATE: foreground and specimen masks",
+    "where": "prep raw 0.5*Otsu slab threshold (L143); common.oct_tissue_mask (peak-walk + closing + fill + largest CC); specimen.oct_specimen_mask + want_texture/choose_oct_mask band; oct150_mask_core.npy; octv_mask.npy (nearest); MRI tissue mask (threshold only, prep L95); qc_fine.clean_mask (repeated in test_specimen_mask.py); fine m_spec / valid_o erosion / exclude_fov rind; qc_fine valid2, face margin, FOV margin; register.py adaptive overlap gate as a mask-mismatch compensator; parse_mri.tissue_mask (Otsu); prep_i46 fixed intensity valley; run_demo parser tissue probability; destripe statistics mask (2 mm erosion, test_destripe fallback loop 2->1->0.5 mm)",
+    "what": "More than ten masks for tissue, specimen, validity and field of view, with different thresholds, morphology in voxels or mm, and cleanup rules.",
+    "classification": "dataset-specific",
+    "evidence": "All documented failures are mask failures on one side: I61 and DANDI I58 bath (MRI), I58 brainstem agarose (OCT), I58 MRI boundary holes (qc_fine). The masks drive the search template, the overlap gate, the Otsu statistics and QC (HANDOFF 5.1.6; REPORT 2.1, 4.2).",
+    "recommendation": "One mask module: foreground(volume, spacing) -> cleaned mask plus confidence/failure flag, used identically for MRI and OCT; one validity mask for missing data (zeros); all derived erosions in mm from these two."
+   },
+   {
+    "name": "DUPLICATE: polarity and handedness handling",
+    "where": "Polarity:\n- register.py --oct-wm-bright auto (whole structural stage twice);\n- --mri-wm-bright (manual);\n- fine.polarity_guard (tile sign of raw NCC);\n- the --init-transform polarity evaluation (register.py L172-181);\n- parse_mri.py --auto-polarity (geometric cue);\n- run_demo_i46.py parser-derived polarity.\nHandedness:\n- search mirrored rotation copies (search.py L125);\n- refine.MIRROR flag;\n- --no-mirror plus an inline oct150_affine flip in run_xiangrui_i58.sh and run_i58_handedness.sh;\n- layout_affine determinant convention vs the NIfTI header determinant;\n- export composition.",
+    "what": "Two discrete ambiguities, each handled by several unrelated mechanisms.",
+    "classification": "core-general",
+    "evidence": "Polarity decidable only after refinement (I46 0.7564 vs 0.7300 while the search prefers the wrong one). Handedness undecidable on I58: class NCC 0.1241 vs 0.1132, and another mirrored pose scores 0.1358. The other candidate has the better outline (1.57 vs 2.02 mm) (REPORT C.4). The mirror branch is required on DANDI (6/9 mirrored).",
+    "recommendation": "One search over the four hypotheses (handedness x relative polarity), refining the best candidate of each and reporting all four scores and margins in result.json; delete the flag- and frame-level workarounds."
+   },
+   {
+    "name": "DUPLICATE: pose-difference metrics and convergence criteria",
+    "where": "evaluate.transform_diff (fixed 7 mm cube; rotation broken for mirrored poses); fine.pose_move / block_corners / rotation_deg / point_disp_stats; register.py structural restarts (<0.5 mm, 7 mm cube); vascular restarts (<0.3 mm, 7 mm cube); fine restarts (<0.3 mm, block corners); register.py distinct runner-up (2 mm / 5 deg); search NMS (3 mm / 10 deg); regress.py G4 (transform_diff)",
+    "what": "Several distance definitions and thresholds for 'same pose'.",
+    "classification": "tooling",
+    "evidence": "The 7 mm cube under-reads the I58 block's rotation by about 3x; 41 invalid rotation fields in result.json (REPORT 2.3; HANDOFF 6.14.1). Block corners are computed in at least five places (register.py twice, search, refine, fine, qc_fine, test_fine).",
+    "recommendation": "One pose metric: mean and max displacement over the OCT mask points (or block corners), plus the polar-factor rotation of T1 inv(T2) with a handedness check; one convergence tolerance defined relative to the target grid."
+   },
+   {
+    "name": "DUPLICATE: QC figures, summaries and reporters",
+    "where": "Figures:\n- evaluate.qc_figure (qc_oct_space.png);\n- viz_result.py (qc_vessels.png);\n- qc_fine.py (qc_fine.png, qc_fine_landscape.png);\n- specimen.mask_qc_png;\n- test_specimen_mask.fig3 and the test_destripe figure;\n- fig_doc.py, fig_doc2.py, fig_bs.py, fig_handedness.py.\nTables:\n- summarize.py;\n- summarize_runs.py (broken);\n- regress.py;\n- inline python summaries in run_xiangrui_i58.sh, run_i58_handedness.sh, run_v11_polish.sh (fine_report), run_v11_regress.sh (gate_report), run_v11_candeval.sh;\n- build_inspection.sh INDEX.md.",
+    "what": "Every stage and experiment added its own figure and table code.",
+    "classification": "tooling",
+    "evidence": "Each reported table and figure comes from a different one of these (README section 3, REPORT 3.2, 6, C.4).",
+    "recommendation": "One per-run QC figure plus one benchmark table and figure generator over a manifest of pairs."
+   },
+   {
+    "name": "DUPLICATE: low-level helpers",
+    "where": "Pooling:\n- common.avg_pool_iso;\n- common.pool_mean_np + pooled_affine;\n- specimen.pooled_affine_np + _pool;\n- register.py MRIFeatures.pooled/region;\n- fine.Level.\nResampling:\n- common.resample_to_grid (torch);\n- specimen.grid_coords + map_coordinates;\n- export_registration.resample (scipy);\n- prep vgrid and the octv_mask nearest code, written twice inline.\nErosion:\n- specimen.erode_mm;\n- fine.erode_ball and fine.erode_vox;\n- qc_fine inline EDT;\n- test_destripe binary_erosion.\nOther copies:\n- ball() twice (specimen, qc_fine);\n- largest CC twice (common, specimen);\n- Gaussian blur in synth.gaussian_blur3d, fine.gauss3d and features._gauss_deriv_kernels;\n- MI-32 twice (fine.MI32, qc_fine.mi32);\n- Rodrigues/perturbation three times (common, fine, qc_fine);\n- landscape peak finder twice;\n- stretch_ijk in register.py, fine.py and scripts;\n- GridDisp twice (nonrigid, refine_validate);\n- Adam/compose oracle loops in oracle_cv, refine_validate, find_reference_pose(2), refine_author_init.",
+    "what": "Utility code written again in each stage and script.",
+    "classification": "tooling",
+    "evidence": "Function-usage map from grep over octreg/*.py and scripts/*.py (this audit).",
+    "recommendation": "Consolidate into common image and geometry utilities when cutting the release package."
+   },
+   {
+    "name": "Hard-coded dataset-specific constants and heuristics (inventory)",
+    "where": "common.py L181 (slab defaults 30/100 = I46); prep_subject.py:\n- L144 window = 1200 um / spacing_z;\n- L143 raw threshold 0.5*Otsu on [::4,::8,::8];\n- L32 layout 'SPR';\n- L133 4-D squeeze rule;\n- L136-137 sidecar axis reversal;\n- L158 DIAG_ERODE_MM 2.0;\n- L52 mask core 2.0 mm;\n- L284 Frangi sigmas in um;\n- L296 top 1 %;\n- L324-325 ves_seg z=0;\n- L64 label permutation.\nspecimen.py:\n- L27-33 mm constants tuned at 0.04 mm on I58;\n- L295 ratio 1.5;\n- L298 band 0.5-1.75.\ndestripe.py:\n- L87 hp_sigma_vox 3 and ratio 0.8;\n- L112 60-plane detrend;\n- L181 sigma 0.48/0.24 mm;\n- clip floor 1.0.\nfeatures.py:\n- L51 blur 1 voxel;\n- L60 sigmoid 0.25*std;\n- L69 flattening 10 mm, pool 4.\nvascular.py:\n- L26 median window 1.35 mm;\n- w/reg/clamp chosen on I46.\nregister.py:\n- L33 --oct-wm-bright 'no';\n- L34 MRI GM bright;\n- L122 LEVELS;\n- L134 gate 0.8/0.15;\n- L227 restart ranges;\n- L231 0.5 mm;\n- L272-276 vascular restart ranges;\n- L43-45 gate thresholds.\nfine.py:\n- L75-84 defaults;\n- L312 guard 0.60/0.40/0.05;\n- L657-671 gates.\nqc_fine.py:\n- L37 deep end 'z+';\n- L65 1 mm3 components;\n- L77 face margin 3 voxels.\nevaluate.py:\n- L72 7 mm cube;\n- L58 label coding.\ncheck_export_header.py: --box 7.\nexport_registration.py: --mri-in-oct-mm 0.08.\nregress.py: TOL tables.\nfig_handedness.py: 1.0211*0.55.\nselftest_search.py: I46 centroid.",
+    "what": "Constants whose value was set on one subject or one resolution, or that encode an axis or protocol assumption.",
+    "classification": "dataset-specific",
+    "evidence": "The origin of each value is recorded in the docstring or comment next to it:\n- I46: slab window, polarity default, vessel weight, gate drop 0.027;\n- I58 probes P1/P2/P3/P8: mask, stripe and fine constants, deep end, core 2 mm;\n- 20 um data: check box 7;\n- I58 MRI spacing 0.08 mm: export grid.\nThe window formula is contradicted by measured periods; the polarity default is contradicted by 7 of 9 DANDI subjects; the auto mask rule never fires on uncropped MRI (evidence in the items above).",
+    "recommendation": "Derive each value from the data (period, axis, spacing) or state it as a physical quantity with a reason; keep the few remaining ones in one documented configuration, not in function defaults and script bodies."
+   },
+   {
+    "name": "Stale documentation and known bugs still in the tree",
+    "where": "README.md (sections 4/6 cite non-existent scripts/validation_i46 and scripts/legacy; section 5 points to superseded run_xiangrui.sh); octreg/__init__.py docstring; common.oct_tissue_mask docstring ('Otsu'); prep_subject.py docstring ('outlier-robust Otsu' MRI mask; oct150_mask_core 'no reader'); evaluate.py docstring (I46 pair); register.py docstring ('octreg v1'); prep_subject.map_labels_to_grid; evaluate.transform_diff rotation; per-chunk Frangi gamma defaults; prep_subject.py L202 destripe divisibility SystemExit; destripe clip floor 1.0; mixed prep provenance",
+    "what": "Documentation that no longer matches the code, and defects affecting evaluation or generality.",
+    "classification": "legacy/dead",
+    "evidence": "HANDOFF A5.3, 6.14.1, 7.2.5, 7.2.9; impl:C open item 4. Server check: I46 prep.json dated 2026-08-20 10:04 with v1-only keys and octv level ~100, vs I55 octv ~14k with the gain. R8 re-ran register.py bit-identically only from the stored preps.",
+    "recommendation": "Fix in the release cut. Regenerate every benchmark prep with one tagged code version and record the git hash in prep.json and result.json."
+   },
+   {
+    "name": "Minimal code path that reproduces the reported results",
+    "where": "DANDI table (README section 3; REPORT 6):\n- prep_subject.py --work work/S --mri ... --oct ...ome.tiff [--labels-wholehemi --labels-ba --mri-vessels --oct-vesseg];\n- register.py --work work/S --out work/runs/S_otsu --oct-wm-bright auto (defaults: otsu, 8000 rotations, mirror, vascular on/auto, fine off);\n- viz_result.py; summarize.py.\nXiangrui I58 (REPORT C.4): run_xiangrui_i58.sh =\n- prep_subject.py --oct-mask auto --destripe on --skip-vessels;\n- register.py --oct-wm-bright auto;\n- qc_fine.py; export_registration.py; check_export_header.py;\n- mirror frame via inline affine flip + register.py --no-mirror;\n- fig_handedness.py.\nNegative results: register.py --fine on [options] + regress.py (run_v11_regress.sh, run_v11_polish.sh).",
+    "what": "Package functions actually executed on the DANDI path:\n- common: loaders/affines/resample/pool, oct_slab_normalize, histogram_tissue_threshold, oct_tissue_mask, layout_affine, save_nifti, write_json, lta_text;\n- specimen: want_texture, choose_oct_mask, mask_qc_png, erode_mm (no texture);\n- features: otsu_two_class, otsu_two_class_lowmem, frangi_gamma, frangi_dark_vesselness, sym3x3_eigvals;\n- synth.gaussian_blur3d;\n- search.FFTSearcher; refine.Refiner/compose/params_from_matrix;\n- vascular: mri_dark_channel, density_on_grid, vascular_refine, frangi_chunked;\n- evaluate: all four functions;\n- fine: mri_box, block_corners, pose_move (vascular gate only).\nOn I58 add specimen.oct_specimen_mask and destripe.detect_stripe_axis/destripe_inplace; vascular and fine are not executed.\nNever needed for any reported number: parser.py, nonrigid.py, synth.py except gaussian_blur3d, features.mind_ssc/parser_features/build_features, and about 50 scripts. The I46 validation numbers (oracle, scale profile, vessel sweep) come from legacy scripts on the old I46 prep chain and cannot be regenerated with the current prep outputs.",
+    "classification": "core-general",
+    "evidence": "Server result.json args: all reported runs use features otsu, oct_wm_bright auto, crop_centre None, n_rot 8000. R8/R9 reproduce I46/I55 bit for bit from the stored preps (0 FAIL of 26). The one-command I58 run reproduces R5 to 0.00 mm from the raw NIfTIs. The stored DANDI preps predate the current prep_subject.py (I46 without gain) and were not regenerated.",
+    "recommendation": "Release pipeline:\n1. header-aware loader;\n2. one sectioning flat field;\n3. one foreground mask with a failure flag;\n4. identical flattened two-class maps;\n5. FFT search over rotation x handedness x polarity;\n6. rigid -> similarity -> affine with a stated scale prior;\n7. boundary-agreement QC and search margins;\n8. export in the input frames.\nVessels optional; fine, parser and nonrigid archived. Then re-prep and re-run every pair (I38, I46, I48, I55, I56, I57, I58 DANDI, I61, I62, Xiangrui I58) from raw files with one tagged version, and report failures (I57, I61, DANDI I58, I48) alongside successes."
+   }
+  ],
+  "open_questions": [
+   "Can the current prep_subject.py regenerate the stored DANDI preps? The I46 prep (2026-08-20 10:04, no float16 gain, v1-only keys) predates later prep edits. R8/R9 only re-ran register.py on the stored arrays, so an end-to-end rerun from raw OME-TIFFs has not been done for any DANDI subject.",
+   "Should the OCT two-class map be bias-flattened like the MRI map (features.otsu_two_class vs otsu_two_class_lowmem)? The asymmetry has never been ablated.",
+   "Can destripe (detected axis) replace oct_slab_normalize on DANDI? The I46 detector is decisive on axis 0 with a 0.39 mm period, but destripe was never applied to a DANDI registration. As written, --destripe on would stop with SystemExit on 14 um spacing (I55); this was worked out from the code, not observed.",
+   "Is the texture specimen mask usable beyond agarose-embedded blocks? On I46 it keeps 0.28 of about 0.68 cm3. Its auto rule compares against the whole MRI tissue volume, so it cannot trigger on uncropped MRI. What data-internal criterion should replace it?",
+   "Does the vascular stage help on any pair other than I46/I55? I38/I56/I62 have no vessel annotation inside the block, it is harmful on the I58 brainstem, and the section-phase gate has never been exercised on any prep.",
+   "Does qc_fine boundary agreement track accuracy on the labelled pairs? It was never run on I46/I55, yet it is the main label-free evidence for I58 and for the handedness comparison.",
+   "After map_labels_to_grid is fixed, do the Dice values and 'correct' verdicts for the six 0.12 mm subjects (I38, I48, I56, I57, DANDI I58, I61) change? Every current number for them uses mis-paired labels.",
+   "What causes the I57 failure (healthy MRI mask, block possibly two pieces)? Would requiring each OCT connected component to land on tissue fix it?",
+   "For DANDI OME-TIFF blocks without a world frame, can handedness be stated physically at all? For NIfTI OCT, should the header orientation be trusted, which would make the reported I58 pose a mirror image?",
+   "Should --oct-wm-bright auto become the default (7 of 9 DANDI subjects plus the brainstem need wm_bright True, and all reported runs passed auto explicitly), and --mri-wm-bright be removed as redundant under relative-polarity search?",
+   "Which, if any, of the I46 validation experiments (oracle residual, depth-scale profile, vessel control) must be re-implemented on current prep outputs for the paper? The existing scripts cannot run without the old I46 cache (oct12_affine, oct24, oct_ves_dist48_z0)."
+  ]
+ },
+ "judge_simplicity": {
+  "scores": [
+   {
+    "design": "minimal",
+    "score": 8.5,
+    "strengths": "It asks the least of a reader. The pipeline is 8 steps with 15 constants in one frozen Params, each with unit and provenance, and there are no CLI flags for method behaviour. The public surface is `octreg register OCT MRI -o OUT` plus `octreg apply`, with 5 options. `--params` exists only for ablations and marks the run nondefault_params. That replaces 49 register and 27 prep flags with one obvious entry point.\n\nThe best engineering idea in any of the three designs is treating polarity as the sign of the score. I checked features.py L51-65 and search.py L95-112. Once the OCT channels are made u and 1-u (not multiplied by the mask), NCC_w(1-u, v) = -NCC_w(u, v). The MRI-side variance floor and the template variance do not change when the channels are swapped. So one FFT pass yields all four hypotheses (handedness x polarity). This removes the 2x cost of `--oct-wm-bright auto` and the 5 polarity mechanisms, and tests/test_duality.py can pin it to 1e-5.\n\nIt also:\n- drops restarts, the vascular stage, the fine stage and the texture mask, so there is less code and less compute;\n- sets the fine level to h = max(0.15 mm, MRI voxel), which cuts the 0.12 mm pyramids;\n- has clean boundaries: params / io / geometry / normalize / features / search / refine / pipeline / qc / cli, about 1,400 lines, with evaluation and label repair confined to bench/;\n- has strong tests: synthetic pose x handedness x polarity x spacing recovery, a mirrored-pose test for pose_distance, a stripe detector no-op, and oblique det<0 frames;\n- has disciplined migration: archive tag first, pre-declared deletion rule R9 (fewer steps wins ties) and revert rule R10, Stage-0 evaluation repair before any registration, a sha256 manifest, and a serial queue with a 55 GB watchdog;\n- has a realistic cost: core benchmark about 6 h, total about 70 h;\n- has a documentation plan that fits a journal and a new user: method.md of about 1,500 words with a parameter table, generated benchmark tables with failures in the same table, data cards, negative_results.md, decisions.md, and a README that says what each flag means and what to do.",
+    "fatal_or_major_problems": "1. Too many untested changes land in one release candidate. Unmasked OCT channels, OCT-side flattening, the h rule on 0.12 mm MRIs, the no-largest-component cleanup applied to the MRI as well, per-hypothesis top-12, rho 0.8 instead of 0.85, header frames and divide-form section gain all change together. A regression on I46/I55 cannot be attributed to one of them, and A10 reverts run only after a failure. Land them as a staged sequence, with a regression check against the stored v1 transforms after each change.\n2. There is no automatic 'undecided' rule. Gaps are reported but never interpreted, so a new user gets numbers without guidance, and I48-type ties go out looking like normal results.\n3. Agarose OCT and bath MRI are handled only by a user-supplied mask. That keeps the method simple but moves the work to users. The brainstem relies on the rho gate with an over-inclusive mask (v1 did this successfully).\n4. Step 3 (section gain at native resolution) uses a foreground threshold defined in step 2 at h, so the order of these two steps needs spelling out.\n5. Two budget items are hard to justify: 22 h of ANTs on whole hemispheres and 15 h of A13 seeds. Trim them or limit them to 3 pairs.\n6. The 'keep all components >= 1 %' rule on the MRI may keep bath fragments. They are flagged but not removed."
+   },
+   {
+    "design": "robust",
+    "score": 5.5,
+    "strengths": "It has the best user-facing semantics:\n- status OK / AMBIGUOUS / UNRELIABLE with reason codes;\n- a decisions[] audit trail in result.json;\n- docs/statuses.md telling the user what to do for each reason;\n- every discrete ambiguity exported as a ranked alternative in the input frames.\n\nOther strengths:\n- Using --init to restrict the same search, instead of skipping it, is the right single prior mechanism.\n- The deterministic super-Fibonacci grid makes bit-identical reruns (A7) achievable.\n- Anti-aliased resampling removes the integer-factor bugs (the 14 um SystemExit and round(12.5)).\n- Vessels are isolated in an extras/ module that the core never imports.\n- The phantom tests are the most thorough of the three: dark bath, bright bath, textured agarose, all-tissue crop, two-piece specimen, a non-separable case that must fail, and a mirror-symmetric phantom that must come out AMBIGUOUS.\n- Parameters.md is generated from config.py, and every figure caption carries a git hash.\n- Acceptance A2 ('no silent wrong pose') is the right goal.",
+    "fatal_or_major_problems": "1. Too many concepts and parameters for a methods reader to hold:\n   - an invalid-voxel mask;\n   - h_s adjusted by extent/12 and by a 600^3 cap;\n   - a log-domain two-level normalised-convolution flat field;\n   - a 2-D GMM foreground (intensity plus 40 um directional texture) with border-shell enrichment E, Bhattacharyya distance and an all_tissue_fov state;\n   - Ashman's D with a leave-one-subject-out threshold;\n   - a covering-angle rotation rule depending on R_g;\n   - RMS-displacement NMS;\n   - a MAD-based z_search;\n   - a spatial jackknife with block-size and merge rules, z >= 3 and B >= 8;\n   - scale identifiability profiles, per-component coverage, header consistency, auto-enabled boundary agreement;\n   - three statuses plus warnings.\n   config.py is about 120 lines; the claimed 1,600 package lines are optimistic.\n2. It re-introduces corpus-fitted thresholds: Ashman D and coverage calibrated on n = 9 DANDI subjects. That is the dataset-specific tuning the user wants removed, and A2/A3 tie release success to unproven QC.\n3. The highest migration risk. Foreground, rotation grid, NMS metric, flat field and decision layer are all rewritten at once, and none of them has been run on DANDI.\n4. The largest compute bill. The 6 deg covering grid means about 33k orientations per handedness on I38/I57, roughly 4x the v1 search (I57 v1 was 1,010 s per polarity). Texture features run on every volume, and the queue is about 90 h. Its own A9 runtime target is likely to fail, and the fallback (a cap at 16k) becomes one more rule.\n5. The spatial jackknife over correlated blocks may be miscalibrated in either direction. The 'robust' layer could end up flagging correct pairs or passing wrong ones."
+   },
+   {
+    "design": "publication",
+    "score": 6.5,
+    "strengths": "The strongest documentation and presentation plan:\n- METHOD.md, conventions.md, benchmark.md and limitations.md;\n- tables T1-T5 and 7 figures, all generated by bench/report.py, with no hand edits;\n- a human visual sign-off CSV, which fixes the problem of verdicts read by an AI from figures;\n- explicit honesty rules (report confirmed/unresolved/failed counts, restarts described as basin width, no absolute NCC threshold, prior-free claims limited to DANDI).\n\nOther strengths:\n- Module split (io / grid / normalize / foreground / structure / search / refine / pipeline / qc / config / cli) is clean, under 1,800 lines.\n- Ablations are YAML config diffs, never code branches.\n- Relative clamps remove fine._DeltaRefiner.\n- Tests include an autograd-vs-finite-difference check and an export test ported from check_export_header.\n- Manifest with sha256 and a pinned dandiset version; serial queue with a watchdog.\n- E0 evaluation repair comes first.\n- Pre-registered config and thresholds; baselines cover ANTs, NiftyReg, MIND, the authors' affine, and v1.1 as shipped.\n- A11 decides the vessel question with the corrected spacing instead of by assertion.",
+    "fatal_or_major_problems": "1. The decision rule is not sound. Basin sigma is the std of refined NCC over 12 restarts that return within 1 mm. Converged restarts give sigma near zero, so almost any gap passes 3 sigma. Stable wrong basins (I61 and DANDI I58 at 12/12) would come out 'decided', and the claimed 'I48 undecided' does not follow from this rule. It also keeps the 12-restart machinery that the evidence says is anti-correlated with correctness, which adds a concept and compute.\n2. The foreground estimator is a cascade (valley, then GMM, then texture for OCT without a valley). That is a hidden mode switch, and the texture branch has only been validated on I58.\n3. It does not exploit the score-sign duality. Polarity is searched as separate swapped-channel hypotheses with top-24 each, so search cost stays about 2x.\n4. The override surface (--config, --set key=value, and a data card holding a 'corrected' I46 spacing) makes per-pair tuning easy; it is policed only by acceptance criterion 6.\n5. Acceptance pre-specifies outcomes: brainstem handedness 'must be undecided'.\n6. The synthetic target (>= 95 % within 0.3 mm) is drawn from the same MRIs.\n7. Baseline compute is optimistic: ANTs with 48 multi-starts on a whole 0.12 mm hemisphere at about 1 h per pair on CPU. The about 4-5 day serial plan will likely overrun."
+   }
+  ],
+  "must_have": [
+   "One obvious entry point: `octreg register OCT MRI -o OUT` (<= ~6 options: spacing for header-less TIFF, optional masks, optional prior, device, seed) plus `octreg apply`. All method constants live in one frozen, documented Params/config with a unit and provenance for each; any override is recorded and marks the run nondefault.",
+   "Relative polarity obtained as the sign of the score in the same FFT pass (make OCT channels u and 1-u, unmasked; the weight carries support). Handedness searched as a discrete branch. Every run refines and exports the best candidate of every hypothesis. A CPU unit test asserts that swapping channels gives score -S.",
+   "The same mm-based two-class function applied to both modalities, and one foreground function applied to both. The foreground function returns an explicit status and never silently keeps everything. No largest-component rule. Kept or deleted according to a pre-declared ablation, not by default.",
+   "At most one sectioning step: detected axis and measured period, recorded no-op when nothing is decisive, with a pre-declared deletion rule if an ablation on I46/I55/brainstem shows no effect.",
+   "The absolute scale prior and the rigid->similarity->affine ladder kept as the only pose-producing refinement, with clamp saturation written to result.json.",
+   "Outputs written directly in the input file frames: 4x4 in both directions, LTA/ITK, overlays in both grids, a hypothesis table. result.json records git hash, argv, params hash, input sha256, spacing source, per-stage runtime and peak RAM/GPU.",
+   "Clean split: the installed package contains only the method. Label mapping (fixed), metrics, random-pose null, baselines, ablations and the report generator live in bench/. Legacy code is preserved at an archive git tag before deletion.",
+   "Stage 0 before any method change: repair the label frame and re-score the stored v1 transforms, so every acceptance criterion references honest verdicts.",
+   "Staged migration: land each merged change as its own commit, with a regression check against stored v1 transforms on I46, I55 and the brainstem, so a regression can be attributed to one change.",
+   "Synthetic CPU test suite (< 5 min):\n- frames with an oblique det<0 header;\n- a pose_distance test with mirrored poses;\n- search recovery of pose x handedness x polarity x spacing error;\n- stripe detection and no-op;\n- foreground status on bimodal and unimodal inputs.",
+   "Benchmark infrastructure:\n- a manifest with sha256 and pinned dandiset version;\n- a strictly serial queue with a memory watchdog;\n- outputs under a directory keyed by commit hash on the server;\n- caching of preprocessing so ablations that change only search or refine reuse it;\n- a core benchmark that fits in about one serial day.",
+   "Documentation:\n- a paper-style method.md with a parameter table;\n- generated benchmark tables listing failures next to successes;\n- data cards for metadata facts;\n- a negative-results supplement with numbers;\n- a decisions log;\n- a short README explaining each flag or status and the user's next action;\n- all figures generated from run outputs and human-verified."
+  ],
+  "must_not": [
+   "No per-dataset or per-pair method flags or modes: no --oct-wm-bright, --no-mirror, --destripe, --oct-mask auto, and no auto switch keyed on whole-MRI volume ratios. Config overrides (--set key=value) must not become a per-pair tuning channel.",
+   "Do not ship the fine stage, the vascular channel in the core, the parser/synth, nonrigid, the MI landscape or MIND in the package. At most, vessels go in an isolated extras module that the core never imports.",
+   "Do not gate or declare correctness on restart counts, restart-NCC spread, absolute NCC, raw top1/top2 margins, or thresholds fitted to the same few pairs they are evaluated on (for example LOSO-calibrated Ashman D on n = 9).",
+   "Do not derive a 'decided/undecided' noise scale from converged restarts, which gives sigma near zero in stable wrong basins.",
+   "No silent fallbacks: foreground, spacing, 4-D squeeze, header orientation.",
+   "Do not land all merged changes (foreground rewrite, OCT flattening, unmasked channels, new grid/NMS, flat field, header frames) in one untested release candidate.",
+   "Do not grow the search budget (for example covering-angle grids of 33k orientations per handedness) or add texture features on every volume without a measured accuracy gain; either could multiply benchmark cost on the 62 GB / one-GPU server.",
+   "Do not run two heavy jobs in parallel, copy volumes or caches to the local Mac, or overwrite the old prep caches.",
+   "Do not keep label/annotation mapping inside prep or registration, or report any Dice for the 0.12 mm subjects before the frame repair.",
+   "Do not pre-specify experimental outcomes as acceptance criteria (for example 'brainstem handedness must be undecided'), and do not hand-edit figures or use AI-read figures as verdicts.",
+   "Do not keep package code that no reported number exercises, or leave stale README pointers to superseded scripts."
+  ]
+ },
+ "judge_evidence": {
+  "scores": [
+   {
+    "design": "minimal (octreg 1.0 minimal core: two-class maps, one exhaustive search over pose x handedness x polarity, one prior-bounded affine ladder)",
+    "score": 7.5,
+    "strengths": "It changes the least evidence, and the changes it makes are ones that can be checked.\n\n- **Search, ladder and scale prior** are kept almost unchanged: the prior at 2 with clamp 0.15, the ladder, and the adaptive overlap gate (0.8·min(1,V_M/V_O) gives 0.37 on the brainstem crop, matching v1's 0.369).\n- **Polarity duality is correct.** I checked it at db2282e: the OCT channels are [s·m, (1−s·m)·m] (features.py L51-65), and the search and refiner score the mean channel-weighted NCC. Swapping the OCT classes therefore negates the score exactly when the mask is binary. One search pass gives all four hypotheses, the same candidates as v1's two-pass auto mode at half the cost. It also correctly notes that the MRI second channel carries the outline, which explains the brainstem channels [-0.017, 0.220].\n- **Sectioning step reproduces v1.** A window of 3 measured periods gives the current windows on I46 (100 slices = 3.03P) and I56 (34 = 2.83P), and moves the step to axis 2 on I58. On DANDI subjects sectioned along axis 0 it should reproduce v1 prep, and it is a recorded no-op when the axis is not decisive.\n- **Foreground threshold is unchanged from v1.** No regression on the six MRIs with a valley or on I55's fallback. The fail-open case gets a flag.\n- **Unvalidated steps can be deleted.** Rule R9 deletes OCT flattening (A1), the sectioning gain (A3) or the extra ladder stage (A6) if they are not needed. Rule R10 reverts each merged step on its own if it breaks I46, I55 or the brainstem.\n- **Useful evidence experiments:**\n  - A11 oracle-foreground ablation on I56, I57, I61 and DANDI I58 separates mask failures from objective failures;\n  - A12 spacing variants decide whether the vessel depth-scale result is really a metadata error;\n  - a random admissible-pose null.\n- **Evaluation and scope.** Stage 0 label-frame repair runs before any verdict. I58 at 30 deg is an extra row. Restarts, absolute NCC and margin are never used as gates, with the right counterexamples (I61 and DANDI I58 at 12/12, I62 at 0.28, I55 margin 1.004). The loss of the I46 vessel-level result is said openly, and the release claim is scaled down to match.",
+    "fatal_or_major_problems": "1. **No 'undecided' output.** Ambiguity is only raw gaps and flags. I48 polarity (gap 0.008) and brainstem handedness (0.1241 vs 0.1132) both get a confident chosen transform with no decided/undecided state.\n2. **Flags have poor discrimination on existing pairs:**\n   - foreground_no_valley fires on I55 (confirmed correct) and I56 (header check puts it 0.4 mm from its BA box) as well as on I61 and DANDI I58;\n   - nothing fires on I57 (wrong) or I48;\n   - clamp_saturated catches I38 but not I46, whose structural depth is 1.026 because the prior holds it. The wrong I46 depth sidecar stays invisible; there is no scale-identifiability check.\n3. **Brainstem hypothesis flip is not foreseen.** Keeping candidates per hypothesis and choosing by highest refined S can surface the known mirrored pose. REPORT C.4: register.py's own 0.15 mm objective scores a mirrored pose with 5.4 % shrink, 30.6 mm away, at 0.1358, above R5's 0.1241. In the v1 search it survived top-8 at 0.6 mm and was dropped only at the joint keep-3 step. Choosing on raw S rather than the penalised loss v1 used may flip the Xiangrui answer. R4 would catch it but gives no rule for it.\n4. **Foreground failures are not fixed.** I61, DANDI I58 and agarose OCT against an uncropped MRI are left to user-supplied masks, which is per-pair manual work.\n5. **Changes with no regression evidence yet** (R10 covers them, but they are unmeasured):\n   - MRI resampled to 0.15 mm on the six 0.12 mm subjects (v1 levels 0.6/0.24/0.12);\n   - MRI mask cleanup;\n   - removing the largest-component rule (motivated only by the I57 hypothesis);\n   - OCT channels no longer multiplied by the mask.\n6. **The --init/prior search is removed** even though the PI says a position prior exists. Cropping the MRI file is the only substitute, and capture range is not measured.\n7. **R4 is loose** (1.5 mm and 15 deg of either reference)."
+   },
+   {
+    "design": "robust (octreg 2: every automatic choice measured, recorded with its margin, allowed to be undecided or unreliable)",
+    "score": 6.5,
+    "strengths": "Best at reporting ambiguity and failure, and several of its rules target exact known cases.\n\n- **Per-block jackknife noise scale.** z for polarity, handedness and distinct runner-up is a real within-specimen noise scale. It should plausibly leave I48 polarity and brainstem handedness undecided and I55 decided, and every hypothesis within z<3 is exported.\n- **Per-axis scale identifiability profile.** It would report the I46 depth axis as not identifiable (dNCC 0.021 across 0.85-1.30) instead of hiding it; clamp saturation catches I38.\n- **Foreground status replaces the silent keep-everything fallback.** The rule set is ok / all_tissue_fov / failed, plus a per-component coverage check that tests the I57 two-piece hypothesis. The all_tissue_fov status handles MRI crops logically.\n- **MRI contrast statistic** targets DANDI I58 at 10 deg; its threshold is set leave-one-subject-out and then frozen.\n- **Other logical necessities:** an invalid/padding voxel mask, and hard refusals (4-D input, missing spacing, inputs swapped).\n- **Validation plan:**\n  - A2 'no silent wrong pose';\n  - A3 'no confirmed pair becomes wrong';\n  - A4 foreground bounds, including I46 OCT ≥0.9x the intensity mask and brainstem ≤1.5x MRI;\n  - A8 sidecar vs 12/12/14 spacing;\n  - synthetic symmetric controls that must come out AMBIGUOUS;\n  - an evidence bar for the vessel extension (V-VES: ≥2 subjects).\n- **Sectioning sigmas** derived from the period reproduce the I58 values (0.48/0.24 mm).",
+    "fatal_or_major_problems": "1. **Validated components on confirmed pairs are replaced by machinery with no evidence on any dataset:**\n   - **Joint GMM foreground for both modalities** (log intensity plus directional texture, border-enrichment background, Bhattacharyya ≥1.0, E ≥1.5). On I46 it replaces a peak-walk that works. Texture alone kept 0.28 of 0.68 cm3 there, and border enrichment is doubtful for cortex blocks whose OCT FOV faces cut through tissue. MRI texture at 0.12 mm has never been computed. A plain GMM is not the P1 recipe (watershed rim, pockets) that gave 18.05 cm3 on the brainstem.\n   - **Log-domain in-sheet flat field applied to DANDI by default.** Destripe has never run in a DANDI registration, and on I46 it failed its own 'other axes change <3 %' check.\n   - **Super-Fibonacci covering-angle rule.** It roughly doubles the search on I38 and I57 (about 33k orientations per handedness) with no evidence that finer sampling helps: I48 had plateaued by 4000 of 16000.\n2. **Many new thresholds with no provenance:** E 1.5, Bhattacharyya 1.0, coverage 0.7, V ratio 1.3, B ≥8, component 5 %, and an Ashman-D cut fitted on the same 9 pairs whose verdicts are themselves uncertain. Leave-one-subject-out on n=9 is weak.\n3. **No deletion rule for unvalidated steps.** If regression fails, it falls back to the old window instead of dropping the step.\n4. **A2 may be unachievable** (I57 has no diagnosed mechanism), with no plan for that case.\n5. **Same brainstem risk as the other designs.** Per-hypothesis retention plus choosing the winner on raw refined S can promote the 0.1358 mirrored 5.4 %-shrink pose over R5 (0.1241). The jackknife would call it AMBIGUOUS, but the primary transform would still flip.\n6. **Confirmed pairs could turn UNRELIABLE.** If the new foreground or contrast rules misfire, I46 or I55 become UNRELIABLE; A3 tolerates one.\n7. **About 90 h of queue.**\n\nOverall: the most general in intent, but the weakest on 'every kept component is supported by evidence', and the greatest risk of losing currently validated behaviour."
+   },
+   {
+    "design": "publication (octreg 1.0: search on two-class maps, 8-step paper design with data cards, baselines and pre-registration)",
+    "score": 5.5,
+    "strengths": "- **Strong, reviewer-oriented validation:**\n  - E0 label repair first;\n  - random-pose control (uniform plus rejected top-K);\n  - baselines ANTs, reg_aladin multistart, MIND in the same search, the authors' I46 affine, and v1.1 as shipped (which keeps the vessel result reproducible from the archive tag);\n  - ablations expressed as config diffs;\n  - pre-registered criteria;\n  - a human visual sign-off sheet replacing AI-read figures;\n  - an A11 test of whether correct I46 spacing recovers ves_seg ≤200 um without vessels.\n- **Core kept:** two-class maps, 4-hypothesis search, the ladder with an absolute prior, and the achievable-overlap gate (0.8·0.738 = 0.59 on the brainstem, matching v1.1).\n- **Boundary agreement gated by a data-internal rule:** less than 20 % of the OCT boundary on array faces.\n- **Foreground failure reported loudly.** Multi-piece blocks are allowed.\n- **Header affines**, with a data card for frame-less TIFF.",
+    "fatal_or_major_problems": "1. **The decided/undecided rule is ungrounded.** It uses sigma = std of refined NCC over restarts that return within 1 mm, which is optimiser noise inside one basin, not data uncertainty. It will be tiny, so the brainstem handedness gap (0.011) and I48 polarity (0.008) come out 'decided', contradicting the design's own acceptance criterion 3 (brainstem handedness 'undecided'). It is undefined when restarts do not converge (other-handedness candidate 1/12). It also keeps 12 restarts per hypothesis, although the evidence shows restarts carry no accuracy information.\n2. **Foreground rules would mis-decide on existing pairs:**\n   - the log-intensity histogram changes the valley threshold on all six healthy MRIs, with no regression evidence;\n   - the GMM fallback now decides I55, a confirmed pair that is correct under the v1 fallback;\n   - foreground_fail (V_MRI < 0.8·V_OCT) fires on the brainstem (13.32 < 0.8×18.05 = 14.44);\n   - the >0.9-of-FOV rule fires on I56 (0.989), which is likely correct;\n   - I61 (wrong) only gets 'uncertain', the same flag as I55 (correct).\n3. **Texture fallback is unverified on DANDI.** It runs whenever the OCT histogram has no valley, but OCT valley status was never checked on the 8 DANDI blocks. Where it fires it would cut cortex (I46: 0.28 of 0.68 cm3). A plain intensity+texture GMM is also not the validated P1 recipe.\n4. **Per-pair data card correction.** The I46 depth is set to 14 um using the sibling I55 and the oracle/authors' fits. That is a dataset-specific metadata fix, partly label-derived, feeding the main benchmark, and it contradicts 'zero per-pair config diffs'. It is also unclear whether the primary I46 run uses the sidecar or the corrected spacing.\n5. **New flat-field form never run anywhere:** in-plane fixed 0.5 mm Gaussian, divided and renormalised over 3 periods. It is neither v1 slab normalisation nor the destripe validated on I58, and there is no deletion rule.\n6. **Outline channel may be lost.** Structure maps are written as [p, 1−p] without saying the MRI channels stay multiplied by the MRI foreground, and that multiplication carries the outline that places the brainstem.\n7. **Grid inconsistency:** 'MRI keeps native grid' is stated next to a fixed 4h/2h/h pyramid.\n8. **Same brainstem risk:** per-hypothesis retention plus a raw-NCC choice can flip to the 0.1358 mirrored shrink pose."
+   }
+  ],
+  "must_have": [
+   "Stage 0 before any method decision: repair the label-to-MRI frame for the seven 0.12 mm subjects (map by array axes to the same-shape label file; for I57/I61 choose flips by label-on-tissue fraction). Re-score the stored v1 transforms. Use Dice restricted to labelled voxels plus BA-inside fraction. Set verdicts with a pre-declared random-admissible-pose null and human-verified figures. The success count and every calibration depend on this.",
+   "Keep the validated core behaviour unchanged unless a regression shows otherwise:\n- two-class soft maps with the MRI channels multiplied by the MRI foreground (the second channel carries the outline that places the brainstem);\n- 10 mm tissue-mean MRI flattening;\n- exhaustive FFT masked-NCC search over full SO(3) x {proper, mirrored} (mirror branch evidence: I46 0.7328 vs 0.6848; 6/9 DANDI poses mirrored);\n- relative polarity decided after refinement (the I46 search prefers the wrong polarity);\n- the rigid->similarity->affine ladder with the absolute scale prior (lambda 2, |log scale| and shear <= 0.15);\n- the achievable-overlap gate (0.8*min(1, V_MRI/V_OCT), which reproduces 0.369/0.59 on the brainstem and never binds on DANDI).",
+   "Implement relative polarity as the sign of the one score map. At db2282e the OCT channels are [s*m, (1-s*m)*m], so swapping them negates the masked NCC exactly for a binary mask. One search pass then yields all four handedness x polarity hypotheses. Refine and export the best transform of each hypothesis, with its score, in the input file frames.",
+   "Choose between hypotheses with the same penalised loss the refiner optimises (NCC plus scale prior), as v1's polarity choice did, not raw NCC. Explicitly test the known brainstem competitor from REPORT C.4: a mirrored pose with 5.4 % shrink, 30.6 mm away, scoring 0.1358 against R5's 0.1241 on the 0.15 mm objective. The v1 joint keep-3 dropped it, and per-hypothesis retention will keep it. Report the outcome.",
+   "Report ambiguity as a first-class output: all four refined hypothesis scores, delta_polarity, delta_handedness, a size-normalised search decisiveness and the distance to the distinct runner-up. Any 'undecided' label must come from a data-internal noise scale, such as a spatial block jackknife. That scale must be shown on synthetic symmetric controls to call symmetric cases undecided, and must come out decided on I46/I55 and undecided on I48 polarity and brainstem handedness.",
+   "Report per-OCT-axis scale clamp saturation and identifiability. Clamp saturation fires on I38 (depth exp(-0.15)). An identifiability check should mark I46 depth as unidentifiable (dNCC 0.021), because clamp saturation alone misses I46: its structural stretch is 1.026.",
+   "Sectioning handling: detect the axis and period from the data (I46 axis 0 at 0.39 mm; I58 axis 2 at 0.30 mm), and make the step a recorded no-op when detection is not decisive. If a gain is kept, use a 3-measured-period window, which reproduces the current I46 (100 slices) and I56 (34 slices) windows. Pre-declare that the step is deleted if an ablation on I46, I55 and the brainstem shows no effect.",
+   "One foreground rule applied to both modalities. It keeps the v1 peak-walk threshold wherever a valley exists (no regression on I46, I38, I62, I48, I57), replaces the silent fail-open with an explicit flag, and allows multi-piece specimens. Any replacement (GMM, texture) must first pass: I46 OCT mask >= 0.9x the intensity mask, I55 unchanged, and an oracle-mask ablation on I56, I57, I61 and DANDI I58 that separates mask failures from objective failures.",
+   "Handle metadata honestly. The sidecar spacing is the primary input. I46 at 12/12/14 um and I55 at 12/12/12 um run as declared variants, which decide whether the dropped vascular depth-scale gain was a metadata artefact. DANDI I58 at 30 deg runs as an extra row next to the 10 deg failure case.",
+   "Take the vascular stage out of the core, but keep the I46 vessel-level result reproducible from an archive tag or an optional extension. Set a stated evidence bar for re-entry (gain on >= 2 labelled vessel pairs, e.g. adding I45/I60). Scope the release claim to mm-level placement.",
+   "Pre-declared regression acceptance against the v1 structural pose:\n- I46 and I55: Dice within 0.02; pose within about 0.5-1 mm on OCT mask points.\n- A per-step revert rule.\n- Explicit regression on the 0.12 mm subjects for the level change (v1 0.6/0.24/0.12 to 0.6/0.3/0.15).\n- Re-prep all 10 pairs from raw at one tag, with sha256-verified inputs and the git hash and argv in prep.json and result.json.\n- I57, I61, DANDI I58 and I48 appear in the main table.",
+   "Use header affines for NIfTI and report handedness as 'unknown' for frame-less TIFF. Export in the input file frames with a raw-data frame test: Spearman at the pose against the header-axis-flip controls, as in check_export_header.",
+   "Report boundary agreement only when a data-internal rule says the OCT outline is a real specimen surface (the fraction of OCT boundary away from FOV faces). It is descriptive, not accuracy; it was never calibrated and it favours the other handedness on I58.",
+   "Add a synthetic known-transform benchmark (pose, handedness, polarity, spacing error, stripes, embedding) and a true random-pose control. Use them to measure capture range and the calibration of the decision rules; no accuracy claims from synthetic data."
+  ],
+  "must_not": [
+   "Do not accept, reject or rank poses by absolute NCC, restart convergence counts, raw top1/top2 margin or a hemisphere-volume constant. Counterexamples: I61 and I57 score about 0.50 and are wrong; I62 scores 0.28 and is correct; I61 and DANDI I58 converge 12/12 and are wrong; the I55 margin is 1.004 and I55 is correct.",
+   "Do not use the refined-NCC spread of converged restarts as the noise scale for decided/undecided. It is optimiser noise inside one basin, it is undefined when restarts do not converge (other handedness 1/12), and it would call the brainstem handedness decided.",
+   "Do not decide between hypotheses on raw data NCC while the refiner optimises NCC plus the scale prior. Shrink poses (P5/P6; the 0.1358 mirrored 5.4 %-shrink brainstem pose) exploit exactly that gap.",
+   "Do not ship the texture specimen mask, or an intensity+texture GMM, as a default or behind an automatic switch until it passes I46 and I55. The texture recipe keeps 0.28 of 0.68 cm3 on I46. The volume-ratio switch can only fire on MRI crops. A plain GMM is not the validated P1 recipe (watershed rim, pockets) that gave 18.05 cm3.",
+   "Do not change the foreground threshold definition (log histogram, GMM fallback, new cleanup) on the confirmed pairs without regression. I55 is correct under the current no-valley fallback, and six MRIs have healthy valleys.",
+   "Do not apply the I58-derived in-sheet destripe field, or any new flat-field form, to DANDI by default without an I46/I55 regression. On I46 destripe failed its own other-axes check, and slab normalisation was never ablated.",
+   "Do not correct per-pair metadata in the primary benchmark (e.g. I46 depth set to 14 um in a data card) using sibling, oracle or label-derived evidence. Keep sidecar values primary and run corrections as declared variants.",
+   "Do not introduce new thresholds or sampling rules fitted to, or motivated only by, the 9 DANDI pairs they are evaluated on without leave-one-subject-out calibration, freezing and a stated provenance. Examples: contrast cut, coverage 0.7, Bhattacharyya 1.0, border enrichment 1.5, a covering-angle rule that doubles the search on I38/I57 despite I48 plateauing at 4000 orientations.",
+   "Do not keep in the method or CLI: the fine stage (rejected in 13/13 I58 configurations and harmful on I46/I55), the parser, self-distillation, MIND, nonrigid, the MI landscape as QC, the vascular gate constants, or the section-phase modulation gate (never exercised).",
+   "Do not drop the MRI foreground multiplication from the MRI class channels. It carries the outline that places the brainstem.",
+   "Do not report Dice, BA-inside or vessel numbers for the 0.12 mm subjects before the label-frame repair. Do not keep the Dice whose denominator is the whole OCT class count. Do not keep the 7 mm-cube rotation metric that is invalid for mirrored transforms.",
+   "Do not claim prior-free search on the brainstem (its MRI is already a crop), physical handedness for DANDI TIFF blocks or the brainstem, or vessel-level / depth-scale accuracy for the release core.",
+   "Do not remove the stated failures (I57, I61, DANDI I58 at 10 deg, I48) from the benchmark, and do not patch them with pair-specific masks or flags presented as part of the general method."
+  ]
+ }
+}
