@@ -1,148 +1,54 @@
-"""Differentiable rigid / similarity / affine refinement of a candidate pose.
+"""Refinement (spec step 7): penalised rigid -> similarity -> affine fit of each hypothesis, handedness fixed.
 
-Parameters: rotation vector (3), translation (3), log-scales (3), shears (3); the transform is
-    x_m = M (x_o - c_o) + t,   M = R(r) · Shear(sh) · diag(exp(ls))
-Loss: 1 - masked NCC of MRI features sampled at the transformed OCT voxel positions (OCT tissue
-weighted, averaged over feature channels); multi-resolution; Adam.
+Model x_mri = R Sh diag(exp(ls)) [mirror] (x_oct - c) + t (geometry.compose), c = OCT foreground centroid (mm).
+Loss L = 1 - S + refine_lambda (sum ls^2 + sum sh^2), |ls|, |sh| <= refine_clamp (absolute).
 """
 from __future__ import annotations
 
-import time
-
 import numpy as np
-import torch
 
-from .common import DEVICE, apply_affine, grid_points, matrix_to_rotvec, polar_rotation, rotvec_to_matrix, sample_at_world, to_t
-
-
-def _shear(sh: torch.Tensor) -> torch.Tensor:
-    S = torch.eye(3, dtype=sh.dtype, device=sh.device)
-    S = S.clone()
-    S[0, 1] = sh[0]; S[0, 2] = sh[1]; S[1, 2] = sh[2]
-    return S
-
-
-MIRROR = np.diag([1.0, 1.0, -1.0])
-
-
-def params_from_matrix(T: np.ndarray, c_o: np.ndarray):
-    """Decompose x_m = A x_o + b into (rotvec, translation about c_o, log-scales, shears, mirror).
-    A = R · Shear · diag(exp(ls)) · diag(1,1,±1); exact for outputs of compose()."""
-    A = np.asarray(T[:3, :3], dtype=float)
-    mirror = bool(np.linalg.det(A) < 0)
-    if mirror:
-        A = A @ MIRROR                             # undo the reflection: A_proper = A · diag(1,1,-1)
-    Q, U = np.linalg.qr(A)                         # A = Q U, U upper triangular
-    d = np.sign(np.diag(U)); d[d == 0] = 1.0
-    Q = Q * d[None, :]; U = d[:, None] * U         # make diag(U) > 0
-    if np.linalg.det(Q) < 0:                       # improper: fall back to polar rotation
-        Q = polar_rotation(A); U = Q.T @ A
-    scales = np.diag(U).copy()
-    scales[scales <= 1e-3] = 1e-3
-    Sh = U / scales[None, :]                       # unit-diagonal upper triangular = shear
-    sh = np.array([Sh[0, 1], Sh[0, 2], Sh[1, 2]])
-    r = matrix_to_rotvec(Q)
-    t = np.asarray(T[:3, :3], dtype=float) @ c_o + T[:3, 3]
-    return r, t, np.log(scales), sh, mirror
-
-
-def compose(r: torch.Tensor, t: torch.Tensor, ls: torch.Tensor, sh: torch.Tensor, c_o: torch.Tensor, mirror: bool = False) -> torch.Tensor:
-    R = rotvec_to_matrix(r)
-    M = R @ _shear(sh) @ torch.diag(torch.exp(ls))
-    if mirror:
-        M = M @ torch.diag(torch.tensor([1.0, 1.0, -1.0], dtype=r.dtype, device=r.device))
-    T = torch.eye(4, dtype=r.dtype, device=r.device)
-    T = T.clone()
-    T[:3, :3] = M
-    T[:3, 3] = t - M @ c_o
-    return T
-
-
-def masked_ncc(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, eps: float = 1e-6, chan_w: torch.Tensor | None = None) -> torch.Tensor:
-    """a, b: [C,N]; w: [N] weights -> (channel-weighted) mean over channels of weighted NCC."""
-    N = w.sum() + eps
-    ma = (a * w).sum(1, keepdim=True) / N
-    mb = (b * w).sum(1, keepdim=True) / N
-    da, db = a - ma, b - mb
-    cov = (w * da * db).sum(1)
-    va = (w * da * da).sum(1); vb = (w * db * db).sum(1)
-    ncc = cov / torch.sqrt((va * vb).clamp(min=eps))
-    if chan_w is None:
-        return ncc.mean()
-    return (ncc * chan_w).sum() / chan_w.sum()
+from .params import Params
 
 
 class Refiner:
-    def __init__(self, mri_feat: torch.Tensor, mri_affine: np.ndarray, oct_feat: torch.Tensor, oct_affine: np.ndarray,
-                 oct_mask: torch.Tensor, device=DEVICE, chan_w=None):
-        self.dev = device
-        self.chan_w = None if chan_w is None else torch.as_tensor(np.asarray(chan_w, dtype=np.float32), device=device)
-        self.FM = mri_feat.to(device).float()
-        self.A_M = to_t(mri_affine, device=device)
-        self.FO = oct_feat.to(device).float()
-        self.A_O = to_t(oct_affine, device=device)
-        m = oct_mask.to(device).float()[0]
-        idx = torch.nonzero(m > 0.05)
-        self.pts_o = apply_affine(self.A_O, idx.float())              # [N,3] world coords of OCT tissue voxels
-        self.w = m[idx[:, 0], idx[:, 1], idx[:, 2]]
-        self.fo = self.FO[:, idx[:, 0], idx[:, 1], idx[:, 2]]         # [C,N]
-        d, h, w_ = m.shape
-        corners = torch.tensor([[i, j, k] for i in (0, d - 1) for j in (0, h - 1) for k in (0, w_ - 1)], dtype=torch.float32, device=device)
-        self.c_o = apply_affine(self.A_O, corners).mean(0)
+    """Fits one hypothesis on the level pyramid."""
 
-    def loss_of(self, T: torch.Tensor, subsample: int = 1) -> torch.Tensor:
-        pts = self.pts_o[::subsample]; w = self.w[::subsample]; fo = self.fo[:, ::subsample]
-        pm = apply_affine(T, pts)
-        fm = sample_at_world(self.FM, self.A_M, pm)                     # [C,N]
-        return 1.0 - masked_ncc(fm, fo, w, chan_w=self.chan_w)
+    def __init__(self, mri_levels, oct_levels, hypothesis, params: Params = Params(), device="cuda"):
+        """mri_levels: {factor: (v [2, D, H, W], affine 4x4)} MRI channels per pyramid level (numpy, may stay on the CPU; below
+        the search level only a crop of block radius + refine_crop_mm around the start pose goes to device).
+        oct_levels: {factor: (u [2, d, h, w], w [d, h, w], affine 4x4)} OCT channels ('same' polarity) and weight per level;
+        the loss uses the voxels with w > refine_mask_min. hypothesis: a name in types.HYPOTHESES ('inverted' swaps the OCT
+        channels; every T0 must have the hypothesis's handedness). c = weighted OCT foreground centroid at the finest level."""
+        raise NotImplementedError
 
-    @torch.no_grad()
-    def ncc_channels(self, T: np.ndarray) -> list:
-        """Per-channel masked NCC at the current level (diagnostic)."""
-        Tt = to_t(T, device=self.dev)
-        pm = apply_affine(Tt, self.pts_o)
-        fm = sample_at_world(self.FM, self.A_M, pm)
-        out = []
-        for c in range(fm.shape[0]):
-            out.append(float(masked_ncc(fm[c:c + 1], self.fo[c:c + 1], self.w).item()))
-        return out
+    def fit(self, T0, dof, iters, level):
+        """Adam with a cosine schedule from T0 (4x4 numpy) at pyramid factor level; dof 'rigid' | 'similarity' (one isotropic
+        log-scale) | 'affine'; learning rates refine_lr_rot (rad), refine_lr_t (mm), refine_lr_ls, refine_lr_sh; clamps applied
+        after every step. -> (T 4x4 numpy of the best-L iterate, S, L) at that level."""
+        raise NotImplementedError
 
-    def refine(self, T0: np.ndarray, dof: str = "affine", iters: int = 200, lr_rot: float = 0.02, lr_t: float = 0.3,
-               lr_ls: float = 0.01, lr_sh: float = 0.01, subsample: int = 1, verbose: bool = False,
-               ls_clamp: float = 0.15, sh_clamp: float = 0.15, reg: float = 2.0):
-        c_o = self.c_o.detach().cpu().numpy()
-        r0, t0, ls0, sh0, mirror = params_from_matrix(np.asarray(T0), c_o)
-        r = to_t(r0, device=self.dev).requires_grad_(True)
-        t = to_t(t0, device=self.dev).requires_grad_(True)
-        ls = to_t(ls0, device=self.dev).requires_grad_(dof in ("similarity", "affine"))
-        sh = to_t(sh0, device=self.dev).requires_grad_(dof == "affine")
-        groups = [{"params": [r], "lr": lr_rot}, {"params": [t], "lr": lr_t}]
-        if dof == "similarity":
-            groups.append({"params": [ls], "lr": lr_ls})
-        if dof == "affine":
-            groups += [{"params": [ls], "lr": lr_ls}, {"params": [sh], "lr": lr_sh}]
-        opt = torch.optim.Adam(groups)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters, eta_min=0.0)
-        best = (float("inf"), None)
-        for it in range(iters):
-            opt.zero_grad(set_to_none=True)
-            if dof == "similarity":
-                lsu = ls.mean().expand(3)                              # isotropic scale
-                T = compose(r, t, lsu, sh, self.c_o, mirror)
-            else:
-                T = compose(r, t, ls, sh, self.c_o, mirror)
-            data_loss = self.loss_of(T, subsample)
-            loss = data_loss + reg * ((ls ** 2).sum() + (sh ** 2).sum())
-            loss.backward()
-            opt.step(); sched.step()
-            with torch.no_grad():
-                ls.clamp_(-ls_clamp, ls_clamp); sh.clamp_(-sh_clamp, sh_clamp)
-            if data_loss.item() < best[0]:
-                best = (data_loss.item(), T.detach().cpu().numpy().copy())
-            if verbose and (it % 50 == 0 or it == iters - 1):
-                print(f"    it {it:4d} loss {loss.item():.4f}", flush=True)
-        return best[1], best[0]
+    def evaluate(self, T, level):
+        """(S, L) of pose T (4x4 numpy) at pyramid factor level, no optimisation."""
+        raise NotImplementedError
 
-    @torch.no_grad()
-    def evaluate(self, T: np.ndarray) -> float:
-        return float(self.loss_of(to_t(T, device=self.dev)).item())
+    def prior(self, T) -> float:
+        """refine_lambda (sum ls^2 + sum sh^2) of geometry.decompose(T, c); dimensionless."""
+        raise NotImplementedError
+
+    def points(self, level):
+        """OCT points entering the loss at level: (world mm numpy [N, 3], weights [N])."""
+        raise NotImplementedError
+
+    def block_moments(self, T, level, block_id, n_blocks) -> np.ndarray:
+        """Weighted moment sums per channel and block of OCT values a and MRI values b sampled through T, over points(level):
+        float64 [2, n_blocks, 6] = (sum w, sum w a, sum w b, sum w a^2, sum w b^2, sum w a b). block_id: int [N] in 0..n_blocks-1."""
+        raise NotImplementedError
+
+
+def ladder(hypotheses, mri_levels, oct_levels, params: Params = Params(), device="cuda"):
+    """The refinement ladder for every hypothesis: for each (level, ((dof, iters), ...), keep) of refine_ladder, every surviving
+    pose runs the steps in order and the best `keep` by L survive (compat.v1_retention: v1_keep over the v1 joint list).
+    hypotheses: {name: [Hypothesis from FFTSearcher.run]}; mri_levels, oct_levels as for Refiner.
+    -> ({name: [Hypothesis at the finest level, best L first, with S, L, log_scales, shears, overlap, level_mm]},
+        {name: Refiner used for that hypothesis})."""
+    raise NotImplementedError

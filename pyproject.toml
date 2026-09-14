@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "octreg"
+dynamic = ["version"]
+description = "Label-free affine registration of OCT blocks to MRI"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Yuntian Yang" }]
+dependencies = [
+    "torch",
+    "numpy",
+    "scipy",
+    "scikit-image",
+    "nibabel",
+    "tifffile",
+    "matplotlib",
+    "tomli; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+octreg = "octreg.cli:main"
+
+[tool.setuptools]
+packages = ["octreg"]
+
+[tool.setuptools.dynamic]
+version = { attr = "octreg.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
