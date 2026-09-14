@@ -1,18 +1,18 @@
 # Benchmark: Xiangrui's I58 brainstem pair
 
-octreg 1.0 registered the two original files as given (OCT 1457x2013x1595 at 20 um, header LPI; MRI crop 343x489x495 at 0.08 mm, header RIA) with `octreg register OCT MRI -o OUT` and default parameters (Params hash 8f731954d824ccac). The pair has no labels, so every number here is label-free. The reference R5 is the pose of the earlier research pipeline (v1.1) converted into the header frames. It is a body-level pose, not ground truth. The numbers are read from the run's result.json and eval.json and from ablations.json (copies in docs/results/xiangrui_I58/). Commands: `bash bench/run_xiangrui.sh` (see bench/README.md).
+octreg 1.0 registered the two original files as given (OCT 1457x2013x1595 at 20 um, header LPI; MRI crop 343x489x495 at 0.08 mm, header RIA) with `octreg register OCT MRI -o OUT` and default parameters (Params hash 8f731954d824ccac). The pair has no labels, so every number here is label-free. The reference R5 is the pose of the earlier research pipeline (v1.1) converted into the header frames. It is a body-level pose, not ground truth. The numbers are read from the run's result.json and eval.json and from ablations.json (copies in bench/results/xiangrui_I58/). Commands: `bash bench/run_xiangrui.sh` (see bench/README.md).
 
 ## Visual result
 
 The result is judged by visual inspection of the overlays (docs/METHOD.md, "Evaluation"). The numbers below support that judgement.
 
-![Result and the best pose of the other handedness](figures/fig_handedness_xiangrui.png)
+![Result and the best pose of the other handedness](../docs/figures/fig_handedness_xiangrui.png)
 
 Planes through the centroid of the specimen mask, normal to each OCT array axis: the OCT, then for the result and for the best pose of the other handedness (ablation A8) the MRI through the transform (inverted inside its foreground, polarity -1) and a 2 mm checkerboard. The MRI outline of the result follows the OCT specimen in all three planes, and the cerebellar folia of the MRI lie on the folded folia pieces of the OCT, at the lower right of the axis-1 plane and at the upper right of the axis-2 plane. The mirrored pose fits the outline as well, with the higher S_outline (0.6438 against 0.5891) and the lower loss (L 0.7133 against 0.7296), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
 
 ![QC of the result](figures/fig_qc_xiangrui.png)
 
-qc.png of the run, with the MRI foreground through the transform (red) and the OCT specimen mask (cyan) in the fourth column. qc_montage.png, with four planes per axis, is [fig_qc_montage_xiangrui.png](figures/fig_qc_montage_xiangrui.png). In every plane the MRI outline follows the OCT specimen apart from the torn and folded cerebellar pieces, although the OCT mask outline takes in a margin of agarose in some planes (most in axis 1 at 8.32 mm and axis 2 at 6.37 mm). The folia also correspond in the axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm.
+qc.png of the run, with the MRI foreground through the transform (red) and the OCT specimen mask (cyan) in the fourth column. qc_montage.png, with four planes per axis, is [fig_qc_montage_xiangrui.png](../docs/figures/fig_qc_montage_xiangrui.png). In every plane the MRI outline follows the OCT specimen apart from the torn and folded cerebellar pieces, although the OCT mask outline takes in a margin of agarose in some planes (most in axis 1 at 8.32 mm and axis 2 at 6.37 mm). The folia also correspond in the axis-0 planes at 17.47 and 23.17 mm and in the axis-1 plane at 24.07 mm.
 
 ## Main result
 
@@ -94,7 +94,7 @@ The outline term and the file-header handedness decide this pair. Without the ou
 
 Holes filled in 3-D only (A0c) move the pose by 1.69 mm and lower S_outline from 0.5891 to 0.3986, since holes that reach a cut face then count as embedding. The watershed mask of the earlier pipeline (A0b) gives the same pose to 0.32 mm.
 
-The two-class maps and the flattening change the pose only a little once the outline is in the score: 0.74 mm for standardised intensities (A4, 0.51 mm over the specimen points, just above the deletion threshold), and 0.12 and 0.10 mm for MRI and OCT flattening (A1, A2). Flattening stays because it keeps the pose stable when other parts change. In an ablation run of the same method without flattening (docs/results/xiangrui_I58/no_flattening/ablations.json), the base pose moved by only 0.24 mm, but A0b and A0c moved the pose by 42.3 and 40.9 mm, against 0.32 and 1.69 mm here.
+The two-class maps and the flattening change the pose only a little once the outline is in the score: 0.74 mm for standardised intensities (A4, 0.51 mm over the specimen points, just above the deletion threshold), and 0.12 and 0.10 mm for MRI and OCT flattening (A1, A2). Flattening stays because it keeps the pose stable when other parts change. In an ablation run of the same method without flattening (bench/results/xiangrui_I58/no_flattening/ablations.json), the base pose moved by only 0.24 mm, but A0b and A0c moved the pose by 42.3 and 40.9 mm, against 0.32 and 1.69 mm here.
 
 R5, the pose of the earlier research pipeline, lies 30.4 mm away and has the other handedness in the header frames; it is not a success criterion. Its outlines agree worse than the result's with the method masks (rim medians 3.04 / 3.53 mm against 1.26 / 1.70 mm). The "previous run" in the table is the release run before the outline term, after the flat field and the ladder were removed, with the two-class score alone, the overlap gate and mirrored orientations in the search; it lies 30.0 mm away and also has the other handedness.
 

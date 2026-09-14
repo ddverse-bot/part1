@@ -9,8 +9,8 @@
 #           ablate    bench/ablate.py: preprocessing once, variants A0-A9 -> ABL/ablations.json (removed steps A3, A7 from PREV)
 #           evaluate  bench/evaluate.py OUT: pose to R5 and to PREV_MAIN, boundary with the v1.1 masks, raw-data frame check;
 #                     mask and boundary metrics with the method masks once ABL/prep/texture exists
-#           report    bench/report.py -> docs/BENCHMARK.md, docs/figures/fig_qc_xiangrui.png and fig_ablation.png
-# OUT     run dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel3/main, the run in docs/results); logs go to ${OUT}_logs
+#           report    bench/report.py -> bench/BENCHMARK.md, bench/figures/fig_qc_xiangrui.png and fig_ablation.png
+# OUT     run dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel3/main, the run in bench/results); logs go to ${OUT}_logs
 # ABL     ablation dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel3/ablate); DEVICE cuda | cpu (default cuda)
 # PREV    ablations.json files of the runs that measured the removed steps (space-separated): A3 and A7
 #         (default BENCH/ablate/ablations.json; missing files are skipped)
@@ -77,7 +77,7 @@ for s in $STEPS; do
               if [ -f "$ABL/prep/texture/oct_mask.nii.gz" ]; then ARGS+=(--masks "$ABL/prep/texture")
               else say "evaluate: no $ABL/prep/texture yet, so no metrics with the method masks (run the ablate step first)"; fi
               step evaluate python bench/evaluate.py "$OUT" ${ARGS[@]+"${ARGS[@]}"} || exit 1 ;;
-    report)   step report python bench/report.py --main "$OUT" --ablate "$ABL" --logs "$LOGS" -o docs/BENCHMARK.md --figures docs/figures || exit 1 ;;
+    report)   step report python bench/report.py --main "$OUT" --ablate "$ABL" --logs "$LOGS" -o bench/BENCHMARK.md --figures bench/figures || exit 1 ;;
     *)        say "unknown step '$s' (register | ablate | evaluate | report)"; exit 1 ;;
   esac
 done

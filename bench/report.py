@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Write docs/BENCHMARK.md for Xiangrui's I58 brainstem pair from the bench outputs (formatting only, no computation).
+"""Write bench/BENCHMARK.md for Xiangrui's I58 brainstem pair from the bench outputs (formatting only, no computation).
 
-    python bench/report.py --main RUN --ablate ABL [--logs RUN_logs] [-o docs/BENCHMARK.md] [--figures docs/figures]
+    python bench/report.py --main RUN --ablate ABL [--logs RUN_logs] [-o bench/BENCHMARK.md] [--figures bench/figures]
 
 RUN: the CLI run (result.json; eval.json from bench/evaluate.py). ABL: bench/ablate.py output (ablations.json).
 LOGS (optional): bench/run_xiangrui.sh step logs, adding the wall clock (register.time) and the nvidia-smi peak (register.gpu_mib)
@@ -224,7 +224,7 @@ def main():
     ap.add_argument("--main", type=Path, required=True)
     ap.add_argument("--ablate", type=Path, default=None)
     ap.add_argument("--logs", type=Path, default=None)
-    ap.add_argument("-o", "--out", type=Path, default=Path("docs/BENCHMARK.md"))
+    ap.add_argument("-o", "--out", type=Path, default=Path("bench/BENCHMARK.md"))
     ap.add_argument("--figures", type=Path, default=None, help="also write fig_qc_xiangrui.png and fig_ablation.png into this dir")
     a = ap.parse_args()
     abl = load(a.ablate / "ablations.json") if a.ablate else {}
@@ -235,7 +235,7 @@ def main():
              + (f" (Params hash {phash})" if phash else "") + ". "
              "The pair has no labels, so every number here is label-free. The reference R5 is the pose of the earlier research "
              "pipeline (v1.1) converted into the header frames. It is a body-level pose, not ground truth. The numbers are read from "
-             "the run's result.json and eval.json and from ablations.json (copies in docs/results/xiangrui_I58/). "
+             "the run's result.json and eval.json and from ablations.json (copies in bench/results/xiangrui_I58/). "
              "Commands: `bash bench/run_xiangrui.sh` (see bench/README.md).", ""]
     old = a.out.read_text() if a.out.exists() else ""
     visual = re.search(r"^## Visual result\n.*?(?=^## Main result)", old, re.S | re.M)       # hand-written, kept

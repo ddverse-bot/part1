@@ -8,7 +8,7 @@ no labels, so every metric is label-free. Paths are those of the AutoDL server.
 | `run_xiangrui.sh` | runs the steps below from `/root/autodl-tmp/octreg1`, detached-friendly, logs next to the run dir |
 | `evaluate.py` | pose against the reference R5, OCT mask volume and Dice, boundary agreement, raw-data frame check |
 | `ablate.py` | preprocessing once, then the variants base and A0-A9, one JSON table |
-| `report.py` | writes `docs/BENCHMARK.md` and the two figures in `docs/figures/` from the outputs |
+| `report.py` | writes `bench/BENCHMARK.md` and the two figures in `bench/figures/` from the outputs |
 | `compose_pair.py` | two `octreg qc` outputs of one run side by side (`docs/figures/fig_handedness_xiangrui.png`) |
 
 ## Running
@@ -20,7 +20,7 @@ STEPS="ablate evaluate report" setsid nohup bash bench/run_xiangrui.sh > /dev/nu
 ```
 
 `register` is `python -m octreg register OCT MRI -o OUT` on the two original files. Outputs go to
-`/root/autodl-tmp/bench_runs/xiangrui_I58/rel3/{main,main_logs,ablate}`, the run in docs/results/xiangrui_I58 (override with
+`/root/autodl-tmp/bench_runs/xiangrui_I58/rel3/{main,main_logs,ablate}`, the run in bench/results/xiangrui_I58 (override with
 `OUT`, `ABL`, `PREV`, `PREV_MAIN`, `DEVICE`, `CODE`). Every step writes
 `NAME.log`, `NAME.time` (wall time, peak RSS) and `NAME.gpu_mib` (nvidia-smi samples) into `main_logs`, and a start and a done
 line per step (and the last 5 log lines on failure) to `chain.log`. The script registers its process group in `/root/autodl-tmp/v11_dev/killable/octreg1_xiangrui.pgid` while it runs
@@ -86,4 +86,4 @@ copies their rows and reports how far the present base lies from that earlier ba
 
 The deletion rule: a step whose removal moves the pose by at most 0.5 mm (mean over the specimen-mask points) and changes no
 metric beyond noise is deleted before release, unless it keeps the pose stable under the other ablations (flattening, see
-docs/BENCHMARK.md).
+bench/BENCHMARK.md).
