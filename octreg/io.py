@@ -1,63 +1,229 @@
-"""Input and output in the world frames of the input files.
+"""Volumes in their file frames, read plane by plane, and the output writers.
 
-NIfTI: voxel -> world from the sform, else the qform (both codes 0: frame 'array', handedness 'unknown'). TIFF/OME-TIFF/NPY:
-world = diag(spacing) in array order, handedness 'unknown'. Transforms are 4x4 world -> world in mm (RAS for NIfTI worlds).
+An affine maps voxel index (i, j, k) -> world mm; a transform T is a 4x4 world -> world matrix (mm).
+Volume axes follow the file's storage order so that the last axis k is always the plane axis the file is streamed along:
+NIfTI (i, j, k) as in the header; TIFF and NPY (x, y, z), the numpy axes (z, y, x) reversed (the ITK / SimpleITK index order).
+NIfTI world = sform, else qform (frame 'header'); neither coded -> diag(pixdim) (frame 'array').
+TIFF / OME-TIFF / NPY world = diag(spacing_x, spacing_y, spacing_z) (frame 'array'), the physical frame ITK gives such files.
 """
 from __future__ import annotations
 
+import dataclasses
+import gzip
+import json
+import math
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 
-from .types import Volume
+UNIT_MM = {"nm": 1e-6, "um": 1e-3, "µm": 1e-3, "μm": 1e-3, "micron": 1e-3, "mm": 1.0, "cm": 10.0, "m": 1e3, "meter": 1e3}
 
 
-def load_volume(path, spacing_um=None, axes=None, layout=None) -> Volume:
-    """Open a 3-D image lazily (memmap or plane reader; never loaded whole) and hash the file.
-
-    path: .nii / .nii.gz, .tif / .tiff / .ome.tif(f) or .npy. spacing_um: (s0, s1, s2) in um per array axis, overriding every
-    other source (spacing_source 'cli'). axes: array axis letters of a TIFF/NPY, e.g. 'zyx' (default: OME DimensionOrder, else
-    'zyx'). layout: v1 RAS letters for the array axes, e.g. 'SPR' (compat M1 only; frame 'layout', corner origin).
-    Spacing sources in order: spacing_um, NIfTI header, OME PhysicalSize (length units only), BIDS sidecar JSON.
-    Returns Volume(reader, affine 4x4 voxel -> world mm, spacing_mm, frame, handedness, spacing_source, path, sha256).
-    Raises InputRefused: no spacing source; not 3-D (a 4-D input lists its volumes and is never squeezed); unreadable file.
-    """
-    raise NotImplementedError
+@dataclass(eq=False)
+class Volume:
+    """A 3-D image on disk (header only; voxels are read with iter_planes). shape: voxels along (i, j, k); affine: 4x4
+    voxel -> world mm; spacing_mm: voxel edges along (i, j, k), the affine column norms; frame: 'header' | 'array'."""
+    path: str
+    shape: tuple
+    affine: np.ndarray
+    spacing_mm: np.ndarray
+    frame: str
 
 
-def read_transform(path) -> np.ndarray:
-    """4x4 world -> world (mm) from a plain 4x4 text matrix, a FreeSurfer LTA (LINEAR_RAS_TO_RAS) or an ITK text transform
-    written by write_itk; always returned in the sense of the T the matching writer was given. Raises ValueError otherwise."""
-    raise NotImplementedError
+def _kind(path) -> str:
+    name = str(path).lower()
+    for kind, ends in (("nii", (".nii", ".nii.gz")), ("tif", (".tif", ".tiff")), ("npy", (".npy",))):
+        if name.endswith(ends):
+            return kind
+    raise ValueError(f"{path}: unsupported format (use .nii, .nii.gz, .tif, .tiff, .ome.tif or .npy)")
 
 
-def write_matrix(T, path) -> None:
-    """4x4 matrix as plain text, one row per line, 17 significant digits (exact float64 round trip)."""
-    raise NotImplementedError
+def _shape3(path, shape, trailing_ok) -> tuple:
+    """The 3-D shape; trailing singleton dimensions are accepted only when trailing_ok (NIfTI)."""
+    shape = tuple(int(s) for s in shape)
+    if not (len(shape) >= 3 and min(shape[:3]) >= 2 and (all(s == 1 for s in shape[3:]) if trailing_ok else len(shape) == 3)):
+        raise ValueError(f"{path}: image of shape {shape}; octreg needs one 3-D volume with >= 2 voxels per axis")
+    return shape[:3]
 
 
-def write_lta(T, src_geom, dst_geom, path) -> None:
-    """FreeSurfer LTA, type LINEAR_RAS_TO_RAS, x_dst = T x_src in mm, with the src and dst volume geometry blocks.
-    src_geom, dst_geom: (shape (3 ints), affine 4x4 voxel -> world mm) of the source (OCT) and destination (MRI) files."""
-    raise NotImplementedError
+def load_volume(path, spacing_um=None) -> Volume:
+    """Open a 3-D image without reading voxels.
+
+    spacing_um: (z, y, x) um, i.e. along (k, j, i) (numpy order for TIFF / NPY, the CLI's Z,Y,X); overrides every other
+    source (a NIfTI header keeps its directions and origin). Otherwise NIfTI: sform / qform / pixdim in the header's length
+    unit ('unknown' = mm); OME-TIFF: PhysicalSize X / Y / Z (unit absent = um); plain TIFF / NPY need spacing_um.
+    Numpy axes are (z, y, x) unless the TIFF series names them.
+    Raises ValueError for a missing file, an unsupported format, a non-3-D image, missing spacing or a singular affine."""
+    p = Path(path)
+    if not p.is_file():
+        raise ValueError(f"{p}: no such file")
+    kind = _kind(p)
+    cli = None if spacing_um is None else np.asarray(spacing_um, float).ravel()[::-1] / 1000.0      # along (i, j, k)
+    if cli is not None and (cli.shape != (3,) or not np.all(cli > 0)):
+        raise ValueError(f"{p}: spacing_um must be three positive numbers (um, Z,Y,X), got {spacing_um}")
+    if kind == "nii":
+        import nibabel as nib
+        hdr = nib.load(str(p)).header
+        shape = _shape3(p, hdr.get_data_shape(), True)
+        unit = UNIT_MM.get(hdr.get_xyzt_units()[0], 1.0)
+        (S, scode), (Q, qcode) = hdr.get_sform(coded=True), hdr.get_qform(coded=True)
+        if scode or qcode:
+            A, frame = np.array(S if scode else Q, float), "header"
+            A[:3] *= unit
+        else:
+            A, frame = np.diag([*(np.asarray(hdr.get_zooms()[:3], float) * unit), 1.0]), "array"
+        if cli is not None:
+            A[:3, :3] *= cli / np.linalg.norm(A[:3, :3], axis=0)
+    else:
+        letters, ome = "zyx", None
+        if kind == "npy":
+            shape = _shape3(p, np.load(p, mmap_mode="r").shape, False)[::-1]
+        else:
+            import tifffile
+            with tifffile.TiffFile(str(p)) as tif:
+                s = tif.series[0]
+                shape, axes = _shape3(p, s.shape, False)[::-1], s.axes.lower()
+                if set(axes) & set("cs"):
+                    raise ValueError(f"{p}: TIFF axes {s.axes} have channels or samples; octreg needs one 3-D volume")
+                letters = axes if sorted(axes) == ["x", "y", "z"] else letters
+                ome = _ome_spacing(tif.ome_metadata) if tif.is_ome else None
+        if cli is None and ome is None:
+            raise ValueError(f"{p}: no voxel spacing (no OME PhysicalSize X / Y / Z); pass spacing_um (--oct-spacing-um Z,Y,X)")
+        A, frame = np.diag([*(cli if cli is not None else [ome[a] for a in letters[::-1]]), 1.0]), "array"
+    A[3] = (0.0, 0.0, 0.0, 1.0)
+    sp = np.linalg.norm(A[:3, :3], axis=0)
+    if not (np.all(np.isfinite(A)) and np.all(sp > 0) and abs(np.linalg.det(A[:3, :3])) > 1e-9 * np.prod(sp)):
+        raise ValueError(f"{p}: singular or missing voxel spacing in affine\n{A}\npass spacing_um (--oct-spacing-um Z,Y,X)")
+    return Volume(str(p), tuple(shape), A, sp, frame)
 
 
-def write_itk(T, path) -> None:
-    """ITK text transform (AffineTransform_double_3_3) that resamples the source onto the destination with ITK/ANTs tools
-    (antsApplyTransforms -i OCT -r MRI -t path): the LPS point map destination -> source, i.e. inv(T) conjugated by diag(-1, -1, 1).
-    T: 4x4 RAS world x_dst = T x_src (mm)."""
-    raise NotImplementedError
+def _ome_spacing(xml):
+    """{'x', 'y', 'z': mm} from the first OME Pixels element, or None unless X, Y and Z all have a length unit."""
+    px = next((e for e in ET.fromstring(xml).iter() if e.tag.split("}")[-1] == "Pixels"), None)
+    out = {}
+    for a in "xyz":
+        v, u = (None, None) if px is None else (px.get(f"PhysicalSize{a.upper()}"), px.get(f"PhysicalSize{a.upper()}Unit", "µm"))
+        if v is None or u not in UNIT_MM or not float(v) > 0:
+            return None
+        out[a] = float(v) * UNIT_MM[u]
+    return out
 
 
-def save_nifti(arr, affine, path, dtype=None) -> None:
-    """NIfTI-1 with sform = qform = affine (code 1, units mm); arr in array order (i, j, k); dtype casts first when given."""
-    raise NotImplementedError
+def iter_planes(vol: Volume):
+    """Yield (k, plane float32 [shape_i, shape_j]) for every plane along the last axis, one plane in memory at a time, in
+    file order (.nii.gz: the gzip stream; TIFF: pages or memmap; .nii / NPY: memmap). NIfTI scl_slope / scl_inter are applied;
+    non-finite voxels are yielded as 0."""
+    kind, (ni, nj, nk) = _kind(vol.path), vol.shape
+    if kind == "nii":
+        import nibabel as nib
+        img = nib.load(vol.path)
+        dt, off, slope, inter = img.header.get_data_dtype(), int(img.dataobj.offset), float(img.dataobj.slope), float(img.dataobj.inter)
+        if not vol.path.lower().endswith(".gz"):
+            arr = np.memmap(vol.path, dt, "r", off, (ni, nj, nk), order="F")
+            for k in range(nk):
+                yield k, _finish(arr[:, :, k], slope, inter)
+            return
+        nbytes = ni * nj * dt.itemsize
+        with gzip.open(vol.path, "rb") as f:                   # nibabel resets vox_offset to 0 in .gz headers: use dataobj.offset
+            f.read(off)
+            for k in range(nk):
+                buf = f.read(nbytes)
+                if len(buf) != nbytes:
+                    raise ValueError(f"{vol.path}: data truncated at plane {k}")
+                yield k, _finish(np.frombuffer(buf, dt).reshape((ni, nj), order="F"), slope, inter)
+        return
+    if kind == "npy":
+        arr = np.load(vol.path, mmap_mode="r")
+    else:
+        import tifffile
+        try:
+            arr = tifffile.memmap(vol.path, series=0, mode="r").reshape(nk, nj, ni)
+        except ValueError:                                     # compressed or non-contiguous: one page per plane
+            with tifffile.TiffFile(vol.path) as tif:
+                pages = tif.series[0].pages
+                if len(pages) != nk:
+                    raise ValueError(f"{vol.path}: TIFF is neither memory-mappable nor one page per plane")
+                for k, page in enumerate(pages):
+                    yield k, _finish(page.asarray().reshape(nj, ni).T, 1.0, 0.0)
+            return
+    for k in range(nk):
+        yield k, _finish(arr[k].T, 1.0, 0.0)
+
+
+def _finish(plane, slope, inter):
+    x = np.asarray(plane, np.float64) * slope + inter if (slope, inter) != (1.0, 0.0) else np.asarray(plane)
+    return np.nan_to_num(x.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def save_nifti(arr, affine, path) -> None:
+    """NIfTI-1 with sform = qform = affine (code 1, unit mm); arr in (i, j, k) order."""
+    import nibabel as nib
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    A = np.asarray(affine, float)
+    img = nib.Nifti1Image(np.asarray(arr), A)
+    img.header.set_xyzt_units("mm")
+    img.header.set_qform(A, code=1)
+    img.header.set_sform(A, code=1)
+    nib.save(img, str(path))
+
+
+def write_transform_txt(T, path) -> None:
+    """4x4 matrix as plain text, one row per line, 17 significant digits (exact float64 round trip with np.loadtxt)."""
+    np.savetxt(path, np.asarray(T, float), fmt="%.17g")
+
+
+def _vol_info(vol: Volume) -> str:
+    """FreeSurfer volume geometry: direction cosines, voxel size, c_ras = affine (shape / 2)."""
+    A = np.asarray(vol.affine, float)
+    vs = np.linalg.norm(A[:3, :3], axis=0)
+    D, c = A[:3, :3] / vs, A[:3, :3] @ (np.array(vol.shape, float) / 2.0) + A[:3, 3]
+    f = lambda v: " ".join(f"{x:.15e}" for x in v)
+    return (f"valid = 1  # volume info valid\nfilename = {Path(vol.path).resolve()}\nvolume = {vol.shape[0]} {vol.shape[1]} "
+            f"{vol.shape[2]}\nvoxelsize = {f(vs)}\nxras   = {f(D[:, 0])}\nyras   = {f(D[:, 1])}\nzras   = {f(D[:, 2])}\ncras   = {f(c)}\n")
+
+
+def write_lta(T, src: Volume, dst: Volume, path) -> None:
+    """FreeSurfer LTA, LINEAR_RAS_TO_RAS, x_dst = T x_src (world mm), with source and destination volume geometry."""
+    rows = "\n".join(" ".join(f"{v:.15e}" for v in r) for r in np.asarray(T, float))
+    Path(path).write_text(f"# transform file {path}\n# created by octreg\ntype      = 1 # LINEAR_RAS_TO_RAS\nnxforms   = 1\n"
+                          f"mean      = 0.0000 0.0000 0.0000\nsigma     = 1.0000\n1 4 4\n{rows}\nsrc volume info\n{_vol_info(src)}"
+                          f"dst volume info\n{_vol_info(dst)}subject unknown\nfscale 0.100000\n")
+
+
+def write_itk(T, src: Volume, dst: Volume, path) -> None:
+    """ITK AffineTransform_double_3_3 text for resampling src onto dst with ITK / ANTs (antsApplyTransforms -i src -r dst -t path):
+    the physical point map dst -> src, F_src inv(T) F_dst, where F = diag(-1, -1, 1) for NIfTI (ITK reads RAS headers as LPS)
+    and the identity for TIFF / NPY (the array frame is ITK's physical frame)."""
+    F_src, F_dst = (np.diag([-1.0, -1.0, 1.0, 1.0] if _kind(v.path) == "nii" else [1.0] * 4) for v in (src, dst))
+    L = F_src @ np.linalg.inv(np.asarray(T, float)) @ F_dst
+    q = " ".join(f"{v:.17g}" for v in [*L[:3, :3].ravel(), *L[:3, 3]])
+    Path(path).write_text(f"#Insight Transform File V1.0\n#Transform 0\nTransform: AffineTransform_double_3_3\nParameters: {q}\n"
+                          "FixedParameters: 0 0 0\n")
 
 
 def write_json(obj, path) -> None:
-    """JSON with indent 1, numpy-safe: arrays -> lists, numpy scalars -> Python numbers, Path -> str, dataclasses -> dicts
-    (Volume.reader dropped), NaN/inf -> null. Written to path + '.tmp' and renamed, so a crash never leaves half a file."""
-    raise NotImplementedError
+    """JSON (indent 1) of dicts, lists, dataclasses, numpy / torch arrays and scalars, Paths; NaN and inf become null."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(_plain(obj), indent=1, allow_nan=False))
 
 
-def sha256_file(path, chunk_bytes=1 << 24) -> str:
-    """Hex sha256 of a file read in chunks of chunk_bytes."""
-    raise NotImplementedError
+def _plain(o):
+    if isinstance(o, dict):
+        return {str(k): _plain(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_plain(v) for v in o]
+    if dataclasses.is_dataclass(o) and not isinstance(o, type):
+        return _plain(dataclasses.asdict(o))
+    if hasattr(o, "detach"):
+        o = o.detach().cpu().numpy()
+    if isinstance(o, (np.ndarray, np.generic)):
+        return _plain(o.tolist())
+    if isinstance(o, Path):
+        return str(o)
+    if isinstance(o, float) and not math.isfinite(o):
+        return None
+    if o is None or isinstance(o, (str, int, float)):
+        return o
+    raise TypeError(f"write_json: cannot serialise {type(o).__name__}")

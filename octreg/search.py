@@ -1,43 +1,161 @@
-"""Global search (spec step 6): masked NCC over all translations by FFT, for every orientation in both handedness branches,
-with both relative polarities read from the sign of one score map."""
+"""Orientation search (method step 4) on the coarsest pyramid level.
+
+For every rotation of a fixed uniform set, and each rotation mirrored, the OCT two-class template is correlated with the MRI
+crop over all translations by FFT (weighted NCC with a Padfield-style mask).
+The OCT channels are (p, 1 - p) with a separate weight, so swapping them gives exactly -S: one score map per orientation,
+argmax |S| over the admissible translations, and the sign of that score is the contrast polarity.
+"""
 from __future__ import annotations
 
-import numpy as np
+import math
+import time
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from . import geometry as G
 from .params import Params
 
+MIRROR = np.diag([1.0, 1.0, -1.0])
+EPS = 1e-6          # numerical guard of weight sums and NCC denominators
+VAR_FLOOR = 0.02    # local MRI variance >= this x its foreground variance: round-off guard of the FFT sums
+DIMS = (-3, -2, -1)
 
-class FFTSearcher:
-    """Exhaustive search over orientation x translation x handedness x polarity at one pyramid level."""
 
-    def __init__(self, mri_v, mri_mask, A_M, oct_u, oct_w, A_O, level_mm, params: Params = Params(), init=None, device="cuda"):
-        """mri_v: MRI channels [2, D, H, W] on the search grid (isotropic level_mm, MRI array axes); mri_mask: MRI foreground
-        fraction [D, H, W] on that grid; A_M: its voxel -> world affine (mm). oct_u: OCT channels [2, d, h, w] ('same'
-        polarity); oct_w: OCT weight [d, h, w]; A_O: its affine. level_mm: grid spacing (mm). numpy or torch; moved to device.
-        init: 4x4 prior pose OCT world -> MRI world, or None. With a prior, translations are restricted to prior_radius_mm of
-        the prior block centre and rotations to prior_angle_deg of the prior's rotation in each handedness branch (the
-        mirrored branch composes it with the mirror); polarity stays free.
-        Rotations: geometry.rotations(search_n_rot, search_seed), each as R and R diag(1, 1, -1)."""
-        raise NotImplementedError
+def to_torch(x, device):
+    """numpy or torch -> float32 tensor on device."""
+    return torch.as_tensor(x if torch.is_tensor(x) else np.asarray(x, np.float32)).to(device=device, dtype=torch.float32)
 
-    def score_map(self, R):
-        """One orientation R (numpy [3, 3], det +-1): the OCT channels and weight sampled on an MRI-axis-aligned template covering
-        the block's bounding sphere + search_template_pad_vox voxels, correlated with the zero-padded MRI by FFT; local MRI
-        variance floored at search_var_floor x foreground variance.
-        -> (S torch [D', H', W'] over translations, overlap sum(w M) / sum(w) same shape, admissible bool same shape)."""
-        raise NotImplementedError
 
-    def pose_from(self, R, index) -> np.ndarray:
-        """4x4 OCT world -> MRI world (mm) of orientation R at flat translation index of score_map."""
-        raise NotImplementedError
+def box(affine, shape):
+    """World centre (mm) and bounding-sphere radius (mm) of the voxel centres of a grid (affine 4x4, shape 3 ints)."""
+    ijk = np.array([[i, j, k] for i in (0, shape[0] - 1) for j in (0, shape[1] - 1) for k in (0, shape[2] - 1)], float)
+    xyz = G.apply_affine(np.asarray(affine, float), ijk)
+    return xyz.mean(0), float(np.linalg.norm(xyz - xyz.mean(0), axis=1).max())
 
-    def run(self):
-        """Search every orientation: per orientation the admissible argmax of S ('same') and of -S ('inverted'); overlap
-        admissible iff >= tau = search_rho min(1, V_M / V_O), raised to search_overlap_floor (flag overlap_floor) when lower.
-        Per hypothesis: NMS (same pose iff centres < search_nms_mm AND rotations < search_nms_deg), top search_topk;
-        decisiveness d = (s1 - s2) / (s1 - median of the per-orientation maxima), reported and never gated.
-        compat.v1_retention, v1_masked_oct_channels, v1_overlap: the v1 behaviour of those steps.
-        -> ({hypothesis name: [Hypothesis, best first; S = score, L = 1 - S, overlap, search_top1/top2, decisiveness, level_mm]},
-            {'n_orientations', 'seconds', 'tau', 'overlap_floor': bool,
-             'per_hypothesis': {name: {'top1', 'top2', 'decisiveness', 'n_admissible'}}})."""
-        raise NotImplementedError
+
+def angle_deg(R1, R2):
+    """Rotation angle (deg) between two orthogonal 3x3 matrices; 180 when their handedness differs."""
+    R = np.asarray(R1, float) @ np.asarray(R2, float).T
+    if np.linalg.det(R) < 0:
+        return 180.0
+    return math.degrees(math.acos(np.clip((np.trace(R) - 1) / 2, -1.0, 1.0)))
+
+
+class Searcher:
+    """Score maps of one orientation at a time against the zero-padded MRI grid."""
+
+    def __init__(self, mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, params: Params = Params(), device="cuda"):
+        """mri_v [2, D, H, W] MRI channels, mri_mask [D, H, W] foreground fraction, mri_affine voxel -> world (mm, isotropic grid);
+        oct_u [2, d, h, w] OCT channels (p, 1 - p), oct_w [d, h, w] OCT weight, oct_affine. numpy or torch.
+        The template is centred on the OCT grid box centre c_o and covers its bounding sphere (+3 voxels); the MRI is zero-padded
+        by half a template so a block over the edge of the crop is still scored (the overlap rule decides)."""
+        self.dev = device
+        I, M, u, w = (to_torch(x, device) for x in (mri_v, mri_mask, oct_u, oct_w))
+        A_M, A_O = np.asarray(mri_affine, float), np.asarray(oct_affine, float)
+        self.c_o, radius = box(A_O, w.shape)
+        self.n = n = math.ceil(2 * radius / float(np.linalg.norm(A_M[:3, :3], axis=0).mean())) + 3
+        pad = n // 2 + 1
+        self.A_M = A_M.copy()
+        self.A_M[:3, 3] -= A_M[:3, :3] @ np.full(3, float(pad))
+        I, Mp = F.pad(I, [pad] * 6), F.pad(M[None], [pad] * 6)[0]
+        self.shape = sh = tuple(I.shape[1:])
+        fg = Mp > 0.5
+        if not bool(fg.any()):
+            raise ValueError("no MRI foreground on the search grid")
+        self.var_floor = torch.stack([I[c][fg].var() for c in range(2)]).reshape(2, 1, 1, 1) * VAR_FLOOR
+        self.FI, self.FI2, self.Ftis = torch.fft.rfftn(I, dim=DIMS), torch.fft.rfftn(I * I, dim=DIMS), torch.fft.rfftn(Mp)
+        del I, Mp, fg
+        # template source: u edge-replicated and w zero-padded by one voxel, so wherever the sampled weight is > 0 the two sampled
+        # channels sum to 1 and the swapped-class map is exactly -S (also where the weight touches the OCT array faces)
+        self.src = torch.cat([F.pad(u[None], [1] * 6, mode="replicate")[0], F.pad(w[None], [1] * 6)])
+        self.A_src = A_O.copy()
+        self.A_src[:3, 3] -= A_O[:3, :3] @ np.ones(3)
+        q = torch.arange(n, dtype=torch.float32, device=device) - (n - 1) / 2.0
+        L_M = torch.as_tensor(self.A_M[:3, :3], dtype=torch.float32, device=device)
+        self.tgrid = torch.stack(torch.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3) @ L_M.T     # offsets on MRI axes, mm
+        self.c_t = torch.as_tensor(self.c_o, dtype=torch.float32, device=device)
+        self.valid = torch.zeros(sh, dtype=torch.bool, device=device)                                 # template inside the grid
+        self.valid[:sh[0] - n + 1, :sh[1] - n + 1, :sh[2] - n + 1] = True
+        V_M = float(M.sum()) * abs(np.linalg.det(A_M[:3, :3]))
+        V_O = float(w.sum()) * abs(np.linalg.det(A_O[:3, :3]))
+        if not V_O > 0:
+            raise ValueError("OCT weight is empty on the search grid")
+        tau = params.overlap_rho * min(1.0, V_M / V_O)
+        self.overlap_floor = bool(tau < params.overlap_floor)
+        self.tau = max(tau, params.overlap_floor)
+
+    def _corr(self, x, FX):
+        """Cross-correlation over all translations of a template x [..., n, n, n] (placed at the grid origin) with FFT'd FX."""
+        n = self.n
+        xp = x.new_zeros(x.shape[:-3] + self.shape)
+        xp[..., :n, :n, :n] = x
+        return torch.fft.irfftn(torch.fft.rfftn(xp, dim=DIMS).conj() * FX, s=self.shape, dim=DIMS)
+
+    @torch.no_grad()
+    def score(self, R):
+        """Orientation R (numpy 3x3, det +-1) -> (S [D', H', W'] masked NCC, mean over the two channel pairs; overlap sum(w M) /
+        sum(w); admissible bool = template inside the grid and overlap >= tau). Index u means x_mri = R (x_oct - c_o) + t_u."""
+        n = self.n
+        pts = self.c_t + self.tgrid @ torch.as_tensor(np.asarray(R), dtype=torch.float32, device=self.dev)   # x_o = c_o + R^T y
+        vals = G.sample_world(self.src, self.A_src, pts)
+        T, w = vals[:2].reshape(2, n, n, n), vals[2].reshape(n, n, n)
+        N = w.sum() + EPS
+        Fw = w.new_zeros(self.shape)
+        Fw[:n, :n, :n] = w
+        Fw = torch.fft.rfftn(Fw).conj()
+        SI = torch.fft.irfftn(Fw * self.FI, s=self.shape, dim=DIMS)
+        SII = torch.fft.irfftn(Fw * self.FI2, s=self.shape, dim=DIMS)
+        overlap = torch.fft.irfftn(Fw * self.Ftis, s=self.shape) / N
+        wT = w * T
+        ST, STT = wT.sum(DIMS).reshape(2, 1, 1, 1), (wT * T).sum(DIMS).reshape(2, 1, 1, 1)
+        cov = self._corr(wT, self.FI) - ST * SI / N
+        varI = torch.maximum(SII - SI * SI / N, self.var_floor * N)
+        S = (cov / torch.sqrt(((STT - ST * ST / N) * varI).clamp(min=EPS))).mean(0)
+        return S, overlap, self.valid & (overlap >= self.tau)
+
+    def pose(self, R, index):
+        """4x4 OCT world -> MRI world (mm) of orientation R at flat translation index: x_mri = R (x_oct - c_o) + t."""
+        T = np.eye(4)
+        T[:3, :3] = np.asarray(R, float)
+        centre = np.array(np.unravel_index(int(index), self.shape), float) + (self.n - 1) / 2.0     # template centre, MRI voxels
+        T[:3, 3] = G.apply_affine(self.A_M, centre) - T[:3, :3] @ self.c_o
+        return T
+
+
+def search(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, params: Params = Params(), device="cuda"):
+    """Orientation search at one grid (arguments as Searcher). Rotations: geometry.rotations(n_rot, seed), plus each composed with
+    diag(1, 1, -1) if params.mirror. Per orientation the admissible argmax of |S| (polarity 'sign'; the sign is the polarity) or of
+    polarity x S (polarity '+1' / '-1' forced). Greedy NMS on polarity x S: a pose duplicates a kept one iff centres are closer
+    than nms_mm and rotations (same handedness) closer than nms_deg; the best topk are kept.
+    -> (candidates [{T 4x4, S signed, polarity +1|-1, mirror bool, overlap}] best first,
+        info {top1, top2 (polarity x S of the first two), n_admissible orientations, tau, overlap_floor flag, n_orientations, seconds})."""
+    P, t0 = params, time.time()
+    forced = {"sign": 0, "+1": 1, "-1": -1}[P.polarity]
+    s = Searcher(mri_v, mri_mask, mri_affine, oct_u, oct_w, oct_affine, P, device)
+    Rs = G.rotations(P.n_rot, P.seed)
+    if P.mirror:
+        Rs = np.concatenate([Rs, Rs @ MIRROR])
+    found = []
+    for i, R in enumerate(Rs):
+        S, overlap, adm = s.score(R)
+        X = (S.abs() if forced == 0 else forced * S).masked_fill(~adm, float("-inf")).reshape(-1)
+        j = torch.argmax(X)
+        x, Sj, ov, j = torch.stack([X[j].double(), S.reshape(-1)[j].double(), overlap.reshape(-1)[j].double(), j.double()]).tolist()
+        if x > float("-inf"):
+            found.append((x, i, int(j), Sj, forced or (1 if Sj >= 0 else -1), ov))
+    if not found:
+        raise ValueError(f"no admissible pose: no orientation reaches overlap tau = {s.tau:.3f}")
+    kept = []
+    for x, i, j, Sj, pol, ov in sorted(found, key=lambda f: -f[0]):
+        T = s.pose(Rs[i], j)
+        centre = G.apply_affine(T, s.c_o)
+        if any(np.linalg.norm(centre - c) < P.nms_mm and angle_deg(Rs[i], R) < P.nms_deg for _, c, R, _ in kept):
+            continue
+        kept.append((dict(T=T, S=Sj, polarity=pol, mirror=bool(np.linalg.det(Rs[i]) < 0), overlap=ov), centre, Rs[i], x))
+        if len(kept) >= P.topk:
+            break
+    info = dict(top1=kept[0][3], top2=kept[1][3] if len(kept) > 1 else None, n_admissible=len(found), tau=s.tau,
+                overlap_floor=s.overlap_floor, n_orientations=len(Rs), seconds=time.time() - t0)
+    return [k[0] for k in kept], info

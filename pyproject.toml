@@ -5,20 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "octreg"
 dynamic = ["version"]
-description = "Label-free affine registration of OCT blocks to MRI"
+description = "Label-free affine registration of serial-sectioning OCT blocks to ex-vivo MRI"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "Yuntian Yang" }]
-dependencies = [
-    "torch",
-    "numpy",
-    "scipy",
-    "scikit-image",
-    "nibabel",
-    "tifffile",
-    "matplotlib",
-    "tomli; python_version < '3.11'",
-]
+dependencies = ["torch>=1.10", "numpy>=1.20", "scipy>=1.6", "scikit-image>=0.19", "nibabel>=3.2", "tifffile>=2021.1", "matplotlib"]
 
 [project.optional-dependencies]
 test = ["pytest"]
