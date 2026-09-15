@@ -7,9 +7,8 @@ It writes the transform between the two input files, each volume resampled into 
 
 ![Registration of the I58 brainstem pair](docs/figures/registration_I58.png)
 
-*I58 brainstem pair, one plane per MRI axis through the registered specimen, read from the original files: the MRI, then the
-OCT placed on it before registration (orientation from the file headers, OCT specimen at the centre of the MRI crop) and after
-it, each with a 2 mm checkerboard against the MRI (MRI contrast inverted).*
+*I58 brainstem pair, one plane per MRI axis through the registered specimen, read from the original files: the MRI, the
+registered OCT on the same plane and a 2 mm checkerboard of the two (MRI contrast inverted).*
 
 ## Installation
 

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """README registration figure in the MRI frame, read from the original files: three MRI array planes through the registered
-OCT specimen centre, the native MRI slice (the reference), and the OCT placed onto it before registration (orientation from the
-file headers, the OCT specimen centre moved to the centre of the MRI crop, the only position prior) and after it (the run's transform), each also as a
-2 mm checkerboard with the MRI (MRI contrast inverted inside the run's MRI foreground when the polarity is -1, as in qc.png).
+OCT specimen centre, the native MRI slice (the reference), the OCT placed onto it by the run's transform, and a 2 mm
+checkerboard of the two (MRI contrast inverted inside the run's MRI foreground when the polarity is -1, as in qc.png).
 The OCT is box-averaged to the MRI voxel size (0.08 mm) before it is sampled.
 
     python bench/fig_registration.py --run RUN --mask MASK --mri-mask MRI_MASK --oct OCT --mri MRI -o FIG.png
@@ -47,8 +46,6 @@ def main():
     oct_, A_o = G.resample_iso(io.load_volume(a.oct), sp_m)                                   # OCT at the MRI voxel size
 
     c_oct = A_h @ np.append(ndimage.center_of_mass(spec > 0.5), 1.0)                         # OCT specimen centre, OCT world
-    T0 = np.eye(4)                                                                             # before registration
-    T0[:3, 3] = (A_m @ np.append((np.array(mri.shape) - 1) / 2.0, 1.0))[:3] - c_oct[:3]
     idx = np.rint((np.linalg.inv(A_m) @ T @ c_oct)[:3]).astype(int)                           # MRI planes
     sub = oct_[::3, ::3, ::3]
     lo_o, hi_o = np.percentile(sub[sub > 0], [0.5, 99.5])
@@ -68,24 +65,19 @@ def main():
         m = np.where(fg, 1 - m if pol < 0 else m, 0.0)
         tile = int(round(TILE_MM / sp_m))
         board = ((np.arange(sl.shape[0])[:, None] // tile + np.arange(sl.shape[1])[None, :] // tile) % 2) == 0
-        imgs = [np.clip(sl / hi_m, 0, 1)]
-        for X in (T0, T):
-            back = np.linalg.inv(X) @ world                                                    # MRI world -> OCT world
-            o = sample(oct_, A_o, back).reshape(u.shape)
-            inside = (sample(spec, A_h, back, order=0).reshape(u.shape) > 0.5) & (o > 0)
-            lo_s, hi_s = np.percentile(o[inside], [1, 99]) if inside.any() else (lo_o, hi_o)
-            imgs += [np.clip((o - lo_o) / (hi_o - lo_o), 0, 1) * (o > 0),
-                     np.where(board, np.clip((o - lo_s) / (hi_s - lo_s), 0, 1) * (o > 0), m)]
+        back = np.linalg.inv(T) @ world                                                        # MRI world -> OCT world
+        o = sample(oct_, A_o, back).reshape(u.shape)
+        inside = (sample(spec, A_h, back, order=0).reshape(u.shape) > 0.5) & (o > 0)
+        lo_s, hi_s = np.percentile(o[inside], [1, 99]) if inside.any() else (lo_o, hi_o)
+        imgs = [np.clip(sl / hi_m, 0, 1), np.clip((o - lo_o) / (hi_o - lo_o), 0, 1) * (o > 0),
+                np.where(board, np.clip((o - lo_s) / (hi_s - lo_s), 0, 1) * (o > 0), m)]
         rows.append((ax, idx[ax] * sp_m, [x.T for x in imgs]))
 
-    cell, head, gap = 3.3, 0.6, 0.2
-    x_of = lambda j: 0.35 + j * cell + gap * (j >= 1) + gap * (j >= 3)
-    W, H = x_of(4) + cell + 0.05, head + 3 * cell
+    cell, head = 3.3, 0.35
+    x_of = lambda j: 0.35 + j * cell
+    W, H = x_of(3) + 0.05, head + 3 * cell
     fig = plt.figure(figsize=(W, H), dpi=150, facecolor="white")
-    board_head = "checkerboard (MRI inverted)" if pol < 0 else "checkerboard"
-    heads = ("MRI", "OCT", board_head, "OCT", board_head)
-    for (j0, j1), t in (((1, 2), "before registration"), ((3, 4), "after registration")):
-        fig.text((x_of(j0) + x_of(j1) + cell) / 2 / W, 1 - 0.14 / H, t, ha="center", va="center", fontsize=10, weight="bold")
+    heads = ("MRI", "registered OCT", "checkerboard (MRI inverted)" if pol < 0 else "checkerboard")
     for r, (ax, pos, imgs) in enumerate(rows):
         for j, img in enumerate(imgs):
             axh = fig.add_axes(((x_of(j) + 0.03) / W, (3 * cell - (r + 1) * cell + 0.03) / H, (cell - 0.06) / W, (cell - 0.06) / H))
