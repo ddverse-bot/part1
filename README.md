@@ -2,14 +2,14 @@
 
 Label-free affine registration of serial-section OCT blocks to ex-vivo MRI.
 
-octreg aligns an OCT volume of a tissue block embedded in scatterer-doped agarose to an MRI already cropped around the block.
+octreg aligns an OCT volume of a tissue block embedded in scatterer-doped agarose to an MRI roughly cropped around the block.
 It writes the transform between the two input files, each volume resampled into the other's frame, and QC images.
 
 ![Registration of the I58 brainstem pair](docs/figures/registration_I58.png)
 
 *I58 brainstem pair, one plane per MRI axis through the registered specimen, read from the original files: the MRI, then the
-OCT placed on it before registration (orientation from the file headers, specimen centres matched) and after it, each with a
-2 mm checkerboard against the MRI (MRI contrast inverted).*
+OCT placed on it before registration (orientation from the file headers, OCT specimen at the centre of the MRI crop) and after
+it, each with a 2 mm checkerboard against the MRI (MRI contrast inverted).*
 
 ## Installation
 
@@ -47,7 +47,8 @@ resamples an OCT-frame volume (MRI-frame with `--inverse`) onto the grid of `--r
 
 1. **Specimen mask from isotropic texture.** Agarose artefacts vary along one array axis, tissue texture along all three.
 2. **One score for structure and outline.** Both scans become bright/dark tissue maps, compared together with the specimen
-   outline; the sign of the structure term gives the contrast polarity.
+   outline (OCT tissue must lie on MRI tissue; the MRI may hold tissue beyond the block); the sign of the structure term gives
+   the contrast polarity.
 3. **Orientation search in the crop and a bounded affine fit.** FFT search over 8,000 rotations, then a 12-parameter affine fit
    of the best poses under a scale and shear prior.
 

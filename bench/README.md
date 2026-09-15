@@ -20,7 +20,7 @@ STEPS="ablate evaluate report" setsid nohup bash bench/run_xiangrui.sh > /dev/nu
 ```
 
 `register` is `python -m octreg register OCT MRI -o OUT` on the two original files. Outputs go to
-`/root/autodl-tmp/bench_runs/xiangrui_I58/rel3/{main,main_logs,ablate}`, the run in bench/results/xiangrui_I58 (override with
+`/root/autodl-tmp/bench_runs/xiangrui_I58/rel4/{main,main_logs,ablate}`, the run in bench/results/xiangrui_I58 (override with
 `OUT`, `ABL`, `PREV`, `PREV_MAIN`, `DEVICE`, `CODE`). Every step writes
 `NAME.log`, `NAME.time` (wall time, peak RSS) and `NAME.gpu_mib` (nvidia-smi samples) into `main_logs`, and a start and a done
 line per step (and the last 5 log lines on failure) to `chain.log`. The script registers its process group in `/root/autodl-tmp/v11_dev/killable/octreg1_xiangrui.pgid` while it runs
@@ -40,7 +40,7 @@ not a success criterion.
 
 - Pose: displacement of `T_oct2mri` against `T_ref`, mean and max over the v1.1 OCT specimen-mask points and at the 8 block corners,
   plus the rotation angle between the two. The same distance to an earlier run with `--previous` (the script passes `PREV_MAIN`,
-  by default `final/main`, the release run with the two-class score alone, the overlap gate and the mirror search).
+  by default `rel3/main`, the previous release run, with the two-sided outline).
 - OCT specimen mask: volume and Dice against the stored v1.1 mask (`oct150_mask.npy`, 18.05 cm3), compared through the header
   affines.
 - Boundary agreement: OCT mask outline through the pose to the MRI foreground outline and back, median per face; "rim" leaves out
@@ -51,7 +51,7 @@ not a success criterion.
   `oct_in_mri.nii.gz` (Spearman, 7^3 voxel boxes). Controls flip each raw OCT axis or shift the pose by 2 mm. It passes when the pose
   gives at least 0.9 and every flip at most 0.3.
 
-Masks come from `ablate.py` (`rel3/ablate/prep/texture/`), so `evaluate` reports mask and boundary metrics only after the ablate step.
+Masks come from `ablate.py` (`rel4/ablate/prep/texture/`), so `evaluate` reports mask and boundary metrics only after the ablate step.
 
 ## Ablations
 
@@ -67,7 +67,7 @@ Masks come from `ablate.py` (`rel3/ablate/prep/texture/`), so `evaluate` reports
 | A6 | no scale prior: lambda 0 and clamp 1.0 instead of 2 and 0.15 |
 | A8 | the other handedness: the OCT world mirrored (z negated) before search and refinement |
 | A9 | no outline term: S = 2 S_class / 3 in the search (patched `search.combined`) and in the refinement (outline weight = the specimen mask, so S_outline = 0) |
-| A10 | two-sided outline of the first release: OCT embedding over MRI tissue or outside the crop counted as a mismatch |
+| A10 | two-sided outline of the previous release: OCT embedding over MRI tissue or outside the crop counted as a mismatch |
 | A11, A11b | simulated cut face (specimen mask removed beyond 70 % of its extent along OCT axis 1, data kept as embedding), with the method and with the two-sided outline |
 | A3, A7 | removed steps (section-stripe flat field; rigid, similarity and affine ladder), rows copied from the first ablation run |
 

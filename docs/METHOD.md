@@ -4,8 +4,10 @@
 
 The OCT is a scattering or intensity map of a tissue block embedded in scatterer-doped agarose, with section stripes along one
 array axis, tile seams in the section plane and exact zeros where data are missing. Its contrast may be inverted relative to
-the MRI. The MRI is an ex-vivo scan already cropped to a region containing the block; the crop is the only position prior. Both
-voxel sizes are taken as correct, so the true scales are close to 1, and both file headers as having the correct handedness.
+the MRI. The MRI is an ex-vivo scan roughly cropped to a region containing the block. The crop is larger than the block and may
+hold tissue that is not in it, for example beyond a face where the block was cut out of a larger specimen; it is the only
+position prior. Both voxel sizes are taken as correct, so the true scales are close to 1, and both file headers as having the
+correct handedness.
 
 Transforms map millimetres in the OCT file world to the MRI file world: the NIfTI header frame, or for TIFF and NPY
 diag(spacing) on the axes (x, y, z) = numpy axes (2, 1, 0). The OCT is streamed plane by plane into a 0.04 mm fine grid, where
@@ -35,9 +37,11 @@ percentile, p = sigmoid((x − t) / (0.25 s)).
 
 The OCT enters as channels u = (p_O, 1 − p_O) with its specimen mask w as weight, the MRI as v = (p_M M, (1 − p_M) M). The
 class structure alone is a weak signal on real blocks, so the score also compares the outlines, w against M over the measured
-OCT voxels q, so that the agarose has to fall on MRI background:
+OCT voxels q. OCT tissue has to lie on MRI tissue and agarose may lie on MRI background, but agarose over MRI tissue is no
+mismatch, since the MRI can hold tissue that is not in the block. The outline weight therefore leaves that case out:
+q' = q (1 − (1 − w) E), with E = M inside the crop and 1 outside it.
 
-    S_class = ½ [NCC_w(u_1, v_1) + NCC_w(u_2, v_2)],   S_outline = NCC_q(w, M),   S = (2 |S_class| + S_outline) / 3.
+    S_class = ½ [NCC_w(u_1, v_1) + NCC_w(u_2, v_2)],   S_outline = NCC_q'(w, M),   S = (2 |S_class| + S_outline) / 3.
 
 Weighted covariance is linear and ignores constants, so NCC_w(1 − u, v) = −NCC_w(u, v). Swapping the OCT classes therefore
 negates S_class exactly and leaves S_outline unchanged: one correlation scores both contrasts, and the sign of S_class is the
@@ -46,15 +50,16 @@ never multiplies them.
 
 ## 3. Orientation search in the crop
 
-The crop fixes the position, so only orientation is sampled: 8,000 rotations uniform on SO(3). For each, the OCT template is
-rotated about its box centre and S is computed over all translations with FFTs in the masked form of Padfield (IEEE Trans.
-Image Process. 21:2706, 2012); outside the crop the MRI counts as background. Each rotation keeps its best translation, and
-non-maximum suppression (3 mm, 10°) leaves 24 poses.
+The crop bounds the position, so no global search is needed: 8,000 rotations uniform on SO(3) are sampled, and for each the OCT
+template is rotated about its box centre and S is computed over all translations with FFTs in the masked form of Padfield (IEEE
+Trans. Image Process. 21:2706, 2012); with b = q (1 − w), every sum of the outline NCC is a correlation of a template with E,
+M, M² or M³. Outside the crop, OCT tissue counts as over background (the crop contains the block) and agarose is left out. Each
+rotation keeps its best translation, and non-maximum suppression (3 mm, 10°) leaves 24 poses.
 
 Mirror images are not searched, so the handedness is that of the file headers. Two physical specimens are never mirror images,
 and the score cannot tell handedness on a nearly symmetric specimen: on I58 the best mirrored pose has the lower loss but its
-anatomy in the wrong place. A mirrored stack, for example with a reversed section
-order, has to be fixed in its header, or for TIFF and NPY by reversing one array axis.
+anatomy in the wrong place. A mirrored stack, for example with a reversed section order, has to be fixed in its header, or for
+TIFF and NPY by reversing one array axis.
 
 ## 4. Prior-bounded affine refinement
 
@@ -69,40 +74,49 @@ h_i clamped to ±0.15. The lowest L wins. The prior is needed because S alone re
 
 A registration is judged by looking at it, because label-free numbers can prefer a wrong pose. In every plane of qc_montage.png
 (four planes per OCT axis, each shown as OCT, MRI through the transform, checkerboard and OCT with both outlines) the OCT
-specimen must lie on the same anatomy in the MRI, internal structures must continue across the checkerboard, cut faces and
-folded pieces must correspond and lie on the same side, and the contrast must be consistently inverted or not. Other candidate
+specimen must lie on the same anatomy in the MRI, internal structures must continue across the checkerboard, folded pieces, and
+cut faces that the MRI also shows, must correspond and lie on the same side (where the block was cut out of a larger specimen,
+the MRI tissue continues beyond the OCT cut face), and the contrast must be consistently inverted or not. Other candidate
 transforms can be rendered with `octreg qc --T` and compared side by side.
 
 ### I58 brainstem pair
 
-On the two original files (OCT 1457×2013×1595 at 20 µm, MRI crop 343×489×495 at 0.08 mm) the run took 9 min 36 s, 5.2 GiB of
-RAM and 1.8 GiB of GPU memory. S is 0.2747 (S_class −0.1175, S_outline 0.5891), polarity −1, scales 1.007 / 0.971 / 0.970. Raw
-20 µm OCT values mapped through the header and the transform correlate with the exported overlay at Spearman 0.991, against at
-most 0.270 with any OCT axis flipped.
+On the two original files (OCT 1457×2013×1595 at 20 µm, MRI crop 343×489×495 at 0.08 mm) the run took 10 min 28 s, 5.2 GiB of
+RAM and 1.3 GiB of GPU memory allocated by torch. S is 0.2855 (S_class −0.1144, S_outline 0.6277), polarity −1, scales 0.994 / 0.966 / 0.970. Raw
+20 µm OCT values mapped through the header and the transform correlate with the exported overlay at Spearman 0.990, against at
+most 0.266 with any OCT axis flipped.
 
 docs/figures/registration_I58.png shows the OCT on three MRI planes through the registered specimen before and after
-registration, read from the original files. In the qc_montage.png of the run the MRI outline follows the OCT specimen in every
-plane apart from the torn and folded cerebellar pieces, which have moved; the OCT mask takes in a margin of agarose in most
-planes. The cerebellar folia of the MRI land on the folded folia of the OCT, and a round nucleus at the top of the axis-2
-planes corresponds. The best mirrored pose fits the outline as well (S_outline 0.6438) and has the lower loss (L 0.7133 against
-0.7296), but its folia lie at the upper right of the axis-1 plane and are missing from the upper right of the axis-2 plane.
+registration, read from the original files; in the axis-0 plane the MRI tissue continues beyond the block. In the
+qc_montage.png of the run the MRI outline follows the OCT specimen in every plane apart from the torn and folded cerebellar
+pieces, which have moved; the OCT mask takes in a margin of agarose in several planes. The cerebellar folia of the MRI land on the
+folded folia of the OCT, and a round nucleus at the top of the axis-2 planes corresponds. The best mirrored pose fits the
+outline better (S_outline 0.6867) and has the lower loss (L 0.7035 against 0.7192), but its folia lie at the upper right of the
+axis-1 plane and are missing from the upper right of the axis-2 plane.
 
-Each ablation changes one element and reruns search and refinement; pose changes are block-corner means against the result.
+Each ablation changes one element and reruns search and refinement (the cut-face row compares the two outlines on the same
+cut); pose changes are block-corner means against the result.
 
 | change | pose change (mm) |
 |---|---|
-| polarity forced to +1 | 47.7 |
-| no scale prior (λ 0, clamp 1.0): S 0.3610, one axis scaled to 0.43 | 44.5 |
-| intensity-threshold OCT mask instead of the texture mask | 42.1 |
-| no outline term | 41.8 |
-| the other handedness (OCT mirrored) | 29.8 |
-| holes filled in 3-D only | 1.69 |
-| standardised intensities instead of two-class maps | 0.74 |
-| an independently made rim-watershed specimen mask (Dice 0.92) | 0.32 |
-| MRI flattening off / OCT flattening off | 0.12 / 0.10 |
+| intensity-threshold OCT mask instead of the texture mask | 42.0 |
+| no outline term | 41.7 |
+| polarity forced to +1 | 41.1 |
+| no scale prior (λ 0, clamp 1.0): S 0.5018, one axis scaled to 0.46 | 38.7 |
+| the other handedness (OCT mirrored) | 29.5 |
+| cut face simulated by removing the last 30 % of the mask along OCT axis 1: two-sided outline / method | 4.69 / 0.40 |
+| OCT flattening off | 2.41 |
+| an independently made rim-watershed specimen mask (Dice 0.92) | 2.26 |
+| holes filled in 3-D only | 2.18 |
+| standardised intensities instead of two-class maps | 0.79 |
+| two-sided outline (agarose over MRI tissue counted as a mismatch) | 0.23 |
+| MRI flattening off | 0.18 |
 
-Flattening barely moves the pose but keeps it stable: without it, the rim-watershed mask and 3-D hole filling moved the pose by
-42.3 and 40.9 mm.
+The two-sided outline scores the full pair almost as the method does, but once the block has a cut face beyond which the MRI
+tissue continues, it pulls the pose by 4.7 mm and the method by 0.4 mm. OCT flattening off, the rim-watershed mask and 3-D hole
+filling all end in nearly the same pose, 5.2 to 5.7° from the result (1.0 to 1.1 mm mean over the specimen). Refined under the
+method from the first and the last of these, the loss stops at 0.7197 against 0.7192 for the result, and the overlay of the first places
+the torn cerebellar pieces worse. The loss separates poses this close only weakly.
 
 ## Parameters
 

@@ -8,7 +8,7 @@ explicit change: another OCT mask (A0 the histogram valley of the OCT, A0b the s
 A0c the texture mask with the 3-D hole filling of the first release), two_class(..., flatten=False) for one modality (A1, A2),
 standardised intensity channels built in this file (A4),
 align(..., polarity=+1 / -1) (A5), Params lam 0 and clamp 1 (A6), the OCT world mirrored so that the search and refinement see
-the other handedness (A8), no outline term (A9), the two-sided outline of the first release (A10), or a simulated cut face
+the other handedness (A8), no outline term (A9), the two-sided outline of the previous release (A10), or a simulated cut face
 with the method and with the two-sided outline (A11, A11b). 'base' is the method through this driver; its distance to the CLI run
 (--main) is the driver check. The OCT is streamed once, each OCT mask is computed once and the MRI is prepared once.
 
@@ -152,7 +152,7 @@ def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_cla
     outline False: S = 2 S_class / 3. The search's combined score is patched to leave S_outline out (on the pooled search grid
     the mask edge is fractional, so a zero outline weight alone would not remove it); in the refinement the outline weight is
     the specimen mask itself, on which the mask is constant, so S_outline is 0.
-    two_sided: the outline of the first release, weight q in the search and the refinement (embedding over MRI tissue counts).
+    two_sided: the outline of the previous release, weight q in the search and the refinement (embedding over MRI tissue counts).
     cut_axis: the specimen mask is removed beyond 70 % of its extent along that OCT axis, the OCT data there kept as embedding,
     as for a block cut out of a larger specimen whose MRI tissue continues beyond the cut."""
     h = P.base_mm
