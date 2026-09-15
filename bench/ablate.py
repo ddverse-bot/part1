@@ -9,13 +9,17 @@ A0c the texture mask with the 3-D hole filling of the first release), two_class(
 standardised intensity channels built in this file (A4),
 align(..., polarity=+1 / -1) (A5), Params lam 0 and clamp 1 (A6), the OCT world mirrored so that the search and refinement see
 the other handedness (A8), no outline term (A9), the two-sided outline of the previous release (A10), or a simulated cut face
-with the method and with the two-sided outline (A11, A11b). 'base' is the method through this driver; its distance to the CLI run
+with the method and with the two-sided outline (A11, A11b), or no fine-structure refinement (A12, the pose of §4). Every other
+variant ends with §5 on its own best pose. 'base' is the method through this driver; its distance to the CLI run
 (--main) is the driver check. The OCT is streamed once, each OCT mask is computed once and the MRI is prepared once.
 
 Removed steps (REMOVED) keep their rows from the ablation run that measured them (--previous, one ablations.json per group):
 the section-stripe flat field (A3) and the rigid -> similarity -> affine ladder (A7) from the first run. Each was measured
 against the base of its run, which still had the step, and the pose change from that base to the present base is reported
 next to them.
+
+Every variant keeps the pose of §4 (T_before_ngf) as well as the final pose, and the table reports the change of both against
+the base: steps of §1-4 act through the §4 pose, which §5 then refines within a few degrees and millimetres.
 
 Metrics from bench/evaluate.py: pose to base and to R5, boundary agreement with the base masks for every variant (so it reflects
 the pose only), OCT mask volume and Dice against the v1.1 mask per mask source.
@@ -43,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import evaluate as E                                                    # noqa: E402  (bench/evaluate.py)
 from octreg import geometry as G, io, preprocess as pp, refine as Rf, search as S     # noqa: E402
 from octreg.params import Params                                        # noqa: E402
+from octreg.ngf import refine_ngf                                       # noqa: E402
 from octreg.register import align, fine_mask                            # noqa: E402
 
 VARIANTS = {    # name: (what changes, the explicit change: mask source, solve() keywords, Params overrides)
@@ -62,6 +67,7 @@ VARIANTS = {    # name: (what changes, the explicit change: mask source, solve()
     "A11": ("simulated cut face: specimen mask removed beyond 70 % of its extent along OCT axis 1 (data kept as embedding)",
             {"cut_axis": 1}),
     "A11b": ("the same cut face with the two-sided outline", {"cut_axis": 1, "two_sided": True}),
+    "A12": ("no fine-structure refinement (§5): the pose of §4", {"ngf": False}),
 }
 MIRROR = np.diag([1.0, 1.0, -1.0, 1.0])
 REMOVED = [    # groups of removed steps, each measured in one earlier ablation run
@@ -146,7 +152,7 @@ def standardised(arr, mask, h, P):
 
 
 def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0, mirror=False, outline=True,
-          two_sided=False, cut_axis=None):
+          two_sided=False, cut_axis=None, ngf=True):
     """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls.
     mirror: search and refine against the OCT world mirrored by MIRROR, poses returned in the OCT header world (det < 0).
     outline False: S = 2 S_class / 3. The search's combined score is patched to leave S_outline out (on the pooled search grid
@@ -154,7 +160,9 @@ def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_cla
     the specimen mask itself, on which the mask is constant, so S_outline is 0.
     two_sided: the outline of the previous release, weight q in the search and the refinement (embedding over MRI tissue counts).
     cut_axis: the specimen mask is removed beyond 70 % of its extent along that OCT axis, the OCT data there kept as embedding,
-    as for a block cut out of a larger specimen whose MRI tissue continues beyond the cut."""
+    as for a block cut out of a larger specimen whose MRI tissue continues beyond the cut.
+    ngf False: the best pose of §4 without the fine-structure refinement (§5); otherwise §5 refines the best pose, as in register,
+    on the raw base-grid arrays with the (cut) specimen mask."""
     h = P.base_mm
     if cut_axis is not None:
         idx = np.argwhere(o["mask"])[:, cut_axis]
@@ -183,6 +191,9 @@ def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_cla
         poses, info = align((u, w, q, F @ o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
     finally:
         S.combined, S.Searcher._outline, Rf.BaseGrid.score = combined, outline_map, score
+    if ngf:
+        T, info["ngf"] = refine_ngf((m["arr"], m["mask"], m["affine"]), (o["arr"], o["mask"], F @ o["affine"]), poses[0]["T"], P, device)
+        poses[0] = {**poses[0], "T_before_ngf": poses[0]["T"] @ F, "T": T, "NGF_start": info["ngf"]["F_start"], "NGF": info["ngf"]["F"]}
     return [{**p, "T": p["T"] @ F} for p in poses], info
 
 
@@ -212,7 +223,9 @@ def run_variant(name, out, device, force):
         return json.loads((d / "result.json").read_text())
     keys = ("S", "S_class", "S_outline", "L", "polarity", "log_scales", "shears", "search_rank")
     best = poses[0]
-    r = {**head, "T": best["T"], "best": {k: best[k] for k in keys}, "poses": [{k: p[k] for k in keys} for p in poses], **info,
+    r = {**head, "T": best["T"], "T_before_ngf": best.get("T_before_ngf", best["T"]),
+         "best": {**{k: best[k] for k in keys}, **{k: best[k] for k in ("NGF_start", "NGF") if k in best}},
+         "poses": [{k: p[k] for k in keys} for p in poses], **info,
          "seconds": time.time() - t0, "gpu_peak_gb": torch.cuda.max_memory_allocated() / 2 ** 30 if cuda else None,
          "peak_rss_gb": peak_rss_gb()}
     io.write_transform_txt(best["T"], d / "T_oct2mri.txt")
@@ -250,19 +263,22 @@ def main():
                      ref["A_hdr"])
     masks = {s: E.mask_agreement(*E.load_mask(a.out / "prep" / s / "oct_mask.nii.gz"), ref["mask"], ref["A_mask"]) for s in sources}
     rows = {n: run_variant(n, a.out, a.device, a.force) for n in names}
-    T_base = np.array(rows["base"]["T"])
+    T_base, T_base4 = np.array(rows["base"]["T"]), np.array(rows["base"]["T_before_ngf"])
     table = {}
     for n, r in rows.items():
         common = {"change": r["change"], "prep": r["prep"], "spec": r["spec"], "mask": masks[r["prep"]], "seconds": r["seconds"]}
         if "error" in r:
             table[n] = {**common, "error": r["error"]}
             continue
-        T, best = np.array(r["T"]), r["best"]
-        to_base = E.pose(T, T_base, pts, cor)
+        T, T4, best = np.array(r["T"]), np.array(r["T_before_ngf"]), r["best"]
+        to_base, to_base4 = E.pose(T, T_base, pts, cor), E.pose(T4, T_base4, pts, cor)
+        A_lin = ref["A_hdr"][:3, :3] / np.linalg.norm(ref["A_hdr"][:3, :3], axis=0)
         table[n] = {**common, "S": best["S"], "S_class": best["S_class"], "S_outline": best["S_outline"], "L": best["L"],
-                    "polarity": best["polarity"], "scales": np.exp(best["log_scales"]).tolist(), "shears": best["shears"],
+                    "NGF_start": best.get("NGF_start"), "NGF": best.get("NGF"), "polarity": best["polarity"],
+                    "scales": np.linalg.norm(T[:3, :3] @ A_lin, axis=0).tolist(), "shears": best["shears"],
                     "search": {k: r["search"].get(k) for k in ("top1", "top2", "n_orientations")},
                     "refine": r["refine"], "pose_to_base": to_base, "within_0.5mm_of_base": to_base["mean_mm"] <= 0.5,
+                    "pose_to_base_s4": to_base4, "within_0.5mm_of_base_s4": to_base4["mean_mm"] <= 0.5, "T_before_ngf": r["T_before_ngf"],
                     "pose_to_R5": E.pose(T, ref["T_ref"], pts, cor), "boundary": bnd(T), "search_seconds": r["search"]["seconds"],
                     "refine_seconds": r["refine"]["seconds"], "gpu_peak_gb": r["gpu_peak_gb"], "T_oct2mri": r["T"]}
     prep = {s: json.loads((a.out / "prep" / s / "prep.json").read_text()) for s in sources + ["mri"]}

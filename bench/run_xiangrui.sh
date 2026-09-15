@@ -6,16 +6,16 @@
 #
 # STEPS   in order; default "register evaluate". The whole benchmark is "register ablate evaluate report".
 #           register  python -m octreg register OCT MRI -o OUT
-#           ablate    bench/ablate.py: preprocessing once, variants A0-A11b -> ABL/ablations.json (removed steps A3, A7 from PREV)
+#           ablate    bench/ablate.py: preprocessing once, variants A0-A12 -> ABL/ablations.json (removed steps A3, A7 from PREV)
 #           evaluate  bench/evaluate.py OUT: pose to R5 and to PREV_MAIN, boundary with the v1.1 masks, raw-data frame check;
 #                     mask and boundary metrics with the method masks once ABL/prep/texture exists
 #           report    bench/report.py -> bench/BENCHMARK.md, bench/figures/fig_qc_xiangrui.png and fig_ablation.png
-# OUT     run dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel4/main, the run in bench/results); logs go to ${OUT}_logs
-# ABL     ablation dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel4/ablate); DEVICE cuda | cpu (default cuda)
+# OUT     run dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel6/main, the run in bench/results); logs go to ${OUT}_logs
+# ABL     ablation dir (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel6/ablate); DEVICE cuda | cpu (default cuda)
 # PREV    ablations.json files of the runs that measured the removed steps (space-separated): A3 and A7
 #         (default BENCH/ablate/ablations.json; missing files are skipped)
-# PREV_MAIN  an earlier CLI run dir for evaluate's pose distance (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel3/main,
-#            the previous release run, with the two-sided outline)
+# PREV_MAIN  an earlier CLI run dir for evaluate's pose distance (default /root/autodl-tmp/bench_runs/xiangrui_I58/rel4/main,
+#            the release run before §5)
 # Every step writes NAME.log, NAME.time (wall time and peak RSS, GNU time wording) and NAME.gpu_mib (nvidia-smi every 5 s);
 # chain.log has a start and a done line per step (and the last 5 log lines on failure). One heavy job at a time (62 GB
 # container): refuses to start while another registration runs.
@@ -25,10 +25,10 @@ DATA=/root/autodl-tmp/oct-mri-registration/data/xiangrui/OCT_to_MRI
 OCT=$DATA/I58_Brainstem_mus_Slice_full_20um_corr.nii.gz
 MRI=$DATA/I58_brainstem_MRI_cropped_to_OCT.nii.gz
 BENCH=/root/autodl-tmp/bench_runs/xiangrui_I58
-OUT=${OUT:-$BENCH/rel4/main}
-ABL=${ABL:-$BENCH/rel4/ablate}
+OUT=${OUT:-$BENCH/rel6/main}
+ABL=${ABL:-$BENCH/rel6/ablate}
 PREV=${PREV:-$BENCH/ablate/ablations.json}
-PREV_MAIN=${PREV_MAIN:-$BENCH/rel3/main}
+PREV_MAIN=${PREV_MAIN:-$BENCH/rel4/main}
 LOGS=${OUT}_logs
 STEPS=${STEPS:-register evaluate}
 DEVICE=${DEVICE:-cuda}

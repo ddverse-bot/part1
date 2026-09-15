@@ -1,13 +1,14 @@
 # bench
 
-Benchmark of octreg 1.0 on Xiangrui's I58 brainstem pair, the only pair in scope for now. It lives in the repository but is not part of the package, and the method never reads anything here. The pair has
-no labels, so every metric is label-free. Paths are those of the AutoDL server.
+Benchmark of octreg 1.0 on Xiangrui's I58 brainstem pair, and a generality check on the DANDI:000026 blocks. It lives in the repository but is not part of the package, and the method never reads anything here. The I58 pair has
+no labels, so its metrics are label-free. Paths are those of the AutoDL server.
 
 | file | what it does |
 |---|---|
 | `run_xiangrui.sh` | runs the steps below from `/root/autodl-tmp/octreg1`, detached-friendly, logs next to the run dir |
 | `evaluate.py` | pose against the reference R5, OCT mask volume and Dice, boundary agreement, raw-data frame check |
-| `ablate.py` | preprocessing once, then the variants base and A0-A9, one JSON table |
+| `ablate.py` | preprocessing once, then the variants base and A0-A12, one JSON table |
+| `dandi.py` | DANDI:000026 blocks: MRI crop around the Broca-area labels, a block position of an earlier registration or a coarse whole-hemisphere location; §1-5 for both handednesses; label checks (`bench/results/dandi/summary.json`) |
 | `report.py` | writes `bench/BENCHMARK.md` and the two figures in `bench/figures/` from the outputs |
 | `compose_pair.py` | two `octreg qc` outputs of one run side by side (`bench/figures/fig_handedness_xiangrui.png`) |
 
@@ -20,7 +21,7 @@ STEPS="ablate evaluate report" setsid nohup bash bench/run_xiangrui.sh > /dev/nu
 ```
 
 `register` is `python -m octreg register OCT MRI -o OUT` on the two original files. Outputs go to
-`/root/autodl-tmp/bench_runs/xiangrui_I58/rel4/{main,main_logs,ablate}`, the run in bench/results/xiangrui_I58 (override with
+`/root/autodl-tmp/bench_runs/xiangrui_I58/rel7/{main,main_logs}` and `rel6/ablate` (rel6/main has the identical transform), the run in bench/results/xiangrui_I58 (override with
 `OUT`, `ABL`, `PREV`, `PREV_MAIN`, `DEVICE`, `CODE`). Every step writes
 `NAME.log`, `NAME.time` (wall time, peak RSS) and `NAME.gpu_mib` (nvidia-smi samples) into `main_logs`, and a start and a done
 line per step (and the last 5 log lines on failure) to `chain.log`. The script registers its process group in `/root/autodl-tmp/v11_dev/killable/octreg1_xiangrui.pgid` while it runs
@@ -40,7 +41,7 @@ not a success criterion.
 
 - Pose: displacement of `T_oct2mri` against `T_ref`, mean and max over the v1.1 OCT specimen-mask points and at the 8 block corners,
   plus the rotation angle between the two. The same distance to an earlier run with `--previous` (the script passes `PREV_MAIN`,
-  by default `rel3/main`, the previous release run, with the two-sided outline).
+  by default `rel4/main`, the release run before §5).
 - OCT specimen mask: volume and Dice against the stored v1.1 mask (`oct150_mask.npy`, 18.05 cm3), compared through the header
   affines.
 - Boundary agreement: OCT mask outline through the pose to the MRI foreground outline and back, median per face; "rim" leaves out
@@ -69,6 +70,7 @@ Masks come from `ablate.py` (`rel4/ablate/prep/texture/`), so `evaluate` reports
 | A9 | no outline term: S = 2 S_class / 3 in the search (patched `search.combined`) and in the refinement (outline weight = the specimen mask, so S_outline = 0) |
 | A10 | two-sided outline of the previous release: OCT embedding over MRI tissue or outside the crop counted as a mismatch |
 | A11, A11b | simulated cut face (specimen mask removed beyond 70 % of its extent along OCT axis 1, data kept as embedding), with the method and with the two-sided outline |
+| A12 | no fine-structure refinement: the pose of §4 (every other variant ends with §5) |
 | A3, A7 | removed steps (section-stripe flat field; rigid, similarity and affine ladder), rows copied from the first ablation run |
 
 `Params` holds method constants only. Each variant is one explicit change made in the driver around the package functions the
@@ -86,6 +88,6 @@ the search, (`/root/autodl-tmp/bench_runs/xiangrui_I58/ablate`), against a base 
 the flat field and the ladder. Neither moved the pose by more than 0.5 mm, so both steps were deleted. `ablate.py --previous`
 copies their rows and reports how far the present base lies from that earlier base.
 
-The deletion rule: a step whose removal moves the pose by at most 0.5 mm (mean over the specimen-mask points) and changes no
-metric beyond noise is deleted before release, unless it keeps the pose stable under the other ablations (flattening, see
-bench/BENCHMARK.md).
+The deletion rule: a step whose removal moves the pose by at most 0.5 mm (mean over the specimen-mask points; the pose after §4
+for steps of §1-4, the final pose for §5) and changes no metric beyond noise is deleted before release. MRI flattening meets it
+and is kept as the one exception, so that both volumes pass through the same class map (see bench/BENCHMARK.md).

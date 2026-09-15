@@ -1,8 +1,9 @@
 """End to end through the command line on a small synthetic pair, CPU: an agarose-embedded OCT block (equal mean intensity,
 section offsets, tile seams, a black tile, inverted contrast, LPI-like header) and an MRI crop (RIA-like header) related by
-a known affine. Reduced search and refinement through --params; the pose is recovered to < 0.4 mm (0.16-0.17 mm over seeds 0-2),
+a known affine. Reduced search and refinement through --params; the pose is recovered to < 0.4 mm (0.12-0.28 mm over seeds 0-2),
 the texture mask finds the specimen where the histogram rule has no valley, every output is written, `octreg apply`
-reproduces oct_in_mri.nii.gz and `octreg qc` reproduces the visual QC figures; user masks replace both foregrounds."""
+reproduces oct_in_mri.nii.gz and `octreg qc` reproduces the visual QC figures; user masks replace both foregrounds; the same OCT
+as an NPY stack, whose array frame is the mirror image of the NIfTI world, is registered in its correct handedness."""
 import json
 
 import nibabel as nib
@@ -100,7 +101,7 @@ def test_register_and_apply(tmp_path):
     assert 0.9 < res["foreground"]["oct"]["volume_cm3"] / (len(pts) * 0.08 ** 3 / 1e3) < 1.3          # 1.10-1.12 over seeds
     scale = res["pose"]["scale_per_oct_axis"]                   # true 1.03 / 1 / 1; the mask margin biases it low (0.91-0.97)
     assert 0.85 < min(scale) and max(scale) < 1.1
-    assert res["params"]["n_rot"] == FAST["n_rot"] and set(res["seconds"]) >= {"oct_mask", "search_refine", "total"}
+    assert res["params"]["n_rot"] == FAST["n_rot"] and set(res["seconds"]) >= {"oct_mask", "search_refine_ngf", "total"}
     assert res["refine"]["n_poses"] == FAST["topk"] and res["search"]["n_orientations"] == FAST["n_rot"]
 
     ref = nib.load(str(out / "oct_in_mri.nii.gz"))
@@ -144,3 +145,25 @@ def test_user_masks(tmp_path):
     res = json.loads((out / "result.json").read_text())
     assert res["foreground"]["oct"]["source"].endswith("oct_mask.nii.gz") and res["foreground"]["mri"]["source"].endswith("mri_mask.nii.gz")
     assert distance(np.loadtxt(out / "T_oct2mri.txt"), T_true, pts) < 0.4 and res["pose"]["polarity"] == -1
+
+
+def test_array_frame_handedness(tmp_path):
+    """An NPY stack has no orientation: both handednesses are tried and fine structure picks the mirrored one here."""
+    oct_path, mri_path, T_true, pts = pair(tmp_path, seed=0)
+    img = nib.load(str(oct_path))
+    np.save(tmp_path / "oct.npy", np.asarray(img.dataobj, np.float32).transpose(2, 1, 0))       # numpy (z, y, x)
+    A_arr = np.diag([0.08, 0.08, 0.08, 1.0])
+    T_arr = T_true @ img.affine @ np.linalg.inv(A_arr)                                          # array world -> MRI world, det < 0
+    pts_arr = G.apply_affine(A_arr @ np.linalg.inv(img.affine), pts)
+    (tmp_path / "params.json").write_text(json.dumps(FAST))
+    out = tmp_path / "run"
+    assert main(["register", str(tmp_path / "oct.npy"), str(mri_path), "-o", str(out), "--device", "cpu", "--params",
+                 str(tmp_path / "params.json"), "--oct-spacing-um", "80,80,80"]) == 0
+    res, T = json.loads((out / "result.json").read_text()), np.loadtxt(out / "T_oct2mri.txt")
+    assert np.linalg.det(T_arr[:3, :3]) < 0 and np.linalg.det(T[:3, :3]) < 0
+    assert res["pose"]["handedness"] == -1 and "mirrored_oct_frame" in res["flags"] and distance(T, T_arr, pts_arr) < 0.4
+    assert res["pose"]["NGF"] > res["pose"]["NGF_other_handedness"]
+    assert main(["apply", "--run", str(out), "--moving", str(tmp_path / "oct.npy"), "--reference", str(mri_path), "-o",
+                 str(tmp_path / "again.nii.gz")]) == 0
+    np.testing.assert_allclose(nib.load(str(tmp_path / "again.nii.gz")).get_fdata(),
+                               nib.load(str(out / "oct_in_mri.nii.gz")).get_fdata(), rtol=1e-5, atol=1e-3)

@@ -61,6 +61,7 @@ def main(argv=None) -> int:
             res = register(args.oct, args.mri, args.out, args.oct_spacing_um, args.oct_mask, args.mri_mask, params, args.device)
             pose, s = res["pose"], res["search"]
             print(f"octreg: S {pose['S']:.4f}, polarity {pose['polarity']:+d}, search top1/top2 {s['top1']:.4f}/{s['top2'] or 0:.4f}, "
+                  f"NGF {pose['NGF_start']:.4f} -> {pose['NGF']:.4f}, "
                   f"flags {res['flags'] or 'none'} -> {args.out}")
         elif args.command == "apply":
             print(f"octreg: wrote {apply(args.run, args.moving, args.reference, args.out, args.inverse)}")

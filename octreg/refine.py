@@ -1,7 +1,7 @@
 """Affine refinement (docs/METHOD.md §4): every search pose is fitted on the base grid with its polarity fixed, and the lowest loss
 wins.
 
-Model x_mri = R(r) Sh(sh) diag(exp(ls)) (x_oct - c) + t, c = OCT grid box centre (mm); no mirror (handedness from the file frames).
+Model x_mri = R(r) Sh(sh) diag(exp(ls)) (x_oct - c) + t, c = OCT grid box centre (mm); proper poses only.
 S = (2 S_class + S_outline) / 3 as in the search: S_class the mean over the two channel pairs of the NCC between the OCT channels
 at the specimen voxels (swapped for polarity -1) and the MRI channels sampled through the pose; S_outline the NCC between the
 specimen mask w and the MRI foreground M sampled through the pose at the measured OCT voxels q, weighted by q (1 - (1 - w) E),
@@ -36,7 +36,7 @@ def decompose(T, c):
     """Inverse of compose for a 4x4 numpy affine: A = Q U (QR, diag U > 0) -> (r, t, ls, sh numpy [3]). A mirrored pose is refused."""
     A = np.asarray(T, float)[:3, :3]
     if np.linalg.det(A) <= 0:
-        raise ValueError(f"mirrored or singular pose (det <= 0): the handedness comes from the file frames\n{T}")
+        raise ValueError(f"mirrored or singular pose (det <= 0)\n{T}")
     Q, U = np.linalg.qr(A)
     d = np.where(np.diag(U) < 0, -1.0, 1.0)
     Q, U = Q * d, d[:, None] * U

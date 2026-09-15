@@ -56,12 +56,15 @@ def stack(vol):
 def test_params_defaults_dict_and_hash():
     p = Params()
     assert (p.search_mm, p.base_mm, p.fine_mm, p.n_rot, p.topk, p.iters, p.lam, p.clamp) == (0.6, 0.15, 0.04, 8000, 24, 200, 2.0, 0.15)
-    assert all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in p.to_dict().values())       # constants, no switches
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    assert all(num(v) or (isinstance(v, tuple) and v and all(isinstance(x, float) for x in v)) for v in p.to_dict().values())  # constants
+    assert Params.from_dict({"ngf_sigmas_mm": [0.5, 1]}).ngf_sigmas_mm == (0.5, 1.0)
     q = Params.from_dict(json.loads(json.dumps(dataclasses.replace(p, topk=12, lam=0.0).to_dict())))
     assert q == dataclasses.replace(p, topk=12, lam=0.0) and q.hash() != p.hash() and len(p.hash()) == 16
     assert Params.from_dict({"lam": 1, "clamp": 1}) == dataclasses.replace(p, lam=1.0, clamp=1.0)
     for bad in ({"rho": 0.8}, {"topk": 12.5}, {"topk": True}, {"polarity": "+1"}, {"destripe": False}, {"levels": [0.6, 0.15]},
-                {"fine_mm": 0.2}, {"search_mm": 0.1}, {"search_mm": 0.55}):
+                {"fine_mm": 0.2}, {"search_mm": 0.1}, {"search_mm": 0.55}, {"ngf_sigmas_mm": []}, {"ngf_sigmas_mm": [0.3, -0.1]},
+                {"ngf_sigmas_mm": 0.3}, {"ngf_iters": 0}, {"ngf_erode_mm": 0.0}):
         with pytest.raises(ValueError):
             Params.from_dict(bad)
     env = dict(os.environ, PYTHONHASHSEED="4242", PYTHONPATH=str(ROOT))

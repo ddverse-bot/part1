@@ -1,4 +1,4 @@
-"""`octreg register` (docs/METHOD.md §1-4 on two files, then the outputs) and `octreg apply`.
+"""`octreg register` (docs/METHOD.md §1-5 on two files, then the outputs) and `octreg apply`.
 
 A transform T is a 4x4 matrix (mm) from the OCT world to the MRI world; worlds are the NIfTI header frames (array frame for
 TIFF / NPY). The OCT is only ever streamed: its largest array in memory is the fine grid (Params.fine_mm).
@@ -15,9 +15,12 @@ import torch
 from scipy import ndimage
 
 from . import __version__, geometry as G, io, preprocess as pp
+from .ngf import refine_ngf
 from .params import Params
-from .refine import refine
-from .search import search
+from .refine import decompose, refine
+from .search import box, search
+
+MIRROR = np.diag([1.0, 1.0, -1.0, 1.0])       # the other handedness of an OCT frame: world z negated
 
 OUTPUTS = ("T_oct2mri.txt", "T_mri2oct.txt", "oct2mri.lta", "oct2mri_itk.txt", "oct_in_mri.nii.gz", "mri_in_oct.nii.gz", "qc.png",
            "qc_montage.png", "result.json")
@@ -62,17 +65,30 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
     u, w = pp.oct_channels(pp.two_class(oct_h, mask_o, h, P), mask_o)
     v = pp.mri_channels(pp.two_class(mri_h, mask_m, h, P), mask_m)
     lap("two_class")
-    # §3-4: orientation search in the crop and affine refinement
-    poses, info = align((u, w, valid_o, A_o), (v, mask_m, A_m), P, device)
-    lap("search_refine")
+    # §3-5: search and affine refinement, then fine-structure refinement of the best pose. Orientation headers on both files fix
+    # the handedness; otherwise (TIFF, NPY, NIfTI without sform/qform) both are tried and the pose with the higher F wins
+    hands = {}
+    for hand, F in ((1, np.eye(4)), (-1, MIRROR))[:1 if vo.frame == vm.frame == "header" else 2]:
+        poses, info = align((u, w, valid_o, F @ A_o), (v, mask_m, A_m), P, device)
+        T5, info["ngf"] = refine_ngf((mri_h, mask_m, A_m), (oct_h, mask_o, F @ A_o), poses[0]["T"], P, device)
+        hands[hand] = (poses[0], T5, F, info)
+    lap("search_refine_ngf")
+    hand = max(hands, key=lambda k: hands[k][3]["ngf"]["F"])
+    best, T5, F, info = hands[hand]
+    T = T5 @ F
 
-    best = poses[0]
-    T = best["T"]
-    pose = {k: best[k] for k in ("S", "S_class", "S_outline", "L", "polarity", "log_scales", "shears", "search_rank")}
-    pose["scale_per_oct_axis"] = np.linalg.norm(T[:3, :3] @ (vo.affine[:3, :3] / vo.spacing_mm), axis=0).tolist()
+    _, _, ls, sh = decompose(T5, box(F @ A_o, oct_h.shape)[0])
+    pose = {k: best[k] for k in ("S", "S_class", "S_outline", "L", "polarity", "search_rank")}
+    corners = G.apply_affine(vo.affine, np.array([[i, j, k] for i in (0, vo.shape[0] - 1) for j in (0, vo.shape[1] - 1)
+                                                  for k in (0, vo.shape[2] - 1)], float))
+    shift = float(np.linalg.norm(G.apply_affine(T, corners) - G.apply_affine(best["T"] @ F, corners), axis=1).mean())
+    pose.update(handedness=hand, T_before_ngf=best["T"] @ F, NGF_start=info["ngf"]["F_start"], NGF=info["ngf"]["F"], ngf_shift_mm=shift,
+                NGF_other_handedness=hands[-hand][3]["ngf"]["F"] if -hand in hands else None, log_scales=ls.tolist(),
+                shears=sh.tolist(), scale_per_oct_axis=np.linalg.norm(T[:3, :3] @ (vo.affine[:3, :3] / vo.spacing_mm), axis=0).tolist())
     flags = ["mri_foreground_no_valley"] * (fg_m.get("status") == "no_valley")
     flags += ["nondefault_params"] * (P != Params())
-    flags += ["clamp_saturated"] * bool(np.abs([*best["log_scales"], *best["shears"]]).max() >= P.clamp * (1 - 1e-3))
+    flags += ["clamp_saturated"] * bool(np.abs([*best["log_scales"], *best["shears"], *ls, *sh]).max() >= P.clamp * (1 - 1e-3))
+    flags += ["mirrored_oct_frame"] * (hand == -1)
     inputs = {"oct": {**vars(vo), "path": _abs(vo.path)}, "mri": {**vars(vm), "path": _abs(vm.path)},
               "oct_spacing_um": oct_spacing_um, "oct_mask": oct_mask, "mri_mask": mri_mask, "device": str(device)}
     result = {"octreg_version": __version__, "inputs": inputs, "params": P.to_dict(), "params_hash": P.hash(), "T_oct2mri": T,
@@ -86,7 +102,7 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
     io.save_nifti(G.resample_to(*overlay, vm.shape, vm.affine, np.linalg.inv(T)), vm.affine, out / "oct_in_mri.nii.gz")
     io.save_nifti(G.resample_to(mri_h, A_m, oct_h.shape, A_o, T), A_o, out / "mri_in_oct.nii.gz")
     qc_figures(out / "qc", (oct_h, mask_o, A_o), (mri_h, mask_m, A_m), T, pose["polarity"], vo.affine,
-               f"S {pose['S']:.4f} (class {pose['S_class']:+.4f}, outline {pose['S_outline']:.4f})")
+               _label(pose))
     lap("outputs")
     try:                                                        # peak RSS: Unix only, None elsewhere
         import resource
@@ -159,6 +175,11 @@ def apply(run_dir, moving, reference, out, inverse=False) -> Path:
     return Path(out)
 
 
+def _label(pose):
+    ngf = f"; §5: NGF {pose['NGF_start']:.4f} -> {pose['NGF']:.4f}" if "NGF" in pose else ""
+    return f"§4: S {pose['S']:.4f} (class {pose['S_class']:+.4f}, outline {pose['S_outline']:.4f}){ngf}"
+
+
 def _mm(x):
     """A length to 6 significant digits (float32 header noise)."""
     return float(f"{x:.6g}")
@@ -194,8 +215,7 @@ def qc(run_dir, oct_path, mri_path, T=None, prefix=None, oct_spacing_um=None, oc
     Tm = T_run if T is None else np.load(T) if str(T).endswith(".npy") else np.loadtxt(T)
     if Tm.shape != (4, 4):
         raise ValueError(f"{T}: expected a 4x4 matrix")
-    label = (f"S {pose['S']:.4f} (class {pose['S_class']:+.4f}, outline {pose['S_outline']:.4f})" if np.array_equal(Tm, T_run)
-             else f"T {Path(T).name}")
+    label = _label(pose) if np.array_equal(Tm, T_run) else f"T {Path(T).name}"
     mri_grid = prepare_mri(vm, P, mm)[0]
     oct_grid = prepare_oct(*G.resample_iso(vo, P.fine_mm), P, mo)[0]
     prefix = prefix or run / ("qc" if T is None else f"qc_{Path(T).stem}")

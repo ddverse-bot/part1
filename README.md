@@ -28,7 +28,9 @@ octreg apply --run OUT --moving X --reference Y -o Z [--inverse]
 ```
 
 `register` runs the registration. The OCT can be NIfTI, TIFF, OME-TIFF or NPY (`--oct-spacing-um Z,Y,X` when the file has no
-spacing), the MRI is NIfTI, and both files must have the correct handedness (for TIFF and NPY, x, y, z = numpy axes 2, 1, 0).
+spacing), the MRI is NIfTI. When both files carry an orientation header (NIfTI sform or qform), it fixes the handedness and must
+be correct; a TIFF or NPY stack (x, y, z = numpy axes 2, 1, 0) or a NIfTI file without one has none, so both handednesses are
+tried and the one whose fine structure matches the MRI is kept (flag `mirrored_oct_frame` when it is the mirrored one).
 `--oct-mask` and `--mri-mask` replace the automatic masks, `--params` reads parameter overrides from JSON, and `--device cpu`
 runs without a GPU. `qc` renders the QC images again, for the run's transform or another one given with `--T`. `apply`
 resamples an OCT-frame volume (MRI-frame with `--inverse`) onto the grid of `--reference`.
@@ -41,7 +43,7 @@ resamples an OCT-frame volume (MRI-frame with `--inverse`) onto the grid of `--r
 | `oct2mri.lta`, `oct2mri_itk.txt` | the same transform for FreeSurfer and ITK |
 | `oct_in_mri.nii.gz`, `mri_in_oct.nii.gz` | OCT on the MRI grid, MRI on a 0.15 mm grid in the OCT frame |
 | `qc.png`, `qc_montage.png` | visual QC; in every plane the OCT should lie on the same MRI anatomy, with structures continuing across the checkerboard |
-| `result.json` | scores, contrast polarity, scales, flags, runtime |
+| `result.json` | scores, fine-structure agreement, handedness, contrast polarity, scales, flags, runtime |
 
 ## Method
 
@@ -49,7 +51,9 @@ resamples an OCT-frame volume (MRI-frame with `--inverse`) onto the grid of `--r
 2. **One score for structure and outline.** Both scans become bright/dark tissue maps, compared together with the specimen
    outline (OCT tissue must lie on MRI tissue; the MRI may hold tissue beyond the block); the sign of the structure term gives
    the contrast polarity.
-3. **Orientation search in the crop and a bounded affine fit.** FFT search over 8,000 rotations, then a 12-parameter affine fit
-   of the best poses under a scale and shear prior.
+3. **Orientation search in the crop.** FFT search over 8,000 rotations and all translations inside the MRI crop.
+4. **Prior-bounded affine refinement.** A 12-parameter affine fit of the best poses under a scale and shear prior.
+5. **Fine-structure refinement.** The best pose is refined on the gradient orientations inside both scans (normalised gradient
+   fields), which follow fibre bundles and vessels and need no intensity mapping.
 
 Details, evaluation and parameters: [docs/METHOD.md](docs/METHOD.md).

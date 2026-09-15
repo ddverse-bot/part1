@@ -18,7 +18,7 @@ from pathlib import Path
 
 DELETION_MM = 0.5            # a step whose removal moves the pose by <= 0.5 mm (and no metric beyond noise) is deleted
 STEP_OF = {"A0c": "per-plane hole filling", "A1": "MRI flattening", "A2": "OCT flattening", "A4": "the two-class maps",
-           "A6": "the scale prior", "A9": "the outline term"}
+           "A6": "the scale prior", "A9": "the outline term", "A12": "the fine-structure refinement"}
 READING = "<!-- reading: written by hand below this line; bench/report.py keeps it when it rewrites the file -->"
 
 
@@ -61,8 +61,10 @@ def main_section(run, logs):
     wall = wall_seconds(logs / "register.time" if logs else None)
     gpu = gpu_peak_gb(logs / "register.gpu_mib" if logs else None)
     sec = res.get("seconds", {})
+    ngf_s = res.get("ngf", {}).get("seconds")
     steps = ", ".join((f"search {num(srch.get('seconds'), 0)}, refinement {num(res['refine']['seconds'], 0)}"
-                       if k == "search_refine" and "refine" in res else f"{k.replace('_', ' ')} {num(v, 0)}")
+                       + (f", fine-structure refinement {num(ngf_s, 0)}" if ngf_s is not None else "")
+                       if k in ("search_refine", "search_refine_ngf") and "refine" in res else f"{k.replace('_', ' ')} {num(v, 0)}")
                       for k, v in sec.items() if k != "total")
     shifts = [v["spearman"] for k, v in fc.get("variants", {}).items() if k.startswith("shift") and v["spearman"] is not None]
     shift_max = max(shifts) if shifts else None
@@ -74,9 +76,12 @@ def main_section(run, logs):
         ("raw-data frame check (Spearman)", f"{num(fc.get('spearman_export'), 3)} at the pose; axis flips <= "
                                             f"{num(fc.get('max_flip_spearman'), 3)}; 2 mm shifts <= {num(shift_max, 3)}; "
                                             f"{('pass' if fc['ok'] else 'fail') if fc else 'n/a'}"),
-        ("score S = (2 polarity S_class + S_outline) / 3; S_class, S_outline; polarity",
+        ("score S of the §4 pose = (2 polarity S_class + S_outline) / 3; S_class, S_outline; polarity",
          f"{num(pose.get('S'), 4)}; {num(pose.get('S_class'), 4)}, {num(pose.get('S_outline'), 4)}; {pose.get('polarity', 'n/a')}"),
         ("search top-1 / top-2", f"{num(srch.get('top1'), 4)} / {num(srch.get('top2'), 4)}"),
+        ("fine-structure agreement F (§5), at the §4 pose -> refined; handedness",
+         f"{num(pose.get('NGF_start'), 4)} -> {num(pose.get('NGF'), 4)}; {pose.get('handedness', 'n/a')}"),
+        ("pose change of §5 (block-corner mean)", f"{num(pose.get('ngf_shift_mm'))} mm"),
         ("scale per OCT array axis", " / ".join(f"{v:.3f}" for v in pose["scale_per_oct_axis"]) if pose else "n/a"),
         ("flags", "n/a" if "flags" not in res else ", ".join(res["flags"]) or "none"),
         ("pose vs the previous run, mean / corners mean / corners max",
@@ -103,11 +108,12 @@ def main_section(run, logs):
 
 def ablation_row(n, r):
     if "error" in r:
-        return (f"| {n} | {r['change']} | failed: {r['error']} | | | | | | | {num(r['mask']['volume_cm3'])} "
+        return (f"| {n} | {r['change']} | failed: {r['error']} | | | | | | | | {num(r['mask']['volume_cm3'])} "
                 f"({num(r['mask']['dice'], 3)}) | {num(r['seconds'], 0)} |")
     rim = r["boundary"]["rim_median_mm"]
-    d = r["pose_to_base"]
-    return (f"| {n} | {r['change']} | {num(d['mean_mm'])} / {num(d['corners_mean_mm'])} / {num(d['corners_max_mm'])} | "
+    d, d4 = r["pose_to_base"], r.get("pose_to_base_s4", {})
+    return (f"| {n} | {r['change']} | {num(d4.get('mean_mm'))} / {num(d4.get('corners_mean_mm'))} | "
+            f"{num(d['mean_mm'])} / {num(d['corners_mean_mm'])} / {num(d['corners_max_mm'])} | "
             f"{num(r['pose_to_R5']['corners_max_mm'])} | {num(r['S'], 4)} | {num(r.get('L'), 4)} | {r['polarity']} | "
             f"{' / '.join(f'{s:.3f}' for s in r['scales'])} | {num(rim[0])} / {num(rim[1])} | "
             f"{num(r['mask']['volume_cm3'])} ({num(r['mask']['dice'], 3)}) | {num(r['seconds'], 0)} |")
@@ -117,14 +123,14 @@ def ablation_section(abl):
     if not abl:
         return ["## Ablations", "", "Not run yet (bench/ablate.py).", ""]
     V = abl["variants"]
-    cols = ("| variant | change | pose change: mean / corners mean / corners max (mm) | vs R5 corners max (mm) | S | L | polarity | scale "
-            "| rim fwd / rev (mm) | OCT mask cm3 (Dice) | time (s) |")
+    cols = ("| variant | change | §4 pose change: mean / corners mean (mm) | final pose change: mean / corners mean / corners max (mm) "
+            "| vs R5 corners max (mm) | S | L | polarity | scale | rim fwd / rev (mm) | OCT mask cm3 (Dice) | time (s) |")
     head = ["## Ablations", "",
             "Each variant is the method with one explicit change, run from the same preprocessed grids (one per OCT mask source). "
             "Pose change is against base (the method through the same driver), as the mean over the v1.1 specimen-mask points and "
             "the mean and max over the 8 corners of the OCT array. The boundary agreement uses the base masks for every variant, "
             "so it reflects the pose only.", "",
-            cols, "|---|---|---|---|---|---|---|---|---|---|---|"]
+            cols, "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     rows = [ablation_row(n, r) for n, r in V.items()]
     tail = [""]
     dc = abl.get("driver_check")
@@ -132,11 +138,12 @@ def ablation_section(abl):
         tail += [f"Driver check: base through bench/ablate.py lies {num(dc['base_vs_main']['mean_mm'])} mm (corners max "
                  f"{num(dc['base_vs_main']['corners_max_mm'])} mm) from the CLI run.", ""]
     done = [n for n in STEP_OF if n in V and "error" not in V[n]]
-    small = [f"{STEP_OF[n]} ({n}, {num(V[n]['pose_to_base']['mean_mm'])} mm)" for n in done if V[n]["within_0.5mm_of_base"]]
-    large = [f"{STEP_OF[n]} ({n}, {num(V[n]['pose_to_base']['mean_mm'])} mm)" for n in done if not V[n]["within_0.5mm_of_base"]]
+    key = lambda n: "pose_to_base" if n == "A12" else "pose_to_base_s4"            # steps of §1-4 act through the §4 pose
+    small = [f"{STEP_OF[n]} ({n}, {num(V[n][key(n)]['mean_mm'])} mm)" for n in done if V[n][key(n)]["mean_mm"] <= DELETION_MM]
+    large = [f"{STEP_OF[n]} ({n}, {num(V[n][key(n)]['mean_mm'])} mm)" for n in done if V[n][key(n)]["mean_mm"] > DELETION_MM]
     if done:
         tail += [(f"Deletion rule: a step goes when removing it moves the pose by at most {DELETION_MM} mm (mean over the "
-                  "specimen-mask points) and changes no other metric beyond noise. "
+                  "specimen-mask points; the §4 pose for steps of §1-4, the final pose for §5) and changes no other metric beyond noise. "
                   + (f"Removing {either(small)} stays within {DELETION_MM} mm. " if small else "")
                   + (f"Removing {either(large)} moves the pose further." if large else "")).strip(), ""]
     groups = [g for g in abl.get("removed_steps", []) if g.get("rows")]
@@ -144,7 +151,7 @@ def ablation_section(abl):
         tail += ["### Removed steps", ""]
     for g in groups:
         pb = g["present_base_vs_previous_base"]
-        tail += [g["note"], "", cols, "|---|---|---|---|---|---|---|---|---|---|---|"]
+        tail += [g["note"], "", cols, "|---|---|---|---|---|---|---|---|---|---|---|---|"]
         tail += [ablation_row(n, r) for n, r in g["rows"].items()]
         tail += ["", f"The present base lies {num(pb['mean_mm'])} mm (corners mean {num(pb['corners_mean_mm'])} mm, corners max "
                  f"{num(pb['corners_max_mm'])} mm, rotation {num(pb['rotation_deg'], 2)} deg) from the base of that run. "
@@ -173,7 +180,7 @@ SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A0c": "h
          "A2": "OCT flattening off", "A3": "destripe off, ladder kept", "A4": "intensity channels", "A5+1": "polarity forced +1",
          "A5-1": "polarity forced -1", "A6": "no scale prior", "A7": "ladder off, destripe kept", "A8": "other handedness",
          "A9": "no outline term", "A10": "two-sided outline",
-         "A11": "cut face", "A11b": "cut face, two-sided outline"}
+         "A11": "cut face", "A11b": "cut face, two-sided outline", "A12": "no fine-structure refinement"}
 
 
 def figures(run, abl, out):
