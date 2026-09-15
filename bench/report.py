@@ -81,7 +81,6 @@ def main_section(run, logs):
         ("flags", "n/a" if "flags" not in res else ", ".join(res["flags"]) or "none"),
         ("pose vs the previous run, mean / corners mean / corners max",
          f"{num(pv.get('mean_mm'))} / {num(pv.get('corners_mean_mm'))} / {num(pv.get('corners_max_mm'))} mm" if pv else "n/a"),
-        ("boundary agreement in result.json (median, mm)", num(res.get("boundary_mm"))),
         ("rim boundary agreement forward / reverse, method masks", rims(b)),
         ("the same with the v1.1 masks", rims(ev.get("boundary_v11_masks", {}))),
         ("OCT specimen mask", f"{num(mk.get('volume_cm3'))} cm3, Dice {num(mk.get('dice'), 3)} against the v1.1 mask "
@@ -173,7 +172,8 @@ def runtime_section(abl):
 SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A0c": "holes filled in 3-D only", "A1": "MRI flattening off",
          "A2": "OCT flattening off", "A3": "destripe off, ladder kept", "A4": "intensity channels", "A5+1": "polarity forced +1",
          "A5-1": "polarity forced -1", "A6": "no scale prior", "A7": "ladder off, destripe kept", "A8": "other handedness",
-         "A9": "no outline term"}
+         "A9": "no outline term", "A10": "two-sided outline",
+         "A11": "cut face", "A11b": "cut face, two-sided outline"}
 
 
 def figures(run, abl, out):

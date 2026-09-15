@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """README registration figure in the MRI frame, read from the original files: three MRI array planes through the registered
 OCT specimen centre, the native MRI slice (the reference), and the OCT placed onto it before registration (orientation from the
-file headers, the OCT specimen centre moved onto the MRI foreground centre) and after it (the run's transform), each also as a
+file headers, the OCT specimen centre moved to the centre of the MRI crop, the only position prior) and after it (the run's transform), each also as a
 2 mm checkerboard with the MRI (MRI contrast inverted inside the run's MRI foreground when the polarity is -1, as in qc.png).
 The OCT is box-averaged to the MRI voxel size (0.08 mm) before it is sampled.
 
@@ -48,7 +48,7 @@ def main():
 
     c_oct = A_h @ np.append(ndimage.center_of_mass(spec > 0.5), 1.0)                         # OCT specimen centre, OCT world
     T0 = np.eye(4)                                                                             # before registration
-    T0[:3, 3] = (A_fm @ np.append(ndimage.center_of_mass(fg_m > 0.5), 1.0))[:3] - c_oct[:3]
+    T0[:3, 3] = (A_m @ np.append((np.array(mri.shape) - 1) / 2.0, 1.0))[:3] - c_oct[:3]
     idx = np.rint((np.linalg.inv(A_m) @ T @ c_oct)[:3]).astype(int)                           # MRI planes
     sub = oct_[::3, ::3, ::3]
     lo_o, hi_o = np.percentile(sub[sub > 0], [0.5, 99.5])

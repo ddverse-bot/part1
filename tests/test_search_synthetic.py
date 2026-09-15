@@ -16,11 +16,12 @@ H = 0.15                                                 # base grid (mm); Param
 FAST = dataclasses.replace(Params(), n_rot=24, topk=8)
 
 
-def phantom(rot_index):
+def phantom(rot_index, cut=None):
     """MRI: p = sigmoid of a smoothed Gaussian field on 64^3 voxels, foreground ball M (radius 4.4 mm); channels (p M, (1 - p) M).
     OCT: 40 x 36 x 32 voxels on a flipped-axis grid, all measured; voxel x shows 1 - p at T_true x, specimen mask M(T_true x),
     channels unmasked.
     T_true = R diag(1.05, 1, 1) (x - c) + (0.4, -0.3, 0.2) mm, R = rotation rot_index of the search set.
+    cut: OCT axis-0 index from which the block was cut off the specimen (mask 0 there, over MRI tissue and background alike).
     -> (mri_base (v, M, affine), oct_base (u, w, measured, affine), T_true, OCT foreground points in mm), base grids of H mm."""
     g = gaussian_filter(np.random.default_rng(1).normal(size=(64, 64, 64)), 5.0)
     p = (1 / (1 + np.exp(-g / (0.25 * g.std())))).astype(np.float32)
@@ -37,6 +38,8 @@ def phantom(rot_index):
     x = G.apply_affine(A_O, np.indices(shape).reshape(3, -1).T.astype(float))
     pm = G.sample_world(torch.as_tensor(np.stack([p, M])), A_M, torch.as_tensor(G.apply_affine(T, x), dtype=torch.float32))
     q, w = 1 - pm[0].numpy().reshape(shape), pm[1].numpy().reshape(shape)
+    if cut is not None:
+        w = w * (np.arange(shape[0]) < cut)[:, None, None]
     return (np.stack([p * M, (1 - p) * M]), M, A_M), (np.stack([q, 1 - q]), w, np.ones(shape, np.float32), A_O), T, x[w.reshape(-1) > 0.5]
 
 
@@ -54,3 +57,14 @@ def test_recovery(rot_index):
     with pytest.raises(ValueError, match="polarity"):
         refine([{"T": T_true, "polarity": 0}], mri, oct, FAST, "cpu")
 
+
+def test_recovery_block_cut_from_larger_specimen():
+    """The MRI holds tissue beyond a cut face of the block, which lies under OCT embedding: recovered to < 0.1 mm (counting that
+    embedding as a mismatch gives 0.16 mm and an outline score of 0.26)."""
+    mri, oct, T_true, pts = phantom(5, cut=24)
+    assert ((oct[1] == 0) & (G.sample_world(torch.as_tensor(mri[1][None]), mri[2], torch.as_tensor(G.apply_affine(
+        T_true, G.apply_affine(oct[3], np.indices(oct[1].shape).reshape(3, -1).T.astype(float))), dtype=torch.float32))[0]
+        .numpy().reshape(oct[1].shape) > 0.5)).sum() > 1000
+    best = align(oct, mri, FAST, "cpu")[0][0]
+    assert best["polarity"] == -1 and np.linalg.det(best["T"][:3, :3]) > 0 and best["S_outline"] > 0.9
+    assert np.linalg.norm(G.apply_affine(best["T"], pts) - G.apply_affine(T_true, pts), axis=1).mean() < 0.1

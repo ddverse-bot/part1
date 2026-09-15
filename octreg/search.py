@@ -5,8 +5,11 @@ For every rotation of a fixed uniform set the OCT template is correlated with th
 that of the input file frames and is not searched (a mirrored stack has to be fixed in its header).
 The score is the mean over three channel pairs. Two are the two-class maps: the OCT channels (p, 1 - p) with the specimen mask as
 weight against the MRI channels (p M, (1 - p) M); swapping the OCT classes gives exactly -S_class. The third is the specimen
-outline: the OCT specimen mask against the MRI foreground M, weighted by the measured OCT voxels, so the embedding has to fall on
-MRI background; it does not depend on the polarity. S = (2 |S_class| + S_outline) / 3, and the sign of S_class is the polarity.
+outline: the OCT specimen mask w against the MRI foreground M over the measured OCT voxels q, weighted by q (1 - (1 - w) E),
+E = M inside the MRI crop and 1 outside. The MRI is only roughly cropped and may hold tissue that is not in the block, so
+embedding over MRI tissue or outside the crop is left out, while OCT tissue over MRI background (or outside the crop, which
+contains the block) and embedding over MRI background both count; the outline does not depend on the polarity.
+S = (2 |S_class| + S_outline) / 3, and the sign of S_class is the polarity.
 """
 from __future__ import annotations
 
@@ -56,7 +59,8 @@ class Searcher:
         grid); oct_u [2, d, h, w] OCT channels (p, 1 - p), oct_w [d, h, w] specimen mask (the two-class weight and the outline
         channel), oct_valid [d, h, w] measured OCT fraction (the outline weight), oct_affine. numpy or torch.
         The template is centred on the OCT grid box centre c_o and covers its bounding sphere (+3 voxels); the MRI is zero-padded
-        by half a template, so a block over the edge of the crop is still scored (outside the crop counts as background)."""
+        by half a template, so a block over the edge of the crop is still scored: OCT tissue outside the crop counts as over
+        background (the crop contains the block), OCT embedding outside it is left out (the MRI there is unknown)."""
         self.dev = device
         I, M, u, w, q = (to_torch(x, device) for x in (mri_v, mri_mask, oct_u, oct_w, oct_valid))
         A_M, A_O = np.asarray(mri_affine, float), np.asarray(oct_affine, float)
@@ -74,6 +78,8 @@ class Searcher:
             raise ValueError("no MRI foreground on the search grid")
         self.var_floor = torch.stack([I[0][fg].var(), I[1][fg].var(), I[2].var()]).reshape(3, 1, 1, 1) * VAR_FLOOR
         self.FI, self.FI2 = torch.fft.rfftn(I, dim=DIMS), torch.fft.rfftn(I * I, dim=DIMS)
+        self.FM3 = torch.fft.rfftn(I[2] ** 3, dim=DIMS)
+        self.FE = torch.fft.rfftn(F.pad(M[None], [pad] * 6, value=1.0)[0], dim=DIMS)              # E: M in the crop, 1 outside
         del I, fg
         # template source: u edge-replicated, w and the measured fraction zero-padded by one voxel, so wherever the sampled weight
         # is > 0 the two sampled channels sum to 1 and the swapped-class map is exactly -S_class (also at the OCT array faces)
@@ -102,15 +108,28 @@ class Searcher:
         varI = torch.maximum(SII - SI * SI / N, self.var_floor[ch] * N)
         return (SIT - ST * SI / N) / torch.sqrt(((STT - ST * ST / N) * varI).clamp(min=EPS))
 
+    def _outline(self, w, q):
+        """NCC maps of the specimen mask w [n, n, n] with M under the weight q (1 - (1 - w) E(x)), q [n, n, n] the measured fraction:
+        with b = q (1 - w) every weighted sum is a correlation of a template with E, M, M^2 or M^3 (E M = M^2, E M^2 = M^3)."""
+        b = q * (1 - w)
+        Fq, Fb, Fqw, Fbw, Fbww = (self._ft(t) for t in (q, b, q * w, b * w, b * w * w))
+        FE, FM, FM2 = self.FE, self.FI[2], self.FI2[2]
+        inv = lambda X: torch.fft.irfftn(X, s=self.shape, dim=DIMS)
+        N = q.sum() - inv(Fb * FE) + EPS
+        ST, STT = (q * w).sum() - inv(Fbw * FE), (q * w * w).sum() - inv(Fbww * FE)
+        SI, SII, SIT = inv(Fq * FM - Fb * FM2), inv(Fq * FM2 - Fb * self.FM3), inv(Fqw * FM - Fbw * FM2)
+        varI = torch.maximum(SII - SI * SI / N, self.var_floor[2] * N)
+        return (SIT - ST * SI / N) / torch.sqrt(((STT - ST * ST / N) * varI).clamp(min=EPS))
+
     @torch.no_grad()
     def score(self, R):
         """Orientation R (numpy 3x3) -> (S_class [D', H', W'], the signed two-class NCC, mean over its two channel pairs;
-        S_outline, the NCC of the specimen mask with M over the measured voxels). Index u means x_mri = R (x_oct - c_o) + t_u;
+        S_outline, the outline NCC of _outline). Index u means x_mri = R (x_oct - c_o) + t_u;
         the template lies inside the grid at the indices of self.valid."""
         n = self.n
         pts = self.c_t + self.tgrid @ torch.as_tensor(np.asarray(R), dtype=torch.float32, device=self.dev)   # x_o = c_o + R^T y
         vals = G.sample_world(self.src, self.A_src, pts).reshape(4, n, n, n)
-        return self._ncc(vals[:2], vals[2], slice(0, 2)).mean(0), self._ncc(vals[2:3], vals[3], slice(2, 3))[0]
+        return self._ncc(vals[:2], vals[2], slice(0, 2)).mean(0), self._outline(vals[2], vals[3])
 
     def pose(self, R, index):
         """4x4 OCT world -> MRI world (mm) of orientation R at flat translation index: x_mri = R (x_oct - c_o) + t."""

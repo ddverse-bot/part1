@@ -76,7 +76,7 @@ def register(oct_path, mri_path, out_dir, oct_spacing_um=None, oct_mask=None, mr
     inputs = {"oct": {**vars(vo), "path": _abs(vo.path)}, "mri": {**vars(vm), "path": _abs(vm.path)},
               "oct_spacing_um": oct_spacing_um, "oct_mask": oct_mask, "mri_mask": mri_mask, "device": str(device)}
     result = {"octreg_version": __version__, "inputs": inputs, "params": P.to_dict(), "params_hash": P.hash(), "T_oct2mri": T,
-              "pose": pose, "flags": flags, "boundary_mm": _boundary_mm(mask_o, valid_o, A_o, mask_m, A_m, T),
+              "pose": pose, "flags": flags,
               "foreground": {"oct": fg_o, "mri": {"source": "histogram", **fg_m}}, **info}
     io.write_transform_txt(T, out / "T_oct2mri.txt")
     io.write_transform_txt(np.linalg.inv(T), out / "T_mri2oct.txt")
@@ -173,20 +173,6 @@ def _mask_on(vol, shape, affine, voxel_mm):
     streamed and box-averaged to max(voxel_mm, mask voxel), trilinear onto the grid, > 0.5. -> bool array."""
     frac, A = G.resample_iso(vol, max(voxel_mm, _mm(vol.spacing_mm.min())), binary=True)
     return G.resample_to(frac, A, shape, affine, np.eye(4)) > 0.5
-
-
-def _boundary_mm(mask_o, valid_o, A_o, mask_m, A_m, T):
-    """Boundary agreement: median distance (mm) from the OCT mask outline through T to the MRI foreground outline. An outline
-    voxel has a 6-neighbour outside its mask; grid faces (a crop may cut the tissue) and neighbours without OCT data are not
-    outside. Over the OCT outline voxels landing inside the MRI grid; None if there are none (the block has no real outline)."""
-    o = mask_o & ~ndimage.binary_erosion(mask_o | ~valid_o, border_value=1)
-    m = mask_m & ~ndimage.binary_erosion(mask_m, border_value=1)
-    c = G.apply_affine(np.linalg.inv(A_m) @ T @ A_o, np.argwhere(o).astype(float))
-    c = c[np.all((c >= 0) & (c <= np.array(m.shape) - 1), axis=1)]
-    if not (len(c) and m.any()):
-        return None
-    d = ndimage.distance_transform_edt(~m, sampling=np.linalg.norm(A_m[:3, :3], axis=0))
-    return float(np.median(ndimage.map_coordinates(d, c.T, order=1)))
 
 
 def qc(run_dir, oct_path, mri_path, T=None, prefix=None, oct_spacing_um=None, oct_mask=None, mri_mask=None):

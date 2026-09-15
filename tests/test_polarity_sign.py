@@ -10,7 +10,7 @@ from scipy.ndimage import gaussian_filter
 
 from octreg import geometry as G
 from octreg.params import Params
-from octreg.refine import BaseGrid, compose
+from octreg.refine import BaseGrid, compose, masked_ncc
 from octreg.search import Searcher, search
 
 MIRROR = np.diag([1.0, 1.0, -1.0])          # the score map negates for any orientation, mirrored ones included
@@ -82,3 +82,42 @@ def test_refiner_score_negates(pair):
     (S, Sc, So), (S_b, Sc_b, So_b), (S_neg, _, _) = ([x.item() for x in g.score(T, pol)] for g, pol in ((a, 1), (b, 1), (a, -1)))
     assert abs(Sc + Sc_b) < TOL and So == So_b and abs(S_neg - S_b) < TOL
     assert Sc > 0.5
+
+
+def test_outline_ignores_embedding_over_mri_tissue(pair):
+    """A block cut out of a larger specimen: the OCT specimen mask is the MRI foreground inside the block up to a cut, and the MRI
+    tissue beyond the cut lies under OCT embedding. At the true pose the outline NCC is 1 (that embedding is left out), whereas
+    counting it would lower the score; the FFT map equals the refiner's direct weighted NCC at shifted poses as well, also with
+    partial-volume masks (M^3 != M^2 != M, q (1 - w) w != 0) and with the block partly outside the MRI crop."""
+    v, M, A_M = pair["mri"]
+    u, _, q, A_O = pair["oct"]
+    x = (np.indices(M.shape).transpose(1, 2, 3, 0) - np.array(M.shape) / 2) / (0.33 * np.array(M.shape))
+    M = ((x ** 2).sum(-1) < 1).astype(np.float32)                                  # a specimen smaller than the block
+    v = v * (M > 0)
+    lo = np.rint(G.apply_affine(np.linalg.inv(A_M), A_O[:3, 3])).astype(int)
+    spec = M[lo[0]:lo[0] + q.shape[0], lo[1]:lo[1] + q.shape[1], lo[2]:lo[2] + q.shape[2]]
+    w = (spec * (np.arange(q.shape[1])[None, :, None] < 12)).astype(np.float32)
+    assert ((w == 0) & (spec > 0)).sum() > 100 and ((w == 0) & (spec == 0)).sum() > 10
+    s = Searcher(v, M, A_M, u, w, q, A_O, device="cpu")
+    _, S_o = s.score(np.eye(3))
+    g = BaseGrid((v, M, A_M), (u, w, q, A_O), "cpu")
+    for shift in ((0, 0, 0), (1, 0, 0), (0, 2, -1)):
+        T = torch.eye(4)
+        T[:3, 3] = torch.tensor(shift, dtype=torch.float32) * 0.6
+        c = G.apply_affine(np.linalg.inv(s.A_M), G.apply_affine(T.numpy(), s.c_o)) - (s.n - 1) / 2.0
+        idx = np.ravel_multi_index(tuple(np.rint(c).astype(int)), s.shape)
+        assert np.allclose(s.pose(np.eye(3), idx), T.numpy(), atol=1e-6)
+        direct = g.score(T, 1)[2].item()
+        assert abs(float(S_o.reshape(-1)[idx]) - direct) < 1e-3
+        if shift == (0, 0, 0):
+            m = G.sample_world(g.v, g.A_M, G.apply_affine(T, g.pts))[2:]
+            assert direct > 0.99 and masked_ncc(m, g.w[None], g.q).item() < 0.9
+    Ms, ws = gaussian_filter(M, 1.0), gaussian_filter(w, 1.0)
+    s2, g2 = Searcher(v * Ms, Ms, A_M, u, ws, q, A_O, device="cpu"), BaseGrid((v * Ms, Ms, A_M), (u, ws, q, A_O), "cpu")
+    _, S_o2 = s2.score(np.eye(3))
+    for shift in ((0, 0, 0), (1, 0, 0), (0, 2, -1), (8, 0, 0)):                     # (8, 0, 0): part of the block leaves the crop
+        T = torch.eye(4)
+        T[:3, 3] = torch.tensor(shift, dtype=torch.float32) * 0.6
+        c = G.apply_affine(np.linalg.inv(s2.A_M), G.apply_affine(T.numpy(), s2.c_o)) - (s2.n - 1) / 2.0
+        idx = np.ravel_multi_index(tuple(np.rint(c).astype(int)), s2.shape)
+        assert abs(float(S_o2.reshape(-1)[idx]) - g2.score(T, 1)[2].item()) < 1e-4

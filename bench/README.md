@@ -67,6 +67,8 @@ Masks come from `ablate.py` (`rel3/ablate/prep/texture/`), so `evaluate` reports
 | A6 | no scale prior: lambda 0 and clamp 1.0 instead of 2 and 0.15 |
 | A8 | the other handedness: the OCT world mirrored (z negated) before search and refinement |
 | A9 | no outline term: S = 2 S_class / 3 in the search (patched `search.combined`) and in the refinement (outline weight = the specimen mask, so S_outline = 0) |
+| A10 | two-sided outline of the first release: OCT embedding over MRI tissue or outside the crop counted as a mismatch |
+| A11, A11b | simulated cut face (specimen mask removed beyond 70 % of its extent along OCT axis 1, data kept as embedding), with the method and with the two-sided outline |
 | A3, A7 | removed steps (section-stripe flat field; rigid, similarity and affine ladder), rows copied from the first ablation run |
 
 `Params` holds method constants only. Each variant is one explicit change made in the driver around the package functions the

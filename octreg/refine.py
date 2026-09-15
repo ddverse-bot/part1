@@ -4,7 +4,9 @@ wins.
 Model x_mri = R(r) Sh(sh) diag(exp(ls)) (x_oct - c) + t, c = OCT grid box centre (mm); no mirror (handedness from the file frames).
 S = (2 S_class + S_outline) / 3 as in the search: S_class the mean over the two channel pairs of the NCC between the OCT channels
 at the specimen voxels (swapped for polarity -1) and the MRI channels sampled through the pose; S_outline the NCC between the
-specimen mask at the measured OCT voxels and the MRI foreground sampled through the pose. L = 1 - S + lam (sum ls^2 + sum sh^2);
+specimen mask w and the MRI foreground M sampled through the pose at the measured OCT voxels q, weighted by q (1 - (1 - w) E),
+E = M inside the MRI grid and 1 outside: embedding over MRI tissue or outside the crop is left out (the MRI may hold tissue that
+is not in the block). L = 1 - S + lam (sum ls^2 + sum sh^2);
 after every Adam step (cosine schedule) |ls|, |sh| <= clamp (absolute).
 """
 from __future__ import annotations
@@ -71,12 +73,15 @@ class BaseGrid:
         self.u = to_torch(u, device)[(slice(None),) + tuple(idx.T)]
         self.spec = self.w > 0
         self.v = torch.cat([to_torch(v, device), to_torch(m, device)[None]])
+        self.not_m = 1 - self.v[2:]                                          # sampled with zeros outside the grid: E = 1 there
 
     def score(self, T, polarity):
         """(S, S_class signed, S_outline) of pose T (torch 4x4); S = (2 polarity S_class + S_outline) / 3."""
-        s = G.sample_world(self.v, self.A_M, G.apply_affine(T, self.pts))
+        x = G.apply_affine(T, self.pts)
+        s = G.sample_world(self.v, self.A_M, x)
+        E = 1 - G.sample_world(self.not_m, self.A_M, x)[0]                                        # M inside the MRI grid, 1 outside
         S_class = masked_ncc(s[:2, self.spec], self.u[:, self.spec], self.w[self.spec])
-        S_outline = masked_ncc(s[2:], self.w[None], self.q)
+        S_outline = masked_ncc(s[2:], self.w[None], self.q * (1 - (1 - self.w) * E))
         return (2 * polarity * S_class + S_outline) / 3, S_class, S_outline
 
 

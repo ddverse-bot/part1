@@ -8,7 +8,8 @@ explicit change: another OCT mask (A0 the histogram valley of the OCT, A0b the s
 A0c the texture mask with the 3-D hole filling of the first release), two_class(..., flatten=False) for one modality (A1, A2),
 standardised intensity channels built in this file (A4),
 align(..., polarity=+1 / -1) (A5), Params lam 0 and clamp 1 (A6), the OCT world mirrored so that the search and refinement see
-the other handedness (A8), or no outline term (A9). 'base' is the method through this driver; its distance to the CLI run
+the other handedness (A8), no outline term (A9), the two-sided outline of the first release (A10), or a simulated cut face
+with the method and with the two-sided outline (A11, A11b). 'base' is the method through this driver; its distance to the CLI run
 (--main) is the driver check. The OCT is streamed once, each OCT mask is computed once and the MRI is prepared once.
 
 Removed steps (REMOVED) keep their rows from the ablation run that measured them (--previous, one ablations.json per group):
@@ -40,7 +41,7 @@ from scipy import ndimage
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import evaluate as E                                                    # noqa: E402  (bench/evaluate.py)
-from octreg import geometry as G, io, preprocess as pp, search as S     # noqa: E402
+from octreg import geometry as G, io, preprocess as pp, refine as Rf, search as S     # noqa: E402
 from octreg.params import Params                                        # noqa: E402
 from octreg.register import align, fine_mask                            # noqa: E402
 
@@ -57,6 +58,10 @@ VARIANTS = {    # name: (what changes, the explicit change: mask source, solve()
     "A6": ("no scale prior: lam 0 and clamp 1.0 (method: 2 and 0.15)", {"params": {"lam": 0.0, "clamp": 1.0}}),
     "A8": ("the other handedness: OCT world mirrored (z negated) before the search", {"mirror": True}),
     "A9": ("no outline term: S = 2 S_class / 3 in the search and the refinement", {"outline": False}),
+    "A10": ("two-sided outline: OCT embedding over MRI tissue or outside the crop counted as a mismatch", {"two_sided": True}),
+    "A11": ("simulated cut face: specimen mask removed beyond 70 % of its extent along OCT axis 1 (data kept as embedding)",
+            {"cut_axis": 1}),
+    "A11b": ("the same cut face with the two-sided outline", {"cut_axis": 1, "two_sided": True}),
 }
 MIRROR = np.diag([1.0, 1.0, -1.0, 1.0])
 REMOVED = [    # groups of removed steps, each measured in one earlier ablation run
@@ -140,13 +145,21 @@ def standardised(arr, mask, h, P):
     return ((x - float(vals.mean())) / float(vals.std())).astype(np.float32)
 
 
-def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0, mirror=False, outline=True):
+def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_class", polarity=0, mirror=False, outline=True,
+          two_sided=False, cut_axis=None):
     """Register steps 3-5 on prepared base-grid arrays; with the default keywords these are register.register's own calls.
     mirror: search and refine against the OCT world mirrored by MIRROR, poses returned in the OCT header world (det < 0).
     outline False: S = 2 S_class / 3. The search's combined score is patched to leave S_outline out (on the pooled search grid
     the mask edge is fractional, so a zero outline weight alone would not remove it); in the refinement the outline weight is
-    the specimen mask itself, on which the mask is constant, so S_outline is 0."""
+    the specimen mask itself, on which the mask is constant, so S_outline is 0.
+    two_sided: the outline of the first release, weight q in the search and the refinement (embedding over MRI tissue counts).
+    cut_axis: the specimen mask is removed beyond 70 % of its extent along that OCT axis, the OCT data there kept as embedding,
+    as for a block cut out of a larger specimen whose MRI tissue continues beyond the cut."""
     h = P.base_mm
+    if cut_axis is not None:
+        idx = np.argwhere(o["mask"])[:, cut_axis]
+        cut = int(idx.min() + 0.7 * (idx.max() - idx.min()))
+        o = {**o, "mask": o["mask"] & (np.arange(o["mask"].shape[cut_axis]) < cut).reshape([-1 if d == cut_axis else 1 for d in range(3)])}
     if features == "intensity":
         z_o, z_m = standardised(o["arr"], o["mask"], h, P), standardised(m["arr"], m["mask"], h, P)
         u, w, v = np.stack([z_o, -z_o]), o["mask"].astype(np.float32), np.stack([z_m, -z_m]) * m["mask"]
@@ -154,13 +167,22 @@ def solve(o, m, P, device, mri_flatten=True, oct_flatten=True, features="two_cla
         u, w = pp.oct_channels(pp.two_class(o["arr"], o["mask"], h, P, flatten=oct_flatten), o["mask"])
         v = pp.mri_channels(pp.two_class(m["arr"], m["mask"], h, P, flatten=mri_flatten), m["mask"])
     F, q = MIRROR if mirror else np.eye(4), o["valid"] if outline else o["mask"]
-    combined = S.combined
+    combined, outline_map, score = S.combined, S.Searcher._outline, Rf.BaseGrid.score
     if not outline:
         S.combined = lambda S_class, S_outline, pol: combined(S_class, torch.zeros_like(S_outline), pol)
+    if two_sided:
+        S.Searcher._outline = lambda self, w_, q_: self._ncc(w_[None], q_, slice(2, 3))[0]
+
+        def score_two_sided(self, T, polarity):
+            s_ = G.sample_world(self.v, self.A_M, G.apply_affine(T, self.pts))
+            S_class = Rf.masked_ncc(s_[:2, self.spec], self.u[:, self.spec], self.w[self.spec])
+            S_outline = Rf.masked_ncc(s_[2:], self.w[None], self.q)
+            return (2 * polarity * S_class + S_outline) / 3, S_class, S_outline
+        Rf.BaseGrid.score = score_two_sided
     try:
         poses, info = align((u, w, q, F @ o["affine"]), (v, m["mask"], m["affine"]), P, device, polarity)
     finally:
-        S.combined = combined
+        S.combined, S.Searcher._outline, Rf.BaseGrid.score = combined, outline_map, score
     return [{**p, "T": p["T"] @ F} for p in poses], info
 
 

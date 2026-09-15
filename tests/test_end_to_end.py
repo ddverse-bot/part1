@@ -99,7 +99,7 @@ def test_register_and_apply(tmp_path):
     assert pp.foreground(raw_h, 0.15, Params())[1]["status"] == "no_valley"
     assert 0.9 < res["foreground"]["oct"]["volume_cm3"] / (len(pts) * 0.08 ** 3 / 1e3) < 1.3          # 1.10-1.12 over seeds
     scale = res["pose"]["scale_per_oct_axis"]                   # true 1.03 / 1 / 1; the mask margin biases it low (0.91-0.97)
-    assert 0 < res["boundary_mm"] < 0.4 and 0.85 < min(scale) and max(scale) < 1.1
+    assert 0.85 < min(scale) and max(scale) < 1.1
     assert res["params"]["n_rot"] == FAST["n_rot"] and set(res["seconds"]) >= {"oct_mask", "search_refine", "total"}
     assert res["refine"]["n_poses"] == FAST["topk"] and res["search"]["n_orientations"] == FAST["n_rot"]
 
