@@ -67,6 +67,23 @@ def test_params_defaults_dict_and_hash():
                 {"ngf_sigmas_mm": 0.3}, {"ngf_iters": 0}, {"ngf_erode_mm": 0.0}):
         with pytest.raises(ValueError):
             Params.from_dict(bad)
+    assert p.hash() == "892a1f3b4fd6f7ed"                                             # octreg 1.1; 1.0: 7d01b8a167a83631
+    assert {k for k in p.to_dict() if k.startswith("df_")} == {                       # §6: the two kinds of evidence, one
+        "df_sigma_mm", "df_block_mm", "df_step_mm", "df_range_mm", "df_z_min", "df_erode_mm",                # lattice, one fit
+        "df_reach_mm", "df_profile_mm", "df_edge_mad", "df_support_mm", "df_huber_mm", "df_grid_mm", "df_lams",
+        "df_max_strain", "df_gain", "df_min_interior", "df_min_boundary"}
+    assert (p.df_sigma_mm, p.df_block_mm, p.df_step_mm, p.df_range_mm, p.df_z_min, p.df_erode_mm) == (0.24, 4.5, 1.5, 1.35, 4.0, 0.6)
+    assert (p.df_grid_mm, p.df_support_mm, p.df_edge_mad, p.df_lams) == (5.0, 5.0, 5.0, (30.0, 10.0, 3.0, 1.0, 0.3))
+    assert Params.from_dict({"df_grid_mm": 7, "df_lams": [3, 1]}) == dataclasses.replace(p, df_grid_mm=7.0, df_lams=(3.0, 1.0))
+    for bad, message in (({"df_grids_mm": [10.0, 7.0, 5.0]}, "unknown key"), ({"df_rounds": 2}, "unknown key"),
+                         ({"df_ridge_mad": 5.0}, "unknown key"), ({"df_grid_mm": [5.0]}, "not a float"), ({"df_lams": []}, "df_lams"),
+                         ({"df_lams": [1.0, 0.0]}, "df_lams"), ({"df_reach_mm": 3.0}, "df_reach_mm <= df_profile_mm"),
+                         ({"df_min_interior": 0}, "df_min_interior"),
+                         *(({k: v}, "df_ lengths") for k, v in (("df_sigma_mm", 0.0), ("df_block_mm", -1.0), ("df_step_mm", -0.5),
+                                                                ("df_z_min", 0.0), ("df_erode_mm", 0.0), ("df_grid_mm", 0.0),
+                                                                ("df_support_mm", -1.0), ("df_edge_mad", 0.0)))):
+        with pytest.raises(ValueError, match=message):
+            Params.from_dict(bad)
     env = dict(os.environ, PYTHONHASHSEED="4242", PYTHONPATH=str(ROOT))
     out = subprocess.run([sys.executable, "-c", "from octreg.params import Params; print(Params().hash())"], env=env,
                          capture_output=True, text=True, check=True).stdout.strip()
@@ -161,7 +178,7 @@ def test_resample_iso_equals_direct_pooling(tmp_path):
         for level in (0.15, 0.1, 0.06):
             out, A_out = g.resample_iso(vol, level)
             assert np.allclose(np.linalg.norm(A_out[:3, :3], axis=0), level)
-            p2, A2 = g.pool_iso(data, vol.affine, vol.spacing_mm, level)
+            p2, A2 = g.pool_iso(data, vol.affine, level)
             assert np.array_equal(out, p2) and np.array_equal(A_out, A2)
             k = np.maximum(1, np.rint(np.round(level / np.array(sp), 9))).astype(int)
             ref, pooled_shape = direct(data, vol.affine, k, out.shape, A_out)
@@ -180,14 +197,14 @@ def test_resample_iso_equals_direct_pooling(tmp_path):
     frac, _ = g.resample_iso(io.load_volume(tmp_path / "mask.nii.gz"), 0.04, binary=True)       # indicator, not the values
     assert np.allclose(frac, mask.reshape(32, 2, 36, 2, 40, 2).mean((1, 3, 5)), atol=1e-6)
     A = oblique((0.02, 0.02, 0.02), (0.0, 0.0, 0.0))                  # k = 8, step 0.9375: 15 pooled -> 16 planes, the last
-    ones, _ = g.pool_iso(np.ones((120, 24, 120), np.float32), A, 0.02, 0.15)          # one past the last pooled centre
+    ones, _ = g.pool_iso(np.ones((120, 24, 120), np.float32), A, 0.15)                 # one past the last pooled centre
     assert ones.shape == (16, 3, 16) and np.allclose(ones[:15, :, :15], 1) and np.allclose(ones[15, :, :15], 0.9375)
     assert np.allclose(ones[15, :, 15], 0.9375 ** 2)
     edge = rng.random((120, 24, 120)).astype(np.float32)
-    out, A_out = g.pool_iso(edge, A, 0.02, 0.15)
+    out, A_out = g.pool_iso(edge, A, 0.15)
     assert np.allclose(out, direct(edge, A, np.array([8, 8, 8]), out.shape, A_out)[0], atol=1e-5)
     with pytest.raises(ValueError, match="fewer than 2"):
-        g.pool_iso(noise[:4, :4, :4], np.diag([0.02, 0.02, 0.02, 1]), 0.02, 0.6)
+        g.pool_iso(noise[:4, :4, :4], np.diag([0.02, 0.02, 0.02, 1]), 0.6)
 
 
 def test_sampling_primitives():
@@ -235,6 +252,7 @@ def test_transform_txt_lta_itk_roundtrip(tmp_path):
     io.write_transform_txt(T, tmp_path / "T.txt")
     assert np.array_equal(np.loadtxt(tmp_path / "T.txt"), T)
     io.write_lta(T, src, dst, tmp_path / "x.lta")
+    assert b"\r" not in (tmp_path / "x.lta").read_bytes() + (tmp_path / "T.txt").read_bytes()
     text = (tmp_path / "x.lta").read_text()
     rows = text.split("1 4 4\n")[1].splitlines()[:4]
     assert "LINEAR_RAS_TO_RAS" in text and np.allclose(np.array([r.split() for r in rows], float), T, rtol=1e-14, atol=1e-14)
@@ -257,6 +275,7 @@ def test_transform_txt_lta_itk_roundtrip(tmp_path):
     q = np.array([3.0, 4.0, 5.0])
     for s, d in ((src, dst), (arr, dst), (src, arr)):
         io.write_itk(T, s, d, tmp_path / "x_itk.txt")
+        assert b"\r" not in (tmp_path / "x_itk.txt").read_bytes()
         p = sitk.ReadTransform(str(tmp_path / "x_itk.txt")).TransformPoint(images[id(d)].TransformContinuousIndexToPhysicalPoint(tuple(q)))
         want = g.apply_affine(np.linalg.inv(s.affine) @ np.linalg.inv(T) @ d.affine, q)
         assert np.allclose(images[id(s)].TransformPhysicalPointToContinuousIndex(p), want, atol=1e-4)

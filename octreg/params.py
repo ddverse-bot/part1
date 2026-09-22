@@ -43,6 +43,24 @@ class Params:
     ngf_sigmas_mm: tuple = (0.6, 0.4, 0.3)    # Gaussian sigma of the gradients, one pass each, coarse to fine
     ngf_erode_mm: float = 0.8                 # both masks eroded by this, so the outlines are left out
     ngf_iters: int = 150                      # Adam iterations per pass
+    # smooth deformation (§6)
+    df_sigma_mm: float = 0.24                 # Gaussian sigma of the gradients of the structure feature
+    df_block_mm: float = 4.5                  # edge of the matched blocks
+    df_step_mm: float = 1.5                   # grid step of the block centres
+    df_range_mm: float = 1.35                 # search range (+- per axis) of the interior block matches
+    df_z_min: float = 4.0                     # a match is confident this many SDs above the mean of its score map
+    df_erode_mm: float = 0.6                  # both masks eroded by this; a block needs 0.7 of it in the core, so it can hang 30 % outside
+    df_reach_mm: float = 1.35                 # a surface edge counts within this distance of the MRI foreground surface
+    df_profile_mm: float = 2.1                # half length of the intensity profile along a boundary normal
+    df_edge_mad: float = 5.0                  # a prominent fall: this many MADs above the median of the fall along the profile
+    df_support_mm: float = 5.0                # a boundary point is used when an interior match lies within this distance
+    df_huber_mm: float = 0.3                  # Huber threshold of both residual types
+    df_grid_mm: float = 5.0                   # spacing of the control lattice
+    df_lams: tuple = (30.0, 10.0, 3.0, 1.0, 0.3)   # candidate membrane weights
+    df_max_strain: float = 0.15               # largest first difference of the lattice / spacing must stay below this
+    df_gain: float = 0.9                      # the held-out score must fall below df_gain x that of no deformation
+    df_min_interior: int = 100                # fewer interior matches: no deformation
+    df_min_boundary: int = 300                # fewer boundary points: no deformation
 
     def __post_init__(self):
         ok = 0 < self.fine_mm <= self.base_mm < self.search_mm
@@ -52,6 +70,13 @@ class Params:
             raise ValueError("Params: ngf_sigmas_mm must be a non-empty tuple of positive finite floats")
         if not (self.ngf_erode_mm > 0 and self.ngf_iters >= 1):
             raise ValueError("Params: need ngf_erode_mm > 0 and ngf_iters >= 1")
+        if not (self.df_lams and all(isinstance(x, float) and 0 < x < float("inf") for x in self.df_lams)):
+            raise ValueError("Params: df_lams must be a non-empty tuple of positive finite floats")
+        if not (min(self.df_sigma_mm, self.df_block_mm, self.df_step_mm, self.df_range_mm, self.df_z_min, self.df_erode_mm,
+                    self.df_huber_mm, self.df_max_strain, self.df_gain, self.df_support_mm, self.df_edge_mad, self.df_grid_mm) > 0
+                and 0 < self.df_reach_mm <= self.df_profile_mm and min(self.df_min_interior, self.df_min_boundary) >= 1):
+            raise ValueError("Params: all df_ lengths, df_z_min, df_max_strain and df_gain must be positive, "
+                             "0 < df_reach_mm <= df_profile_mm, and df_min_interior, df_min_boundary >= 1")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)

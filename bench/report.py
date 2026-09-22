@@ -2,9 +2,10 @@
 """Write bench/BENCHMARK.md for Xiangrui's I58 brainstem pair from the bench outputs (formatting only, no computation).
 
     python bench/report.py --main RUN --ablate ABL [--logs RUN_logs] [-o bench/BENCHMARK.md] [--figures bench/figures]
+        [--store bench/results/xiangrui_I58]
 
 RUN: the CLI run (result.json; eval.json from bench/evaluate.py). ABL: bench/ablate.py output (ablations.json).
-LOGS (optional): bench/run_xiangrui.sh step logs, adding the wall clock (register.time) and the nvidia-smi peak (register.gpu_mib)
+LOGS (optional): bench/run_xiangrui.py step logs, adding the wall clock (register.time) and the nvidia-smi peak (register.gpu_mib)
 to the in-process time and memory of result.json. Missing values print n/a. Two hand-written parts of the old output are kept:
 the '## Visual result' section before '## Main result', and the reading after the READING marker.
 """
@@ -18,7 +19,8 @@ from pathlib import Path
 
 DELETION_MM = 0.5            # a step whose removal moves the pose by <= 0.5 mm (and no metric beyond noise) is deleted
 STEP_OF = {"A0c": "per-plane hole filling", "A1": "MRI flattening", "A2": "OCT flattening", "A4": "the two-class maps",
-           "A6": "the scale prior", "A9": "the outline term", "A12": "the fine-structure refinement"}
+           "A6": "the scale prior", "A6c": "the scale clamp", "A9": "the outline term", "A10": "the one-sided outline",
+           "A12": "the fine-structure refinement"}
 READING = "<!-- reading: written by hand below this line; bench/report.py keeps it when it rewrites the file -->"
 
 
@@ -48,31 +50,51 @@ def gpu_peak_gb(path):
 
 
 def rims(b):
-    """Rim medians forward / reverse at the pose, then those of R5 and the previous run under the same masks."""
+    """Rim medians forward / reverse at the pose, then those of any other pose (the previous run) under the same masks."""
     pair = lambda r: f"{num(r[0])} / {num(r[1])}" if r else "n/a"
-    other = "".join(f"; {n} {pair(r)}" for n, r in b.get("rim_median_mm_of", {}).items())
-    return f"{pair(b.get('rim_median_mm'))} mm{other}" if b.get("rim_median_mm") else "n/a"
+    other = "".join(f"; {n} {pair(r)}" for n, r in (b or {}).get("rim_median_mm_of", {}).items())
+    return f"{pair(b.get('rim_median_mm'))} mm{other}" if (b or {}).get("rim_median_mm") else "n/a"
+
+
+def arrow(pair, scale=1.0, nd=2):
+    """'before -> after' of a [before, after] read-out."""
+    return " -> ".join(num(None if x is None else scale * x, nd) for x in (pair or [None, None]))
+
+
+def deform_rows(d):
+    """Table rows of the smooth deformation (§6) read-outs (result.json 'deform'); none when the run has no such block."""
+    if not d:
+        return []
+    r, f, cv = d.get("residual", {}), d.get("field", {}), d.get("cv", {})
+    model = f"control lattice {num(d.get('grid_mm'), 0)} mm, lambda {num(d.get('lam'), 2)}" if d.get("status") == "applied" else "no field"
+    return [("smooth deformation (§6): status; model; interior matches, supported boundary points used by the fit",
+             f"{d.get('status', 'n/a')}; {model}; {d.get('n_interior', 'n/a')}, {d.get('n_boundary', 'n/a')}"),
+            ("§6 held-out median error, interior + boundary: no deformation -> chosen lambda",
+             f"{arrow([cv['none'][0], cv['chosen'][0]], nd=3)} mm + {arrow([cv['none'][1], cv['chosen'][1]], nd=3)} mm"
+             if cv.get("none") and cv.get("chosen") else "n/a"),
+            ("§6 residuals affine -> deformed, measured again: interior matches; surface-edge offsets (within 0.3 mm)",
+             f"{arrow(r.get('interior_mm'))} mm; {arrow(r.get('boundary_mm'))} mm ({arrow(r.get('boundary_within_0.3mm'), 100, 0)} %)"),
+            ("§6 field over the MRI foreground, median / p95 / max; max strain",
+             f"{num(f.get('median_mm'))} / {num(f.get('p95_mm'))} / {num(f.get('max_mm'))} mm; {num(d.get('max_strain'))}")]
 
 
 def main_section(run, logs):
     res, ev = load(run / "result.json"), load(run / "eval.json")
     pose, srch = res.get("pose", {}), res.get("search", {})
-    p, fc, b, mk = ev.get("pose_to_R5", {}), ev.get("frame_check", {}), ev.get("boundary", {}), ev.get("mask", {})
+    fc, b, mk = ev.get("frame_check", {}), ev.get("boundary", {}), ev.get("mask", {})
     wall = wall_seconds(logs / "register.time" if logs else None)
     gpu = gpu_peak_gb(logs / "register.gpu_mib" if logs else None)
     sec = res.get("seconds", {})
     ngf_s = res.get("ngf", {}).get("seconds")
     steps = ", ".join((f"search {num(srch.get('seconds'), 0)}, refinement {num(res['refine']['seconds'], 0)}"
                        + (f", fine-structure refinement {num(ngf_s, 0)}" if ngf_s is not None else "")
-                       if k in ("search_refine", "search_refine_ngf") and "refine" in res else f"{k.replace('_', ' ')} {num(v, 0)}")
+                       if k == "search_refine_ngf" and "refine" in res else
+                       f"smooth deformation {num(v, 0)}" if k == "deform" else f"{k.replace('_', ' ')} {num(v, 0)}")
                       for k, v in sec.items() if k != "total")
     shifts = [v["spearman"] for k, v in fc.get("variants", {}).items() if k.startswith("shift") and v["spearman"] is not None]
     shift_max = max(shifts) if shifts else None
     pv = ev.get("pose_to_previous", {})
     rows = [
-        ("pose vs R5, mean (max) over the v1.1 specimen mask", f"{num(p.get('mean_mm'))} ({num(p.get('max_mm'))}) mm"),
-        ("pose vs R5 at the block corners, mean (max)", f"{num(p.get('corners_mean_mm'))} ({num(p.get('corners_max_mm'))}) mm"),
-        ("rotation vs R5", f"{num(p.get('rotation_deg'), 1)} deg"),
         ("raw-data frame check (Spearman)", f"{num(fc.get('spearman_export'), 3)} at the pose; axis flips <= "
                                             f"{num(fc.get('max_flip_spearman'), 3)}; 2 mm shifts <= {num(shift_max, 3)}; "
                                             f"{('pass' if fc['ok'] else 'fail') if fc else 'n/a'}"),
@@ -83,40 +105,36 @@ def main_section(run, logs):
          f"{num(pose.get('NGF_start'), 4)} -> {num(pose.get('NGF'), 4)}; {pose.get('handedness', 'n/a')}"),
         ("pose change of §5 (block-corner mean)", f"{num(pose.get('ngf_shift_mm'))} mm"),
         ("scale per OCT array axis", " / ".join(f"{v:.3f}" for v in pose["scale_per_oct_axis"]) if pose else "n/a"),
+        *deform_rows(res.get("deform")),
         ("flags", "n/a" if "flags" not in res else ", ".join(res["flags"]) or "none"),
-        ("pose vs the previous run, mean / corners mean / corners max",
+        ("pose vs the previous run, mean / corners mean / corners max"
+         + (f" (the mean is over {pv['points']})" if pv.get("points") else ""),
          f"{num(pv.get('mean_mm'))} / {num(pv.get('corners_mean_mm'))} / {num(pv.get('corners_max_mm'))} mm" if pv else "n/a"),
         ("rim boundary agreement forward / reverse, method masks", rims(b)),
-        ("the same with the v1.1 masks", rims(ev.get("boundary_v11_masks", {}))),
-        ("OCT specimen mask", f"{num(mk.get('volume_cm3'))} cm3, Dice {num(mk.get('dice'), 3)} against the v1.1 mask "
-                              f"({num(mk.get('reference_cm3'))} cm3)"),
+        ("OCT specimen mask", f"{num(mk.get('volume_cm3'))} cm3"),
         ("registration time in process, peak RAM, peak GPU memory allocated by torch",
          f"{num(sec['total'] / 60 if 'total' in sec else None, 1)} min, {num(res.get('peak_rss_gb'), 1)} GiB, "
          f"{num(res.get('gpu_peak_gb'), 2)} GiB" + (f" (wall clock {num(wall / 60, 1)} min, nvidia-smi peak {num(gpu, 1)} GiB)" if wall else "")),
         ("time per step (s)", steps or "n/a"),
     ]
     frame = ("passes" if fc["ok"] else "does not pass") if fc else "was not run"
-    if not ev:
-        verdict = "bench/evaluate.py has not been run on this run yet."
-    else:
-        verdict = f"The raw-data frame check {frame}. R5 is a reference of the earlier pipeline, not a success criterion."
-    ref = ev.get("reference_check", {})
-    check = (f"R5 in the header frames (T_R5 @ A_spr @ inv(A_hdr)) agrees with the stored header-frame export to "
-             f"{num(ref.get('formula_vs_stored_export_max_mm'), 6)} mm.")
-    return ["## Main result", "", "| | |", "|---|---|"] + [f"| {a} | {v} |" for a, v in rows] + ["", verdict, "", check, ""]
+    verdict = ("bench/evaluate.py has not been run on this run yet." if not ev else
+               f"The raw-data frame check {frame}. The pair has no labels, so none of these numbers is a success criterion.")
+    return ["## Main result", "", "| | |", "|---|---|"] + [f"| {a} | {v} |" for a, v in rows] + ["", verdict, ""]
 
 
 def ablation_row(n, r):
+    """One row of the ablation table. Every read-out is optional, so a table written by another release still prints."""
+    vol = num((r.get("mask") or {}).get("volume_cm3"))
     if "error" in r:
-        return (f"| {n} | {r['change']} | failed: {r['error']} | | | | | | | | {num(r['mask']['volume_cm3'])} "
-                f"({num(r['mask']['dice'], 3)}) | {num(r['seconds'], 0)} |")
-    rim = r["boundary"]["rim_median_mm"]
-    d, d4 = r["pose_to_base"], r.get("pose_to_base_s4", {})
+        return f"| {n} | {r['change']} | failed: {r['error']} | | | | | | | {vol} | {num(r.get('seconds'), 0)} |"
+    rim = (r.get("boundary") or {}).get("rim_median_mm") or [None, None]
+    d, d4 = r.get("pose_to_base", {}), r.get("pose_to_base_s4", {})
     return (f"| {n} | {r['change']} | {num(d4.get('mean_mm'))} / {num(d4.get('corners_mean_mm'))} | "
-            f"{num(d['mean_mm'])} / {num(d['corners_mean_mm'])} / {num(d['corners_max_mm'])} | "
-            f"{num(r['pose_to_R5']['corners_max_mm'])} | {num(r['S'], 4)} | {num(r.get('L'), 4)} | {r['polarity']} | "
-            f"{' / '.join(f'{s:.3f}' for s in r['scales'])} | {num(rim[0])} / {num(rim[1])} | "
-            f"{num(r['mask']['volume_cm3'])} ({num(r['mask']['dice'], 3)}) | {num(r['seconds'], 0)} |")
+            f"{num(d.get('mean_mm'))} / {num(d.get('corners_mean_mm'))} / {num(d.get('corners_max_mm'))} | "
+            f"{num(r.get('S'), 4)} | {num(r.get('L'), 4)} | "
+            f"{r.get('polarity', 'n/a')} | {' / '.join(f'{s:.3f}' for s in r.get('scales', [])) or 'n/a'} | "
+            f"{num(rim[0])} / {num(rim[1])} | {vol} | {num(r.get('seconds'), 0)} |")
 
 
 def ablation_section(abl):
@@ -124,13 +142,16 @@ def ablation_section(abl):
         return ["## Ablations", "", "Not run yet (bench/ablate.py).", ""]
     V = abl["variants"]
     cols = ("| variant | change | §4 pose change: mean / corners mean (mm) | final pose change: mean / corners mean / corners max (mm) "
-            "| vs R5 corners max (mm) | S | L | polarity | scale | rim fwd / rev (mm) | OCT mask cm3 (Dice) | time (s) |")
+            "| S | L | polarity | scale | rim fwd / rev (mm) | OCT mask cm3 | time (s) |")
+    rule = "|---|---|---|---|---|---|---|---|---|---|---|"
     head = ["## Ablations", "",
             "Each variant is the method with one explicit change, run from the same preprocessed grids (one per OCT mask source). "
-            "Pose change is against base (the method through the same driver), as the mean over the v1.1 specimen-mask points and "
-            "the mean and max over the 8 corners of the OCT array. The boundary agreement uses the base masks for every variant, "
-            "so it reflects the pose only.", "",
-            cols, "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+            "Pose change is against base (the method through the same driver), as the mean over the points of the base specimen "
+            "mask and the mean and max over the 8 corners of the OCT array. The boundary agreement uses the base masks for every "
+            "variant, so it reflects the pose only. The smooth deformation (§6) leaves the pose alone, so no variant runs it: "
+            "'no §6' would be base with the identical pose, and its read-outs are the 'before' residuals in the Main result "
+            "table above.", "",
+            cols, rule]
     rows = [ablation_row(n, r) for n, r in V.items()]
     tail = [""]
     dc = abl.get("driver_check")
@@ -143,19 +164,21 @@ def ablation_section(abl):
     large = [f"{STEP_OF[n]} ({n}, {num(V[n][key(n)]['mean_mm'])} mm)" for n in done if V[n][key(n)]["mean_mm"] > DELETION_MM]
     if done:
         tail += [(f"Deletion rule: a step goes when removing it moves the pose by at most {DELETION_MM} mm (mean over the "
-                  "specimen-mask points; the §4 pose for steps of §1-4, the final pose for §5) and changes no other metric beyond noise. "
-                  + (f"Removing {either(small)} stays within {DELETION_MM} mm. " if small else "")
+                  "specimen-mask points; the §4 pose for steps of §1-4, the final pose for §5), changes no other metric beyond "
+                  "noise, and no test outside this pair shows it load bearing. "
+                  + (f"Removing {either(small)} stays within {DELETION_MM} mm, and the evidence for keeping each is in "
+                     "docs/METHOD.md after the ablation table. " if small else "")
                   + (f"Removing {either(large)} moves the pose further." if large else "")).strip(), ""]
     groups = [g for g in abl.get("removed_steps", []) if g.get("rows")]
     if groups:
         tail += ["### Removed steps", ""]
     for g in groups:
         pb = g["present_base_vs_previous_base"]
-        tail += [g["note"], "", cols, "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        tail += [g["note"], "", cols, rule]
         tail += [ablation_row(n, r) for n, r in g["rows"].items()]
         tail += ["", f"The present base lies {num(pb['mean_mm'])} mm (corners mean {num(pb['corners_mean_mm'])} mm, corners max "
                  f"{num(pb['corners_max_mm'])} mm, rotation {num(pb['rotation_deg'], 2)} deg) from the base of that run. "
-                 f"Source: {g['source']}.", ""]
+                 f"Source: {Path(g['source']).parent.name}/{Path(g['source']).name}.", ""]
     return head + rows + tail
 
 
@@ -176,54 +199,19 @@ def runtime_section(abl):
     return out
 
 
-SHORT = {"A0": "intensity OCT mask", "A0b": "v1.1 watershed OCT mask", "A0c": "holes filled in 3-D only", "A1": "MRI flattening off",
-         "A2": "OCT flattening off", "A3": "destripe off, ladder kept", "A4": "intensity channels", "A5+1": "polarity forced +1",
-         "A5-1": "polarity forced -1", "A6": "no scale prior", "A7": "ladder off, destripe kept", "A8": "other handedness",
-         "A9": "no outline term", "A10": "two-sided outline",
-         "A11": "cut face", "A11b": "cut face, two-sided outline", "A12": "no fine-structure refinement"}
-
-
-def figures(run, abl, out):
-    """out/fig_qc_xiangrui.png: RUN/qc.png without the white margin, outline colours kept. out/fig_ablation.png: block-corner mean
-    pose change of every variant against its base (variants: the present base; removed steps: the base of the run that measured
-    them), log scale."""
-    from matplotlib.figure import Figure
+def figures(run, out):
+    """The three figures bench/BENCHMARK.md shows, from the run's own qc images: out/fig_qc_xiangrui.png is RUN/qc.png
+    without the white margin, outline colours kept, and out/fig_qc_montage_xiangrui.png and out/fig_qc_deform_xiangrui.png are
+    RUN/qc_montage.png and RUN/qc_deform.png as they are. The ablation distances are in the table, which needs no picture."""
+    import shutil
     from PIL import Image, ImageOps
     out.mkdir(parents=True, exist_ok=True)
     qc = Image.open(run / "qc.png").convert("RGB")
     x0, y0, x1, y1 = ImageOps.invert(qc.convert("L")).getbbox()
     qc.crop((max(x0 - 8, 0), max(y0 - 8, 0), min(x1 + 8, qc.width), min(y1 + 8, qc.height))).save(out / "fig_qc_xiangrui.png", optimize=True)
-    rows = [(n, r.get("pose_to_base", {}).get("corners_mean_mm"), r.get("error"), False) for n, r in abl["variants"].items() if n != "base"]
-    rows += [(n, r["pose_to_base"]["corners_mean_mm"], None, True) for g in abl.get("removed_steps", [])
-             for n, r in g["rows"].items()]
-    rows.sort(key=lambda r: math.inf if r[1] is None else r[1])
-    lo, ink, grey = 1e-3, "#0b0b0b", "#52514e"
-    fig = Figure(figsize=(7.6, 0.34 * len(rows) + 1.4))
-    ax = fig.add_axes([0.39, 0.2, 0.58, 0.74])
-    for i, (n, d, err, removed) in enumerate(rows):
-        if d is not None and d > lo:
-            ax.barh(i, d - lo, left=lo, height=0.6, color="#d6d5d0" if removed else "#2a78d6", hatch="///" if removed else None,
-                    edgecolor=grey if removed else "#2a78d6", linewidth=0)
-        label = (f"failed: {err.split(':')[-1].strip()[:40]}" if err else "same pose" if d == 0 else
-                 f"< {lo:g} mm" if d < lo else f"{d:.2g} mm")
-        ax.text(max(d or lo, lo) * 1.2, i, label, va="center", fontsize=8, color=grey,
-                bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.3})
-    ax.axvline(0.5, color=ink, linestyle="--", linewidth=1, zorder=1)
-    ax.text(0.5 * 1.1, len(rows) - 0.4, "0.5 mm", fontsize=8, color=ink, va="bottom")
-    ax.set_xscale("log")
-    ax.set_xlim(lo, 400)
-    ax.set_ylim(-0.6, len(rows) + 0.2)
-    ax.set_yticks(range(len(rows)), [f"{n}  {SHORT.get(n, n)}" + ("  (removed)" if rm else "") for n, _, _, rm in rows], fontsize=8.5)
-    ax.set_xlabel("pose change from the one change, block-corner mean (mm)", fontsize=9)
-    ax.tick_params(axis="x", labelsize=8, colors=grey)
-    ax.tick_params(axis="y", length=0)
-    ax.grid(axis="x", which="major", color="#e4e3df", linewidth=0.8)
-    ax.set_axisbelow(True)
-    for side in ("top", "right", "left"):
-        ax.spines[side].set_visible(False)
-    fig.text(0.02, 0.02, "Hatched: steps removed from the method, measured in the first ablation run against the base of that run,\n"
-             "which still had them.", fontsize=7, color=grey)
-    fig.savefig(out / "fig_ablation.png", dpi=150)
+    for src, dst in (("qc_montage.png", "fig_qc_montage_xiangrui.png"), ("qc_deform.png", "fig_qc_deform_xiangrui.png")):
+        if (run / src).exists():
+            shutil.copyfile(run / src, out / dst)
 
 
 def main():
@@ -232,30 +220,39 @@ def main():
     ap.add_argument("--ablate", type=Path, default=None)
     ap.add_argument("--logs", type=Path, default=None)
     ap.add_argument("-o", "--out", type=Path, default=Path("bench/BENCHMARK.md"))
-    ap.add_argument("--figures", type=Path, default=None, help="also write fig_qc_xiangrui.png and fig_ablation.png into this dir")
+    ap.add_argument("--figures", type=Path, default=None, help="also write the qc figures BENCHMARK.md shows into this dir")
+    ap.add_argument("--store", type=Path, default=None,
+                    help="also copy the run's result.json and eval.json and the ablations.json into this dir "
+                         "(bench/results/xiangrui_I58), so the numbers the document quotes travel with it")
     a = ap.parse_args()
     abl = load(a.ablate / "ablations.json") if a.ablate else {}
     phash = load(a.main / "result.json").get("params_hash") or abl.get("params_hash")
     intro = ["# Benchmark: Xiangrui's I58 brainstem pair", "",
-             "octreg 1.0 registered the two original files as given (OCT 1457x2013x1595 at 20 um, header LPI; MRI crop 343x489x495 at "
+             "octreg registered the two original files as given (OCT 1457x2013x1595 at 20 um, header LPI; MRI crop 343x489x495 at "
              "0.08 mm, header RIA) with `octreg register OCT MRI -o OUT` and default parameters"
              + (f" (Params hash {phash})" if phash else "") + ". "
-             "The pair has no labels, so every number here is label-free. The reference R5 is the pose of the earlier research "
-             "pipeline (v1.1) converted into the header frames. It is a body-level pose, not ground truth. The numbers are read from "
-             "the run's result.json and eval.json and from ablations.json (copies in bench/results/xiangrui_I58/). "
-             "Commands: `bash bench/run_xiangrui.sh` (see bench/README.md).", ""]
-    old = a.out.read_text() if a.out.exists() else ""
+             "The pair has no labels, so every number here is label-free. "
+             "The numbers are read from the run's result.json and eval.json and from ablations.json (copies in bench/results/xiangrui_I58/). "
+             "Commands: `python bench/run_xiangrui.py` (see bench/README.md).", ""]
+    old = a.out.read_text(encoding="utf-8") if a.out.exists() else ""
     visual = re.search(r"^## Visual result\n.*?(?=^## Main result)", old, re.S | re.M)       # hand-written, kept
     text = "\n".join(intro + ([visual.group(0).rstrip("\n"), ""] if visual else []) + main_section(a.main, a.logs)
                      + ablation_section(abl) + runtime_section(abl))
     if READING in old:                                   # the hand-written reading at the end survives a rewrite
         text += "\n" + READING + old.split(READING, 1)[1]
     a.out.parent.mkdir(parents=True, exist_ok=True)
-    a.out.write_text(text)
+    a.out.write_bytes(text.encode("utf-8"))             # UTF-8 and LF on every OS
     print(f"wrote {a.out}")
-    if a.figures and abl:
-        figures(a.main, abl, a.figures)
-        print(f"wrote {a.figures}/fig_qc_xiangrui.png, fig_ablation.png")
+    if a.figures:
+        figures(a.main, a.figures)
+        print(f"wrote the figures of {a.out.name} into {a.figures}")
+    if a.store:
+        import shutil
+        a.store.mkdir(parents=True, exist_ok=True)
+        for src in [a.main / "result.json", a.main / "eval.json"] + ([a.ablate / "ablations.json"] if a.ablate else []):
+            if src.exists():
+                shutil.copyfile(src, a.store / src.name)
+                print(f"stored {a.store / src.name}")
 
 
 if __name__ == "__main__":

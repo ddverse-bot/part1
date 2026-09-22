@@ -1,7 +1,7 @@
 """Command line.
 
     octreg register OCT MRI -o OUT [--oct-spacing-um Z,Y,X] [--oct-mask F] [--mri-mask F] [--device cuda|cpu] [--params F]
-    octreg apply --run OUT --moving X --reference Y -o Z [--inverse]
+    octreg apply --run OUT --moving X --reference Y -o Z [--inverse] [--affine-only] [--oct-spacing-um Z,Y,X]
     octreg qc --run OUT --oct OCT --mri MRI [--T F] [-o PREFIX] [--oct-spacing-um Z,Y,X] [--oct-mask F] [--mri-mask F]
 """
 from __future__ import annotations
@@ -24,7 +24,8 @@ def _zyx(text):
 
 def main(argv=None) -> int:
     """Run a subcommand (argv default sys.argv[1:]). -> exit code: 0 done, 2 input refused (ValueError, message on stderr)."""
-    ap = argparse.ArgumentParser(prog="octreg", description="Label-free affine registration of an OCT block to an MRI crop.")
+    ap = argparse.ArgumentParser(prog="octreg", description="Label-free registration of an OCT block to an MRI crop: an affine and a "
+                                 "small smooth deformation on top.")
     sub = ap.add_subparsers(dest="command", required=True)
     r = sub.add_parser("register", help="register OCT to MRI and write the transform, overlays, visual QC and result.json")
     r.add_argument("oct", help="OCT volume: NIfTI, or TIFF / OME-TIFF / NPY with spacing")
@@ -42,7 +43,10 @@ def main(argv=None) -> int:
     a.add_argument("--moving", required=True, help="volume in the OCT frame (MRI frame with --inverse)")
     a.add_argument("--reference", required=True, help="volume whose grid the output takes")
     a.add_argument("-o", "--out", required=True, help="output NIfTI")
-    a.add_argument("--inverse", action="store_true", help="MRI -> OCT")
+    a.add_argument("--inverse", action="store_true", help="MRI -> OCT (through the affine alone: the deformation field is not inverted)")
+    a.add_argument("--affine-only", action="store_true", help="leave out the deformation field oct2mri_warp.nii.gz of the run")
+    a.add_argument("--oct-spacing-um", type=_zyx, metavar="Z,Y,X",
+                   help="as for register, for the file in the OCT frame (default: the run's)")
     q = sub.add_parser("qc", help="render the visual QC of a run for its transform or another one, without registering")
     q.add_argument("--run", required=True, help="output directory of octreg register")
     q.add_argument("--oct", required=True, help="the run's OCT volume")
@@ -54,17 +58,19 @@ def main(argv=None) -> int:
     q.add_argument("--mri-mask", help="as for register (default: the run's)")
     args = ap.parse_args(argv)
     from .params import Params
-    from .register import apply, qc, register
+    from .register import apply, deform_label, qc, register
     try:
         if args.command == "register":
+            if args.params is not None and not args.params.is_file():
+                raise ValueError(f"{args.params}: no such file")
             params = Params.from_dict(json.loads(args.params.read_text())) if args.params else Params()
             res = register(args.oct, args.mri, args.out, args.oct_spacing_um, args.oct_mask, args.mri_mask, params, args.device)
             pose, s = res["pose"], res["search"]
             print(f"octreg: S {pose['S']:.4f}, polarity {pose['polarity']:+d}, search top1/top2 {s['top1']:.4f}/{s['top2'] or 0:.4f}, "
-                  f"NGF {pose['NGF_start']:.4f} -> {pose['NGF']:.4f}, "
+                  f"NGF {pose['NGF_start']:.4f} -> {pose['NGF']:.4f}, {deform_label(res['deform'])}, "
                   f"flags {res['flags'] or 'none'} -> {args.out}")
         elif args.command == "apply":
-            print(f"octreg: wrote {apply(args.run, args.moving, args.reference, args.out, args.inverse)}")
+            print(f"octreg: wrote {apply(args.run, args.moving, args.reference, args.out, args.inverse, args.affine_only, args.oct_spacing_um)}")
         else:
             paths = qc(args.run, args.oct, args.mri, args.T, args.out, args.oct_spacing_um, args.oct_mask, args.mri_mask)
             print(f"octreg: wrote {paths[0]} and {paths[1]}")

@@ -85,34 +85,42 @@ class BaseGrid:
         return (2 * polarity * S_class + S_outline) / 3, S_class, S_outline
 
 
-def fit(grid, T0, polarity, params: Params = Params()):
-    """Adam (lr_rot rad, lr_t mm, lr_ls, lr_sh) with a cosine schedule over params.iters steps from pose T0 (numpy 4x4), all
-    twelve affine parameters (r, t, 3 log-scales, 3 shears). -> (T numpy 4x4, S, S_class, S_outline, L) of the iterate with the
-    lowest L."""
+def fit_adam(grid, T0, objective, iters, t_max, lr_scale, params: Params = Params()):
+    """Adam on L = 1 - objective(T)[0] + lam (sum ls^2 + sum sh^2) from pose T0 (numpy 4x4), over all twelve affine parameters
+    (r, t, 3 log-scales, 3 shears), with a cosine schedule to zero at t_max and learning rates lr_scale x (lr_rot rad, lr_t mm,
+    lr_ls, lr_sh); |ls| and |sh| are clamped to params.clamp after every step. iters and t_max are separate because §4 stops at
+    t_max, never scoring its last iterate, and §5 runs one iterate past it at learning rate 0.
+    objective(T) -> a tuple of scalar tensors, the first of which is the score. -> (T numpy 4x4, *those values, L) of the
+    iterate with the lowest L."""
     P, dev = params, grid.w.device
     f = lambda x: torch.tensor(np.asarray(x, float), dtype=torch.float32, device=dev, requires_grad=True)
     r, t, ls, sh = (f(x) for x in decompose(T0, grid.c))
     c = torch.tensor(np.asarray(grid.c, float), dtype=torch.float32, device=dev)
-    opt = torch.optim.Adam([{"params": [r], "lr": P.lr_rot}, {"params": [t], "lr": P.lr_t}, {"params": [ls], "lr": P.lr_ls},
-                            {"params": [sh], "lr": P.lr_sh}])
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=P.iters, eta_min=0.0)
+    k = lr_scale
+    opt = torch.optim.Adam([{"params": [r], "lr": k * P.lr_rot}, {"params": [t], "lr": k * P.lr_t},
+                            {"params": [ls], "lr": k * P.lr_ls}, {"params": [sh], "lr": k * P.lr_sh}])
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=t_max, eta_min=0.0)
     best = (math.inf,)
-    for _ in range(P.iters):
+    for _ in range(iters):
         opt.zero_grad(set_to_none=True)
         T = compose(r, t, ls, sh, c)
-        S, S_class, S_outline = grid.score(T, polarity)
-        L = 1.0 - S + P.lam * ((ls ** 2).sum() + (sh ** 2).sum())
+        v = objective(T)
+        L = 1.0 - v[0] + P.lam * ((ls ** 2).sum() + (sh ** 2).sum())
+        l, *s = torch.stack([L.detach(), *(x.detach() for x in v)]).tolist()
+        if l < best[0]:
+            best = (l, T.detach().cpu().double().numpy(), *s)
         L.backward()
         opt.step()
         sched.step()
         with torch.no_grad():
             ls.clamp_(-P.clamp, P.clamp)
             sh.clamp_(-P.clamp, P.clamp)
-        l, *s = torch.stack([L.detach(), S.detach(), S_class.detach(), S_outline.detach()]).tolist()
-        if l < best[0]:
-            best = (l, T.detach().cpu().double().numpy(), *s)
     return (*best[1:], best[0])
 
+
+def fit(grid, T0, polarity, params: Params = Params()):
+    """§4: fit_adam on the score of §2 at the given polarity. -> (T numpy 4x4, S, S_class, S_outline, L), lowest L."""
+    return fit_adam(grid, T0, lambda T: grid.score(T, polarity), params.iters, params.iters, 1.0, params)
 
 def refine(candidates, mri, oct, params: Params = Params(), device="cuda"):
     """Fit every search pose (fit, its polarity fixed) on the base grid and sort by L. candidates: search output (T, polarity);

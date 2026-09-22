@@ -163,9 +163,34 @@ def save_nifti(arr, affine, path) -> None:
     nib.save(img, str(path))
 
 
+def save_field(field, affine, path) -> None:
+    """A displacement field (numpy [3, D, H, W], mm along the world axes of `affine`, the grid's voxel -> world) as a NIfTI-1
+    vector image: float32 of shape [D, H, W, 1, 3], intent 'vector', sform = qform = affine. The components follow the NIfTI
+    world axes (RAS+ for a standard header); ITK and ANTs read displacement components as LPS, the first two negated."""
+    import nibabel as nib
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    A = np.asarray(affine, float)
+    img = nib.Nifti1Image(np.ascontiguousarray(np.moveaxis(np.asarray(field, np.float32), 0, -1)[:, :, :, None, :]), A)
+    img.header.set_intent("vector")
+    img.header.set_xyzt_units("mm")
+    img.header.set_qform(A, code=1)
+    img.header.set_sform(A, code=1)
+    nib.save(img, str(path))
+
+
+def load_field(path):
+    """A displacement field written by save_field -> (float32 [3, D, H, W], affine 4x4). Raises ValueError for another shape."""
+    import nibabel as nib
+    img = nib.load(str(path))
+    if len(img.shape) != 5 or img.shape[3:] != (1, 3):
+        raise ValueError(f"{path}: shape {img.shape}; a displacement field has shape [D, H, W, 1, 3]")
+    return np.moveaxis(np.asarray(img.dataobj, np.float32)[:, :, :, 0, :], -1, 0), np.array(img.affine, float)
+
+
 def write_transform_txt(T, path) -> None:
     """4x4 matrix as plain text, one row per line, 17 significant digits (exact float64 round trip with np.loadtxt)."""
-    np.savetxt(path, np.asarray(T, float), fmt="%.17g")
+    with open(path, "w", newline="\n") as f:                    # LF on every OS (np.savetxt(path) writes CRLF on Windows)
+        np.savetxt(f, np.asarray(T, float), fmt="%.17g")
 
 
 def _vol_info(vol: Volume) -> str:
@@ -181,9 +206,10 @@ def _vol_info(vol: Volume) -> str:
 def write_lta(T, src: Volume, dst: Volume, path) -> None:
     """FreeSurfer LTA, LINEAR_RAS_TO_RAS, x_dst = T x_src (world mm), with source and destination volume geometry."""
     rows = "\n".join(" ".join(f"{v:.15e}" for v in r) for r in np.asarray(T, float))
-    Path(path).write_text(f"# transform file {path}\n# created by octreg\ntype      = 1 # LINEAR_RAS_TO_RAS\nnxforms   = 1\n"
-                          f"mean      = 0.0000 0.0000 0.0000\nsigma     = 1.0000\n1 4 4\n{rows}\nsrc volume info\n{_vol_info(src)}"
-                          f"dst volume info\n{_vol_info(dst)}subject unknown\nfscale 0.100000\n")
+    with open(path, "w", newline="\n") as f:                    # LF on every OS
+        f.write(f"# transform file {path}\n# created by octreg\ntype      = 1 # LINEAR_RAS_TO_RAS\nnxforms   = 1\n"
+                f"mean      = 0.0000 0.0000 0.0000\nsigma     = 1.0000\n1 4 4\n{rows}\nsrc volume info\n{_vol_info(src)}"
+                f"dst volume info\n{_vol_info(dst)}subject unknown\nfscale 0.100000\n")
 
 
 def write_itk(T, src: Volume, dst: Volume, path) -> None:
@@ -193,14 +219,16 @@ def write_itk(T, src: Volume, dst: Volume, path) -> None:
     F_src, F_dst = (np.diag([-1.0, -1.0, 1.0, 1.0] if _kind(v.path) == "nii" else [1.0] * 4) for v in (src, dst))
     L = F_src @ np.linalg.inv(np.asarray(T, float)) @ F_dst
     q = " ".join(f"{v:.17g}" for v in [*L[:3, :3].ravel(), *L[:3, 3]])
-    Path(path).write_text(f"#Insight Transform File V1.0\n#Transform 0\nTransform: AffineTransform_double_3_3\nParameters: {q}\n"
-                          "FixedParameters: 0 0 0\n")
+    with open(path, "w", newline="\n") as f:                    # LF on every OS
+        f.write(f"#Insight Transform File V1.0\n#Transform 0\nTransform: AffineTransform_double_3_3\nParameters: {q}\n"
+                "FixedParameters: 0 0 0\n")
 
 
 def write_json(obj, path) -> None:
     """JSON (indent 1) of dicts, lists, dataclasses, numpy arrays and scalars, Paths; NaN and inf become null."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(_plain(obj), indent=1, allow_nan=False))
+    with open(path, "w", encoding="utf-8", newline="\n") as f:                 # LF on every OS, like the transform files
+        f.write(json.dumps(_plain(obj), indent=1, allow_nan=False))
 
 
 def _plain(o):
