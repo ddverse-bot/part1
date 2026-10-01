@@ -143,7 +143,15 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     for z in range(specimen_mask.shape[0]):
         filled_mask[z] = ndimage.binary_fill_holes(specimen_mask[z])
         
-    return filled_mask, {"threshold": float(thresh), "volume_cm3": float(filled_mask.sum()), "n_components": int(num_features), "status": "ok"}
+    # Correct volume calculation in cm3 based on voxel dimensions
+    volume_cm3 = float(filled_mask.sum() * (voxel_mm ** 3) / 1e3)
+        
+    return filled_mask, {
+        "threshold": float(thresh), 
+        "volume_cm3": volume_cm3, 
+        "n_components": int(num_features), 
+        "status": "ok"
+    }
 
 
 # ----------------------------------------------------------------------------- two-class maps and channels (§2)
