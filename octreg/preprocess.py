@@ -101,7 +101,7 @@ def foreground(arr, voxel_mm, params: Params = Params()):
 def specimen_mask(fine, voxel_mm, params: Params = Params()):
     """
     Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
-    following octreg §1 methodology with safe foreground fallback.
+    following octreg §1 methodology with a positive threshold value.
     """
     # 1. Gaussian smoothing
     smoothed = ndimage.gaussian_filter(fine.astype(np.float32), sigma=2.0)
@@ -123,11 +123,13 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     smoothed_log = ndimage.gaussian_filter(log_texture, sigma=1.2)
     
     try:
-        thresh = threshold_otsu(smoothed_log)
-        binary_mask = smoothed_log > thresh
+        log_thresh = threshold_otsu(smoothed_log)
+        binary_mask = smoothed_log > log_thresh
+        # Map the threshold back to the linear texture field domain so it's positive (> 0)
+        thresh = float(np.exp(log_thresh))
     except Exception:
-        thresh = np.mean(smoothed_log)
-        binary_mask = smoothed_log > thresh
+        thresh = float(np.mean(texture_field))
+        binary_mask = texture_field > thresh
         
     # 4. Morphological closing and 3-D hole-filling pass
     struct_elem = ndimage.generate_binary_structure(3, 2)
