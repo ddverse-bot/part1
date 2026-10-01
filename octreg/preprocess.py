@@ -101,7 +101,7 @@ def foreground(arr, voxel_mm, params: Params = Params()):
 def specimen_mask(fine, voxel_mm, params: Params = Params()):
     """
     Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
-    following octreg §1 methodology.
+    following octreg §1 methodology with safe foreground fallback.
     """
     # 1. Gaussian smoothing
     smoothed = ndimage.gaussian_filter(fine.astype(np.float32), sigma=2.0)
@@ -118,16 +118,17 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     # Isotropic texture field F = min over directional axes
     texture_field = np.min(cv, axis=0) if cv.ndim == 4 else cv
         
-    # 3. Otsu thresholding directly on the texture field (or positive values)
-    thresh = threshold_otsu(texture_field)
-    binary_mask = texture_field > thresh
+    # 3. Log-transform, smoothing, and Otsu thresholding
+    log_texture = np.log(np.maximum(texture_field, 1e-5))
+    smoothed_log = ndimage.gaussian_filter(log_texture, sigma=1.2)
     
-    # Alternatively, if you want smoothed log for the binary mask but a positive threshold:
-    # log_texture = np.log(np.maximum(texture_field, 1e-5))
-    # smoothed_log = ndimage.gaussian_filter(log_texture, sigma=1.2)
-    # thresh = float(threshold_otsu(texture_field)) # keep thresh positive based on linear field
-    # binary_mask = smoothed_log > threshold_otsu(smoothed_log)
-    
+    try:
+        thresh = threshold_otsu(smoothed_log)
+        binary_mask = smoothed_log > thresh
+    except Exception:
+        thresh = np.mean(smoothed_log)
+        binary_mask = smoothed_log > thresh
+        
     # 4. Morphological closing and 3-D hole-filling pass
     struct_elem = ndimage.generate_binary_structure(3, 2)
     closed_mask = ndimage.binary_closing(binary_mask, structure=struct_elem, iterations=2)
@@ -140,6 +141,10 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
         specimen_mask = (labeled == largest_label)
     else:
         specimen_mask = closed_mask
+        
+    # Fallback if mask is entirely empty
+    if not specimen_mask.any():
+        specimen_mask = smoothed_log > np.percentile(smoothed_log, 50)
         
     # Plane-by-plane interior hole filling for internal structures/cut faces
     filled_mask = np.zeros_like(specimen_mask, dtype=bool)
