@@ -118,12 +118,15 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     # Isotropic texture field F = min over directional axes
     texture_field = np.min(cv, axis=0) if cv.ndim == 4 else cv
         
-    # 3. Log-transform, smoothing, and Otsu thresholding
-    log_texture = np.log(np.maximum(texture_field, 1e-5))
-    smoothed_log = ndimage.gaussian_filter(log_texture, sigma=1.2)
+    # 3. Otsu thresholding directly on the texture field (or positive values)
+    thresh = threshold_otsu(texture_field)
+    binary_mask = texture_field > thresh
     
-    thresh = threshold_otsu(smoothed_log)
-    binary_mask = smoothed_log > thresh
+    # Alternatively, if you want smoothed log for the binary mask but a positive threshold:
+    # log_texture = np.log(np.maximum(texture_field, 1e-5))
+    # smoothed_log = ndimage.gaussian_filter(log_texture, sigma=1.2)
+    # thresh = float(threshold_otsu(texture_field)) # keep thresh positive based on linear field
+    # binary_mask = smoothed_log > threshold_otsu(smoothed_log)
     
     # 4. Morphological closing and 3-D hole-filling pass
     struct_elem = ndimage.generate_binary_structure(3, 2)
@@ -143,7 +146,6 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     for z in range(specimen_mask.shape[0]):
         filled_mask[z] = ndimage.binary_fill_holes(specimen_mask[z])
         
-    # Correct volume calculation in cm3 based on voxel dimensions
     volume_cm3 = float(filled_mask.sum() * (voxel_mm ** 3) / 1e3)
         
     return filled_mask, {
@@ -152,8 +154,6 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
         "n_components": int(num_features), 
         "status": "ok"
     }
-
-
 # ----------------------------------------------------------------------------- two-class maps and channels (§2)
 def flattened(arr, mask, voxel_mm, params: Params = Params()):
     """arr / its local foreground mean G(arr M) / G(M), Gaussian sigma flatten_sigma_mm on blocks of ~sigma / 4 voxels, linearly
