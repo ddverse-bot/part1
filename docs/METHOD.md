@@ -39,8 +39,9 @@ instead, and a supplied mask is used as given.
 ## 2. One score for structure and outline, polarity as a sign
 
 OCT scattering and MRI intensity follow no fixed mapping, but in both the tissue falls into a brighter and a darker class. Each
-volume I with foreground M is divided by its local foreground mean G(I M) / G(M) (Gaussian σ 10 mm) and blurred by one voxel to
-give x; with t the Otsu threshold and s the standard deviation of the foreground values of x clipped at their 99.5th percentile,
+volume I with foreground M is divided by its local foreground mean G(I M) / G(M) (Gaussian σ 10 mm) to give x, then blurred by
+one voxel as G(xM)/G(M), normalised so background and masked-out gaps do not bleed into tissue. With t the Otsu threshold
+and s the standard deviation of the foreground values of x clipped at their 99.5th percentile,
 p = sigmoid((x − t) / (0.25 s)).
 
 The OCT enters as channels u = (p_O, 1 − p_O) with its specimen mask w as weight, the MRI as v = (p_M M, (1 − p_M) M). The class

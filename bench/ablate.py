@@ -151,9 +151,9 @@ def prepare(out, sources):
 
 
 def standardised(arr, mask, h, P):
-    """A4 map: z = (x - mean) / std over the foreground values clipped at p99.5, x = pp.flattened(arr) blurred with sigma one
+    """A4 map: z = (x - mean) / std over the foreground values clipped at p99.5, x = pp.flattened(arr) blurred within the mask
     voxel, i.e. pp.two_class without its Otsu threshold and sigmoid. -> float32 [D, H, W]."""
-    x = ndimage.gaussian_filter(pp.flattened(arr, mask, h, P), 1.0)
+    x = pp.masked_blur(pp.flattened(arr, mask, h, P), mask)
     vals = np.minimum(x[mask], np.percentile(x[mask], 99.5))
     return ((x - float(vals.mean())) / float(vals.std())).astype(np.float32)
 
