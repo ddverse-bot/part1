@@ -98,10 +98,11 @@ def foreground(arr, voxel_mm, params: Params = Params()):
 
 
 # ----------------------------------------------------------------------------- specimen mask (§1)
+# -----------------------------------------------------------------------------
+# specimen mask (§1)
 def specimen_mask(fine, voxel_mm, params: Params = Params()):
-    """
-    Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
-    following octreg §1 methodology with a positive threshold value.
+    """ Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
+        following octreg §1 methodology with a positive threshold value. 
     """
     # 1. Gaussian smoothing
     smoothed = ndimage.gaussian_filter(fine.astype(np.float32), sigma=2.0)
@@ -117,7 +118,7 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     
     # Isotropic texture field F = min over directional axes
     texture_field = np.min(cv, axis=0) if cv.ndim == 4 else cv
-        
+
     # 3. Log-transform, smoothing, and Otsu thresholding
     log_texture = np.log(np.maximum(texture_field, 1e-5))
     smoothed_log = ndimage.gaussian_filter(log_texture, sigma=1.2)
@@ -130,7 +131,7 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     except Exception:
         thresh = float(np.mean(texture_field))
         binary_mask = texture_field > thresh
-        
+
     # 4. Morphological closing and 3-D hole-filling pass
     struct_elem = ndimage.generate_binary_structure(3, 2)
     closed_mask = ndimage.binary_closing(binary_mask, structure=struct_elem, iterations=2)
@@ -143,22 +144,22 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
         specimen_mask = (labeled == largest_label)
     else:
         specimen_mask = closed_mask
-        
+
     # Fallback if mask is entirely empty
     if not specimen_mask.any():
         specimen_mask = smoothed_log > np.percentile(smoothed_log, 50)
-        
+
     # Plane-by-plane interior hole filling for internal structures/cut faces
     filled_mask = np.zeros_like(specimen_mask, dtype=bool)
     for z in range(specimen_mask.shape[0]):
         filled_mask[z] = ndimage.binary_fill_holes(specimen_mask[z])
-        
+
     volume_cm3 = float(filled_mask.sum() * (voxel_mm ** 3) / 1e3)
-        
+
     return filled_mask, {
-        "threshold": float(thresh), 
-        "volume_cm3": volume_cm3, 
-        "n_components": int(num_features), 
+        "threshold": float(thresh),
+        "volume_cm3": volume_cm3,
+        "n_components": int(num_features),
         "status": "ok"
     }
 # ----------------------------------------------------------------------------- two-class maps and channels (§2)
