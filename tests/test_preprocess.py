@@ -73,6 +73,16 @@ def test_flattening_removes_linear_bias():
 
 
 @pytest.mark.parametrize("flatten", [True, False])
+def test_two_class_ignores_background(flatten):
+    img, _, mask = _classes(3, 48)
+    mask[20:24, 20:24, :] = False
+    expected = pp.two_class(np.where(mask, img, 0), mask, 0.15, P, flatten)
+    for background in (500, 5000):
+        actual = pp.two_class(np.where(mask, img, background), mask, 0.15, P, flatten)
+        np.testing.assert_allclose(actual[mask], expected[mask], atol=1e-6)
+
+
+@pytest.mark.parametrize("flatten", [True, False])
 def test_gain_invariance(flatten):
     img, _, mask = _classes(1, 64)
     p = pp.two_class(img, mask, 0.6, P, flatten)
