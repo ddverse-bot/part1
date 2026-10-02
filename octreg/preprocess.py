@@ -97,7 +97,8 @@ def foreground(arr, voxel_mm, params: Params = Params()):
                "n_components": n}
 
 
-# ----------------------------------------------------------------------------- specimen mask (§1)
+# -----------------------------------------------------------------------------
+# specimen mask (§1)
 def specimen_mask(fine, voxel_mm, params: Params = Params()):
     """Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
        following octreg §1 methodology.
@@ -154,9 +155,12 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
 
     # Plane-by-plane interior hole filling
     filled_base = _fill_planes(mask_base)
-    volume_cm3 = float(filled_base.sum() * (0.15 ** 3) / 1e3)
+    
+    # Upsample back to fine grid shape to match test requirements
+    filled_fine = _upsample(filled_base, k, fine.shape) > 0.5
+    volume_cm3 = float(filled_fine.sum() * (voxel_mm ** 3) / 1e3)
 
-    return filled_base, {
+    return filled_fine, {
         "threshold": float(thresh),
         "volume_cm3": volume_cm3,
         "n_components": int(num_comp),
