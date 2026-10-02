@@ -97,7 +97,8 @@ def foreground(arr, voxel_mm, params: Params = Params()):
                "n_components": n}
 
 
-# ----------------------------------------------------------------------------- specimen mask (§1)
+# -----------------------------------------------------------------------------
+# specimen mask (§1)
 def specimen_mask(fine, voxel_mm, params: Params = Params()):
     """Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
        following octreg §1 methodology.
@@ -134,9 +135,13 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
     k = max(1, int(round(block_mm / voxel_mm)))
     pooled_F = _pool(texture_field, k) / _pool(valid.astype(np.float32), k).clip(min=1e-5)
 
-    # 3. Log-transform, base grid smoothing (sigma 1.2 mm), and Otsu thresholding
+    # 3. Log-transform, base grid smoothing, and Otsu thresholding
     log_texture = np.log(np.maximum(pooled_F, 1e-5))
-    sigma_log_base = 1.2 / 0.15  # base grid spacing is 0.15 mm
+    
+    # Adapt base smoothing sigma dynamically based on parameters or resolution
+    base_spacing = 0.15
+    smooth_target_mm = getattr(params, 'texture_smooth_mm', 1.2)
+    sigma_log_base = smooth_target_mm / base_spacing
     smoothed_log = ndimage.gaussian_filter(log_texture, sigma=sigma_log_base)
 
     try:
@@ -148,15 +153,18 @@ def specimen_mask(fine, voxel_mm, params: Params = Params()):
         base_binary = pooled_F > thresh
 
     # 4. Closing (0.48 mm) and component filtering
-    r_close = int(round(0.48 / 0.15))
+    r_close = int(round(0.48 / base_spacing))
     closed_base = _close(base_binary, r_close)
     mask_base, num_comp = _components(closed_base, min_fraction=None)
 
     # Plane-by-plane interior hole filling
     filled_base = _fill_planes(mask_base)
-    volume_cm3 = float(filled_base.sum() * (0.15 ** 3) / 1e3)
+    
+    # Upsample back to fine grid shape
+    filled_fine = _upsample(filled_base, k, fine.shape) > 0.5
+    volume_cm3 = float(filled_fine.sum() * (voxel_mm ** 3) / 1e3)
 
-    return filled_base, {
+    return filled_fine, {
         "threshold": float(thresh),
         "volume_cm3": volume_cm3,
         "n_components": int(num_comp),
