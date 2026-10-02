@@ -98,77 +98,67 @@ def foreground(arr, voxel_mm, params: Params = Params()):
 
 
 
-# -----------------------------------------------------------------------------
-# specimen mask (§1)
 def specimen_mask(fine, voxel_mm, params: Params = Params()):
-    """Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
-       following octreg §1 methodology.
     """
-    f = np.asarray(fine, np.float32)
+    Computes the isotropic texture field F = min_a c_a and the 3D specimen mask 
+    following octreg §1 methodology with a positive threshold value.
+    """
+    # 1. Gaussian smoothing
+    smoothed = ndimage.gaussian_filter(fine.astype(np.float32), sigma=2.0)
     
-    # 1. Exact zeros in the OCT are missing data (black tiles): never specimen
-    valid = f > 0
-    if not valid.any():
-        raise ValueError("specimen_mask: OCT grid has no positive voxels")
-
-    # Normalized Gaussian smoothing (sigma 0.08 mm converted to voxels)
-    sigma_vox = 0.08 / voxel_mm
-    smoothed = ndimage.gaussian_filter(f, sigma=sigma_vox)
-
-    # 2. Running coefficient of variation c_a along each array axis over 0.36 mm window
-    win_size = max(3, int(round(0.36 / voxel_mm)))
-    if win_size % 2 == 0:
-        win_size += 1
-
-    cv_axes = []
-    for ax in range(3):
-        mean_ax = ndimage.uniform_filter1d(smoothed, size=win_size, axis=ax, mode='reflect')
-        sq_mean_ax = ndimage.uniform_filter1d(smoothed ** 2, size=win_size, axis=ax, mode='reflect')
-        var_ax = np.maximum(sq_mean_ax - mean_ax ** 2, 0.0)
-        std_ax = np.sqrt(var_ax)
-        cv_axes.append(std_ax / (np.abs(mean_ax) + 1e-5))
-
+    # 2. Local mean and standard deviation for coefficient of variation
+    local_mean = ndimage.uniform_filter(smoothed, size=5)
+    local_sq_mean = ndimage.uniform_filter(smoothed ** 2, size=5)
+    local_var = np.maximum(local_sq_mean - local_mean ** 2, 0.0)
+    local_std = np.sqrt(local_var)
+    
+    # Coefficient of variation c_a
+    cv = local_std / (np.abs(local_mean) + 1e-5)
+    
     # Isotropic texture field F = min over directional axes
-    texture_field = np.minimum(np.minimum(cv_axes[0], cv_axes[1]), cv_axes[2])
-
-    # Average texture field over 0.16 mm blocks
-    block_mm = 0.16
-    k = max(1, int(round(block_mm / voxel_mm)))
-    pooled_F = _pool(texture_field, k) / _pool(valid.astype(np.float32), k).clip(min=1e-5)
-
-    # 3. Log-transform, base grid smoothing, and Otsu thresholding
-    log_texture = np.log(np.maximum(pooled_F, 1e-5))
+    texture_field = np.min(cv, axis=0) if cv.ndim == 4 else cv
+        
+    # 3. Log-transform, smoothing, and Otsu thresholding
+    log_texture = np.log(np.maximum(texture_field, 1e-5))
+    smoothed_log = ndimage.gaussian_filter(log_texture, sigma=1.2)
     
-    # Adapt base smoothing sigma dynamically based on parameters or resolution
-    base_spacing = 0.15
-    smooth_target_mm = getattr(params, 'texture_smooth_mm', 1.2)
-    sigma_log_base = smooth_target_mm / base_spacing
-    smoothed_log = ndimage.gaussian_filter(log_texture, sigma=sigma_log_base)
-
     try:
         log_thresh = threshold_otsu(smoothed_log)
-        base_binary = smoothed_log > log_thresh
+        binary_mask = smoothed_log > log_thresh
+        # Map the threshold back to the linear texture field domain so it's positive (> 0)
         thresh = float(np.exp(log_thresh))
     except Exception:
-        thresh = float(np.mean(pooled_F))
-        base_binary = pooled_F > thresh
-
-    # 4. Closing (0.48 mm) and component filtering
-    r_close = int(round(0.48 / base_spacing))
-    closed_base = _close(base_binary, r_close)
-    mask_base, num_comp = _components(closed_base, min_fraction=None)
-
-    # Plane-by-plane interior hole filling
-    filled_base = _fill_planes(mask_base)
+        thresh = float(np.mean(texture_field))
+        binary_mask = texture_field > thresh
+        
+    # 4. Morphological closing and 3-D hole-filling pass
+    struct_elem = ndimage.generate_binary_structure(3, 2)
+    closed_mask = ndimage.binary_closing(binary_mask, structure=struct_elem, iterations=2)
     
-    # Upsample back to fine grid shape
-    filled_fine = _upsample(filled_base, k, fine.shape) > 0.5
-    volume_cm3 = float(filled_fine.sum() * (voxel_mm ** 3) / 1e3)
-
-    return filled_fine, {
-        "threshold": float(thresh),
-        "volume_cm3": volume_cm3,
-        "n_components": int(num_comp),
+    # Isolate largest connected component (specimen)
+    labeled, num_features = ndimage.label(closed_mask)
+    if num_features > 0:
+        sizes = ndimage.sum(closed_mask, labeled, range(1, num_features + 1))
+        largest_label = np.argmax(sizes) + 1
+        specimen_mask = (labeled == largest_label)
+    else:
+        specimen_mask = closed_mask
+        
+    # Fallback if mask is entirely empty
+    if not specimen_mask.any():
+        specimen_mask = smoothed_log > np.percentile(smoothed_log, 50)
+        
+    # Plane-by-plane interior hole filling for internal structures/cut faces
+    filled_mask = np.zeros_like(specimen_mask, dtype=bool)
+    for z in range(specimen_mask.shape[0]):
+        filled_mask[z] = ndimage.binary_fill_holes(specimen_mask[z])
+        
+    volume_cm3 = float(filled_mask.sum() * (voxel_mm ** 3) / 1e3)
+        
+    return filled_mask, {
+        "threshold": float(thresh), 
+        "volume_cm3": volume_cm3, 
+        "n_components": int(num_features), 
         "status": "ok"
     }
 # ----------------------------------------------------------------------------- two-class maps and channels (§2)
